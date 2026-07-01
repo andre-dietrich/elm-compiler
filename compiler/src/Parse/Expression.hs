@@ -205,8 +205,8 @@ record start =
                 oneOf E.RecordEquals
                   [ do  word1 0x7C#Word8 {-|-} E.RecordEquals
                         Space.chompAndCheckIndent E.RecordSpace E.RecordIndentField
-                        firstField <- chompField
-                        fields <- chompFields [firstField]
+                        firstField <- chompUpdateField
+                        fields <- chompUpdateFields [firstField]
                         addEnd start (Src.Update starter fields)
                   , do  word1 0x3D#Word8 {-=-} E.RecordEquals
                         Space.chompAndCheckIndent E.RecordSpace E.RecordIndentExpr
@@ -242,6 +242,46 @@ chompField =
       (value, end) <- specialize E.RecordExpr expression
       Space.checkIndent end E.RecordIndentEnd
       return (key, value)
+
+
+-- UPDATE FIELDS (with dotted paths, e.g. `a.b.c = value`)
+
+
+type UpdateField = ( [A.Located Name.Name], Src.Expr )
+
+
+chompUpdateFields :: [UpdateField] -> Parser E.Record [UpdateField]
+chompUpdateFields fields =
+  oneOf E.RecordEnd
+    [ do  word1 0x2C#Word8 {-,-} E.RecordEnd
+          Space.chompAndCheckIndent E.RecordSpace E.RecordIndentField
+          f <- chompUpdateField
+          chompUpdateFields (f : fields)
+    , do  word1 0x7D#Word8 {-}-} E.RecordEnd
+          return (reverse fields)
+    ]
+
+
+chompUpdateField :: Parser E.Record UpdateField
+chompUpdateField =
+  do  key <- addLocation (Var.lower E.RecordField)
+      path <- chompPath [key]
+      Space.chompAndCheckIndent E.RecordSpace E.RecordIndentEquals
+      word1 0x3D#Word8 {-=-} E.RecordEquals
+      Space.chompAndCheckIndent E.RecordSpace E.RecordIndentExpr
+      (value, end) <- specialize E.RecordExpr expression
+      Space.checkIndent end E.RecordIndentEnd
+      return (path, value)
+
+
+chompPath :: [A.Located Name.Name] -> Parser E.Record [A.Located Name.Name]
+chompPath revSegments =
+  oneOfWithFallback
+    [ do  word1 0x2E#Word8 {-.-} E.RecordField
+          field <- addLocation (Var.lower E.RecordField)
+          chompPath (field : revSegments)
+    ]
+    (reverse revSegments)
 
 
 

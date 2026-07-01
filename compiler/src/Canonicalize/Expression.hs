@@ -136,13 +136,8 @@ canonicalize env (A.At region expression) =
         <*> Result.ok field
 
     Src.Update (A.At reg name) fields ->
-      let
-        makeCanFields =
-          Dups.checkFields' (\r t -> Can.FieldUpdate r <$> canonicalize env t) fields
-      in
-      Can.Update name
-        <$> (A.At reg <$> findVar reg env name)
-        <*> (sequenceA =<< makeCanFields)
+      do  baseExpr <- A.At reg <$> findVar reg env name
+          buildUpdate env name baseExpr fields
 
     Src.Record fields ->
       do  fieldDict <- Dups.checkFields fields
@@ -159,6 +154,68 @@ canonicalize env (A.At region expression) =
 
     Src.Shader src tipe ->
         Result.ok (Can.Shader src tipe)
+
+
+
+-- CANONICALIZE RECORD UPDATE (with dotted paths)
+--
+-- A field's left-hand side may be a dotted path, e.g. `a.b.c = value`. Several
+-- paths that share a prefix are merged into a single nested update tree, so
+-- `{ m | a.b.x = v1, a.b.y = v2 }` becomes
+-- `{ m | a = { m.a | b = { m.a.b | x = v1, y = v2 } } }` and compiles down to
+-- one `_Utils_update` per record level.
+
+
+buildUpdate :: Env.Env -> Name.Name -> Can.Expr -> [([A.Located Name.Name], Src.Expr)] -> Result FreeLocals [W.Warning] Can.Expr_
+buildUpdate env name baseExpr fields =
+  do  fieldList <- traverse (buildUpdateField env baseExpr) (groupByHead fields)
+      return (Can.Update name baseExpr (Map.fromList fieldList))
+
+
+buildUpdateField :: Env.Env -> Can.Expr -> (Name.Name, A.Region, [(A.Region, [A.Located Name.Name], Src.Expr)]) -> Result FreeLocals [W.Warning] (Name.Name, Can.FieldUpdate)
+buildUpdateField env baseExpr (fieldName, headRegion, entries) =
+  case entries of
+    [(r, [], value)] ->
+      (\v -> (fieldName, Can.FieldUpdate r v)) <$> canonicalize env value
+
+    _ ->
+      case [ r | (r, [], _) <- entries ] of
+        r1 : r2 : _ ->
+          Result.throw (Error.DuplicateField fieldName r1 r2)
+
+        r1 : _ ->
+          let r2 = head [ r | (r, _:_, _) <- entries ] in
+          Result.throw (Error.DuplicateField fieldName r1 r2)
+
+        [] ->
+          let
+            nestedBase = A.At headRegion (Can.Access baseExpr (A.At headRegion fieldName))
+            nestedFields = [ (path, value) | (_, path, value) <- entries ]
+          in
+          (\inner -> (fieldName, Can.FieldUpdate headRegion (A.At headRegion inner)))
+            <$> buildUpdate env fieldName nestedBase nestedFields
+
+
+-- Groups update fields by their first path segment, preserving the order of
+-- first appearance. Each bucket keeps the segment name, the region of its first
+-- occurrence, and the list of (this-occurrence region, remaining path, value).
+groupByHead :: [([A.Located Name.Name], Src.Expr)] -> [(Name.Name, A.Region, [(A.Region, [A.Located Name.Name], Src.Expr)])]
+groupByHead fields =
+  List.foldl' insertEntry [] fields
+  where
+    insertEntry buckets (path, value) =
+      case path of
+        [] ->
+          buckets
+
+        A.At hr name : rest ->
+          let
+            addTo [] = [(name, hr, [(hr, rest, value)])]
+            addTo (bucket@(bn, br, es) : bs)
+              | bn == name = (bn, br, es ++ [(hr, rest, value)]) : bs
+              | otherwise  = bucket : addTo bs
+          in
+          addTo buckets
 
 
 
