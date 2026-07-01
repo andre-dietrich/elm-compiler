@@ -75,6 +75,7 @@ data Stmt
   | ExprStmt Expr
   | IfStmt Expr Stmt Stmt
   | Switch Expr [Case]
+  | ForIn Name Expr Stmt
   | While Expr Stmt
   | Break (Maybe Name)
   | Continue (Maybe Name)
@@ -210,6 +211,13 @@ fromStmt level@(Level indent nextLevel) statement =
       mconcat
         [ indent, "switch (", snd (fromExpr level Whatever expr), ") {\n"
         , mconcat (map (fromClause nextLevel) clauses)
+        , indent, "}\n"
+        ]
+
+    ForIn name expr stmt ->
+      mconcat
+        [ indent, "for (var ", Name.toBuilder name, " in ", snd (fromExpr level Whatever expr), ") {\n"
+        , fromStmt nextLevel stmt
         , indent, "}\n"
         ]
 

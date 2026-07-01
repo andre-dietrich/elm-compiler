@@ -126,11 +126,7 @@ generate mode expression =
       JsExpr $ JS.Access (generateJsExpr mode record) (generateField mode field)
 
     Opt.Update record fields ->
-      JsExpr $
-        JS.Call (JS.Ref (JsName.fromKernel Name.utils "update"))
-          [ generateJsExpr mode record
-          , generateRecord mode fields
-          ]
+      generateUpdate mode record fields
 
     Opt.Record fields ->
       JsExpr $ generateRecord mode fields
@@ -274,6 +270,93 @@ generateField mode name =
   case mode of
     Mode.Dev _       -> JsName.fromLocal name
     Mode.Prod fields -> fields ! name
+
+
+
+-- RECORD UPDATES
+
+
+generateUpdate :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> Code
+generateUpdate mode record fields =
+  case mode of
+    Mode.Prod _ | hasNestedUpdate fields ->
+      JsExpr $ generateInlineUpdate mode record fields
+
+    _ ->
+      JsExpr $ generateUpdateCall mode record fields
+
+
+generateUpdateCall :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> JS.Expr
+generateUpdateCall mode record fields =
+  JS.Call (JS.Ref (JsName.fromKernel Name.utils "update"))
+    [ generateJsExpr mode record
+    , generateRecord mode fields
+    ]
+
+
+hasNestedUpdate :: Map.Map Name.Name Opt.Expr -> Bool
+hasNestedUpdate =
+  any isUpdate
+
+
+isUpdate :: Opt.Expr -> Bool
+isUpdate expr =
+  case expr of
+    Opt.Update _ _ -> True
+    _              -> False
+
+
+generateInlineUpdate :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> JS.Expr
+generateInlineUpdate mode record fields =
+  JS.Call
+    (JS.Function Nothing [updateRecord] (generateInlineUpdateBody mode fields))
+    [ generateJsExpr mode record ]
+
+
+generateInlineUpdateBody :: Mode.Mode -> Map.Map Name.Name Opt.Expr -> [JS.Stmt]
+generateInlineUpdateBody mode fields =
+  [ JS.Var updateResult (JS.Object [])
+  , JS.ForIn updateKey (JS.Ref updateRecord) $
+      JS.ExprStmt $
+        JS.Assign
+          (JS.LBracket (JS.Ref updateResult) (JS.Ref updateKey))
+          (JS.Index (JS.Ref updateRecord) (JS.Ref updateKey))
+  ]
+  ++ map (generateInlineUpdateField mode) (Map.toList fields)
+  ++ [ JS.Return (JS.Ref updateResult) ]
+
+
+generateInlineUpdateField :: Mode.Mode -> (Name.Name, Opt.Expr) -> JS.Stmt
+generateInlineUpdateField mode (field, value) =
+  JS.ExprStmt $
+    JS.Assign
+      (JS.LDot (JS.Ref updateResult) (generateField mode field))
+      (generateInlineUpdateValue mode value)
+
+
+generateInlineUpdateValue :: Mode.Mode -> Opt.Expr -> JS.Expr
+generateInlineUpdateValue mode value =
+  case value of
+    Opt.Update record fields ->
+      generateInlineUpdate mode record fields
+
+    _ ->
+      generateJsExpr mode value
+
+
+updateRecord :: JsName.Name
+updateRecord =
+  JsName.fromLocal "$record"
+
+
+updateResult :: JsName.Name
+updateResult =
+  JsName.fromLocal "$updated"
+
+
+updateKey :: JsName.Name
+updateKey =
+  JsName.fromLocal "$key"
 
 
 
