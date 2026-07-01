@@ -1,6 +1,7 @@
 module AST.Optimized
   ( Def(..)
   , Expr(..)
+  , unTrack
   , Global(..)
   , Path(..)
   , Destructor(..)
@@ -71,6 +72,20 @@ data Expr
   | Unit
   | Tuple Expr Expr (Maybe Expr)
   | Shader Shader.Source (Set.Set Name) (Set.Set Name)
+  | TrackedExpr A.Region Expr
+    -- ^ carries the source region of the wrapped expression so that
+    -- code generation can emit source-map information. Transparent: any
+    -- code that inspects the shape of an Expr must look through it (see
+    -- 'unTrack').
+
+
+-- | Strip any source-region tracking wrappers so the underlying shape can be
+-- inspected. Shallow on purpose: it only removes wrappers at the very top.
+unTrack :: Expr -> Expr
+unTrack expr =
+  case expr of
+    TrackedExpr _ inner -> unTrack inner
+    _                   -> expr
 
 
 data Global = Global ModuleName.Canonical Name
@@ -276,6 +291,7 @@ instance Binary Expr where
       Unit             -> putWord8 24
       Tuple a b c      -> putWord8 25 >> put a >> put b >> put c
       Shader a b c     -> putWord8 26 >> put a >> put b >> put c
+      TrackedExpr a b  -> putWord8 27 >> put a >> put b
 
   get =
     do  word <- getWord8
@@ -307,6 +323,7 @@ instance Binary Expr where
           24 -> pure   Unit
           25 -> liftM3 Tuple get get get
           26 -> liftM3 Shader get get get
+          27 -> liftM2 TrackedExpr get get
           _  -> fail "problem getting Opt.Expr binary"
 
 

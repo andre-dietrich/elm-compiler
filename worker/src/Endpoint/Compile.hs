@@ -165,7 +165,7 @@ compile (A.Artifacts interfaces objects) source =
                         mains = Map.singleton home main_
                         graph = Opt.addLocalGraph locals objects
                       in
-                      return $ Success name $ JS.generate mode graph mains
+                      return $ Success name $ JS.generate mode False Map.empty graph mains
 
 
 checkImports :: Map.Map ModuleName.Raw I.Interface -> [Src.Import] -> Either (NE.List Import.Error) (Map.Map ModuleName.Raw I.Interface)

@@ -43,6 +43,7 @@ data Flags =
     , _output :: Maybe Output
     , _report :: Maybe ReportType
     , _docs :: Maybe FilePath
+    , _source_maps :: Bool
     }
 
 
@@ -64,7 +65,7 @@ type Task a = Task.Task Exit.Make a
 
 
 run :: [FilePath] -> Flags -> IO ()
-run paths flags@(Flags _ _ _ report _) =
+run paths flags@(Flags _ _ _ report _ _) =
   do  style <- getStyle report
       maybeRoot <- Stuff.findRoot
       Reporting.attemptWithStyle style Exit.makeToReport $
@@ -74,10 +75,11 @@ run paths flags@(Flags _ _ _ report _) =
 
 
 runHelp :: FilePath -> [FilePath] -> Reporting.Style -> Flags -> IO (Either Exit.Make ())
-runHelp root paths style (Flags debug optimize maybeOutput _ maybeDocs) =
+runHelp root paths style (Flags debug optimize maybeOutput _ maybeDocs sourceMaps) =
   BW.withScope $ \scope ->
   Stuff.withRootLock root $ Task.run $
   do  desiredMode <- getMode debug optimize
+      let useMaps = sourceMaps && supportsSourceMaps desiredMode
       details <- Task.eio Exit.MakeBadDetails (Details.load style scope root)
       case paths of
         [] ->
@@ -97,8 +99,7 @@ runHelp root paths style (Flags debug optimize maybeOutput _ maybeDocs) =
                           generate style "index.html" (Html.sandwich name builder) (NE.List name [])
 
                     name:names ->
-                      do  builder <- toBuilder root details desiredMode artifacts
-                          generate style "elm.js" builder (NE.List name names)
+                      emitJs style "elm.js" useMaps root details desiredMode artifacts (NE.List name names)
 
                 Just DevNull ->
                   return ()
@@ -106,8 +107,7 @@ runHelp root paths style (Flags debug optimize maybeOutput _ maybeDocs) =
                 Just (JS target) ->
                   case getNoMains artifacts of
                     [] ->
-                      do  builder <- toBuilder root details desiredMode artifacts
-                          generate style target builder (Build.getRootNames artifacts)
+                      emitJs style target useMaps root details desiredMode artifacts (Build.getRootNames artifacts)
 
                     name:names ->
                       Task.throw (Exit.MakeNonMainFilesIntoJavaScript name names)
@@ -248,11 +248,47 @@ generate style target builder names =
         Reporting.reportGenerate style names target
 
 
+-- Emit JavaScript, optionally alongside an external source map.
+emitJs :: Reporting.Style -> FilePath -> Bool -> FilePath -> Details.Details -> DesiredMode -> Build.Artifacts -> NE.List ModuleName.Raw -> Task ()
+emitJs style target useMaps root details desiredMode artifacts names =
+  if useMaps then
+    do  (js, mapJson) <- toBuilderSM root details desiredMode (FP.takeFileName target) artifacts
+        generateWithMap style target js mapJson names
+  else
+    do  builder <- toBuilder root details desiredMode artifacts
+        generate style target builder names
+
+
+generateWithMap :: Reporting.Style -> FilePath -> B.Builder -> B.Builder -> NE.List ModuleName.Raw -> Task ()
+generateWithMap style target js mapJson names =
+  Task.io $
+    do  Dir.createDirectoryIfMissing True (FP.takeDirectory target)
+        let mapName = FP.takeFileName target ++ ".map"
+        File.writeBuilder target (js <> sourceMappingComment mapName)
+        File.writeBuilder (target ++ ".map") mapJson
+        Reporting.reportGenerate style names target
+
+
+sourceMappingComment :: String -> B.Builder
+sourceMappingComment mapName =
+  "\n//# sourceMappingURL=" <> B.stringUtf8 mapName <> "\n"
+
+
 
 -- TO BUILDER
 
 
 data DesiredMode = Debug | Dev | Prod
+
+
+-- Source maps are only produced for dev/debug builds. Optimized output is
+-- meant to be minified separately, so we skip maps there.
+supportsSourceMaps :: DesiredMode -> Bool
+supportsSourceMaps desiredMode =
+  case desiredMode of
+    Debug -> True
+    Dev   -> True
+    Prod  -> False
 
 
 toBuilder :: FilePath -> Details.Details -> DesiredMode -> Build.Artifacts -> Task B.Builder
@@ -262,6 +298,15 @@ toBuilder root details desiredMode artifacts =
       Debug -> Generate.debug root details artifacts
       Dev   -> Generate.dev   root details artifacts
       Prod  -> Generate.prod  root details artifacts
+
+
+toBuilderSM :: FilePath -> Details.Details -> DesiredMode -> String -> Build.Artifacts -> Task (B.Builder, B.Builder)
+toBuilderSM root details desiredMode fileName artifacts =
+  Task.mapError Exit.MakeBadGenerate $
+    case desiredMode of
+      Debug -> Generate.debugSourceMaps fileName root details artifacts
+      Dev   -> Generate.devSourceMaps   fileName root details artifacts
+      Prod  -> (\b -> (b, mempty)) <$> Generate.prod root details artifacts
 
 
 

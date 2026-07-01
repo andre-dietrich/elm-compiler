@@ -54,6 +54,11 @@ generateJsExpr mode expression =
 generate :: Mode.Mode -> Opt.Expr -> Code
 generate mode expression =
   case expression of
+    Opt.TrackedExpr region inner ->
+      case generate mode inner of
+        JsExpr jsExpr -> JsExpr (JS.TrackedExpr region jsExpr)
+        block         -> block
+
     Opt.Bool b -> JsExpr $ JS.Bool b
     Opt.Chr c ->
       JsExpr $
@@ -349,7 +354,7 @@ funcHelpers =
 
 generateCall :: Mode.Mode -> Opt.Expr -> [Opt.Expr] -> JS.Expr
 generateCall mode func args =
-  case func of
+  case Opt.unTrack func of
     Opt.VarGlobal global@(Opt.Global (ModuleName.Canonical pkg _) _) | pkg == Pkg.core ->
       generateCoreCall mode global args
 
@@ -522,7 +527,7 @@ cmp idealOp backupOp backupInt left right =
 
 isLiteral :: JS.Expr -> Bool
 isLiteral expr =
-  case expr of
+  case JS.unwrap expr of
     JS.String _ -> True
     JS.Float  _ -> True
     JS.Int    _ -> True
@@ -532,7 +537,7 @@ isLiteral expr =
 
 apply :: Opt.Expr -> Opt.Expr -> Opt.Expr
 apply func value =
-  case func of
+  case Opt.unTrack func of
     Opt.Accessor field -> Opt.Access value field
     Opt.Call f args    -> Opt.Call f (args ++ [value])
     _                  -> Opt.Call func [value]
@@ -554,18 +559,25 @@ jsAppend a b =
 
 toSeqs :: Mode.Mode -> Opt.Expr -> [JS.Expr]
 toSeqs mode expr =
-  case expr of
-    Opt.Call (Opt.VarGlobal (Opt.Global home "append")) [left, right]
-      | home == ModuleName.basics ->
+  case Opt.unTrack expr of
+    Opt.Call opFunc [left, right]
+      | isBasicsAppend opFunc ->
           generateJsExpr mode left : toSeqs mode right
 
     _ ->
       [generateJsExpr mode expr]
 
 
+isBasicsAppend :: Opt.Expr -> Bool
+isBasicsAppend expr =
+  case Opt.unTrack expr of
+    Opt.VarGlobal (Opt.Global home "append") -> home == ModuleName.basics
+    _                                        -> False
+
+
 isStringLiteral :: JS.Expr -> Bool
 isStringLiteral expr =
-  case expr of
+  case JS.unwrap expr of
     JS.String _ -> True
     _           -> False
 
@@ -576,11 +588,11 @@ isStringLiteral expr =
 
 strictEq :: JS.Expr -> JS.Expr -> JS.Expr
 strictEq left right =
-  case left of
+  case JS.unwrap left of
     JS.Int  0 -> JS.Prefix JS.PrefixNot right
     JS.Bool b -> if b then right else JS.Prefix JS.PrefixNot right
     _ ->
-      case right of
+      case JS.unwrap right of
         JS.Int  0 -> JS.Prefix JS.PrefixNot left
         JS.Bool b -> if b then left else JS.Prefix JS.PrefixNot left
         _         -> JS.Infix JS.OpEq left right
@@ -588,11 +600,11 @@ strictEq left right =
 
 strictNEq :: JS.Expr -> JS.Expr -> JS.Expr
 strictNEq left right =
-  case left of
+  case JS.unwrap left of
     JS.Int  0 -> JS.Prefix JS.PrefixNot (JS.Prefix JS.PrefixNot right)
     JS.Bool b -> if b then JS.Prefix JS.PrefixNot right else right
     _ ->
-      case right of
+      case JS.unwrap right of
         JS.Int  0 -> JS.Prefix JS.PrefixNot (JS.Prefix JS.PrefixNot left)
         JS.Bool b -> if b then JS.Prefix JS.PrefixNot left else left
         _         -> JS.Infix JS.OpNe left right
@@ -712,7 +724,7 @@ crushIfsHelp
 crushIfsHelp visitedBranches unvisitedBranches final =
   case unvisitedBranches of
     [] ->
-        case final of
+        case Opt.unTrack final of
           Opt.If subBranches subFinal ->
               crushIfsHelp visitedBranches subBranches subFinal
 

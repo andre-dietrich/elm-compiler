@@ -33,6 +33,7 @@ type Cycle =
 
 optimize :: Cycle -> Can.Expr -> Names.Tracker Opt.Expr
 optimize cycle (A.At region expression) =
+  Opt.TrackedExpr region <$>
   case expression of
     Can.VarLocal name ->
       pure (Opt.VarLocal name)
@@ -136,7 +137,7 @@ optimize cycle (A.At region expression) =
       in
       do  temp <- Names.generate
           oexpr <- optimize cycle expr
-          case oexpr of
+          case Opt.unTrack oexpr of
             Opt.VarLocal root ->
               Case.optimize temp root <$> traverse (optimizeBranch root) branches
 
@@ -425,7 +426,7 @@ optimizeTail cycle rootName argNames locExpr@(A.At _ expression) =
       in
       do  temp <- Names.generate
           oexpr <- optimize cycle expr
-          case oexpr of
+          case Opt.unTrack oexpr of
             Opt.VarLocal root ->
               Case.optimize temp root <$> traverse (optimizeBranch root) branches
 
@@ -452,6 +453,9 @@ toTailDef name argNames destructors body =
 hasTailCall :: Opt.Expr -> Bool
 hasTailCall expression =
   case expression of
+    Opt.TrackedExpr _ inner ->
+      hasTailCall inner
+
     Opt.TailCall _ _ ->
       True
 
