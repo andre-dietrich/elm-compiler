@@ -1,5 +1,6 @@
 {-# OPTIONS_GHC -fno-warn-x-partial #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternGuards #-}
 module Generate.JavaScript.Expression
   ( generate
   , generateCtor
@@ -59,7 +60,7 @@ generate mode expression =
       JsExpr $
         case mode of
           Mode.Dev  _ -> JS.Call toChar [ JS.String (P.primBounded charUtf8 c) ]
-          Mode.Prod _ -> JS.String (P.primBounded charUtf8 c)
+          Mode.Prod _ _ -> JS.String (P.primBounded charUtf8 c)
 
     Opt.Str      s -> JsExpr $ JS.String (Utf8.toBuilder s)
     Opt.Int      i -> JsExpr $ JS.Int i
@@ -72,13 +73,13 @@ generate mode expression =
     Opt.VarEnum (Opt.Global home name) index ->
       case mode of
         Mode.Dev  _ -> JsExpr $ JS.Ref (JsName.fromGlobal home name)
-        Mode.Prod _ -> JsExpr $ JS.Int (Index.toMachine index)
+        Mode.Prod _ _ -> JsExpr $ JS.Int (Index.toMachine index)
 
     Opt.VarBox (Opt.Global home name) ->
       JsExpr $ JS.Ref $
         case mode of
           Mode.Dev  _ -> JsName.fromGlobal home name
-          Mode.Prod _ -> JsName.fromGlobal ModuleName.basics Name.identity
+          Mode.Prod _ _ -> JsName.fromGlobal ModuleName.basics Name.identity
 
     Opt.VarCycle h n     -> JsExpr $ JS.Call (JS.Ref (JsName.fromCycle h n)) []
     Opt.VarDebug n h r u -> JsExpr $ generateDebug n h r u
@@ -134,7 +135,7 @@ generate mode expression =
     Opt.Unit ->
       case mode of
         Mode.Dev  _ -> JsExpr $ JS.Ref (JsName.fromKernel Name.utils "Tuple0")
-        Mode.Prod _ -> JsExpr $ JS.Int 0
+        Mode.Prod _ _ -> JsExpr $ JS.Int 0
 
     Opt.Tuple a b maybeC ->
       JsExpr $
@@ -238,7 +239,7 @@ generateCtor mode (Opt.Global home name) index arity =
     ctorTag =
       case mode of
         Mode.Dev  _ -> JS.String (Name.toBuilder name)
-        Mode.Prod _ -> JS.Int (ctorToInt home name index)
+        Mode.Prod _ _ -> JS.Int (ctorToInt home name index)
   in
   generateFunction argNames $ JsExpr $ JS.Object $
     (JsName.dollar, ctorTag) : map (\n -> (n, JS.Ref n)) argNames
@@ -269,7 +270,7 @@ generateField :: Mode.Mode -> Name.Name -> JsName.Name
 generateField mode name =
   case mode of
     Mode.Dev _       -> JsName.fromLocal name
-    Mode.Prod fields -> fields ! name
+    Mode.Prod fields _ -> fields ! name
 
 
 
@@ -279,7 +280,7 @@ generateField mode name =
 generateUpdate :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> Code
 generateUpdate mode record fields =
   case mode of
-    Mode.Prod _ | hasNestedUpdate fields ->
+    Mode.Prod _ _ | hasNestedUpdate fields ->
       JsExpr $ generateInlineUpdate mode record fields
 
     _ ->
@@ -436,10 +437,13 @@ generateCall mode func args =
     Opt.VarGlobal global@(Opt.Global (ModuleName.Canonical pkg _) _) | pkg == Pkg.core ->
       generateCoreCall mode global args
 
+    Opt.VarGlobal global | Just arity <- Mode.lookupArity mode global, arity == length args ->
+      generateDirectCall mode global args
+
     Opt.VarBox _ ->
       case mode of
         Mode.Dev  _ -> generateCallHelp mode func args
-        Mode.Prod _ ->
+        Mode.Prod _ _ ->
           case args of
             [arg] -> generateJsExpr mode arg
             _     -> generateCallHelp mode func args
@@ -458,6 +462,23 @@ generateCallHelp mode func args =
 generateGlobalCall :: ModuleName.Canonical -> Name.Name -> [JS.Expr] -> JS.Expr
 generateGlobalCall home name args =
   generateNormalCall (JS.Ref (JsName.fromGlobal home name)) args
+
+
+-- A call site with exactly as many arguments as the callee's known arity
+-- always takes the `fun.a === N` branch of `A2`..`A9` (see Generate.Mode).
+-- Reading `fun.f` and calling it directly skips that check and keeps the
+-- call site monomorphic instead of routing it through the shared,
+-- megamorphic `A2`..`A9` helpers.
+generateDirectCall :: Mode.Mode -> Opt.Global -> [Opt.Expr] -> JS.Expr
+generateDirectCall mode (Opt.Global home name) args =
+  JS.Call
+    (JS.Access (JS.Ref (JsName.fromGlobal home name)) rawFunctionField)
+    (map (generateJsExpr mode) args)
+
+
+rawFunctionField :: JsName.Name
+rawFunctionField =
+  JsName.fromLocal "f"
 
 
 generateNormalCall :: JS.Expr -> [JS.Expr] -> JS.Expr
@@ -479,11 +500,13 @@ callHelpers =
 
 
 generateCoreCall :: Mode.Mode -> Opt.Global -> [Opt.Expr] -> JS.Expr
-generateCoreCall mode (Opt.Global home@(ModuleName.Canonical _ moduleName) name) args
+generateCoreCall mode global@(Opt.Global home@(ModuleName.Canonical _ moduleName) name) args
   | moduleName == Name.basics  = generateBasicsCall mode home name args
   | moduleName == Name.bitwise = generateBitwiseCall home name (map (generateJsExpr mode) args)
   | moduleName == Name.tuple   = generateTupleCall   home name (map (generateJsExpr mode) args)
   | moduleName == Name.jsArray = generateJsArrayCall home name (map (generateJsExpr mode) args)
+  | Just arity <- Mode.lookupArity mode global, arity == length args =
+      generateDirectCall mode global args
   | otherwise                  = generateGlobalCall  home name (map (generateJsExpr mode) args)
 
 
@@ -738,7 +761,7 @@ generatePath mode path =
     Opt.Unbox p ->
       case mode of
         Mode.Dev  _ -> JS.Access (generatePath mode p) (JsName.fromIndex Index.first)
-        Mode.Prod _ -> generatePath mode p
+        Mode.Prod _ _ -> generatePath mode p
 
 
 
@@ -864,7 +887,7 @@ generateIfTest mode root (path, test) =
         tag =
           case mode of
             Mode.Dev  _ -> JS.Access value JsName.dollar
-            Mode.Prod _ ->
+            Mode.Prod _ _ ->
               case opts of
                 Can.Normal -> JS.Access value JsName.dollar
                 Can.Enum   -> value
@@ -873,7 +896,7 @@ generateIfTest mode root (path, test) =
       strictEq tag $
         case mode of
           Mode.Dev _ -> JS.String (Name.toBuilder name)
-          Mode.Prod _ -> JS.Int (ctorToInt home name index)
+          Mode.Prod _ _ -> JS.Int (ctorToInt home name index)
 
     DT.IsBool True  -> value
     DT.IsBool False -> JS.Prefix JS.PrefixNot value
@@ -883,7 +906,7 @@ generateIfTest mode root (path, test) =
       strictEq (JS.String (P.primBounded charUtf8 char)) $
         case mode of
           Mode.Dev _ -> JS.Call (JS.Access value (JsName.fromLocal "valueOf")) []
-          Mode.Prod _ -> value
+          Mode.Prod _ _ -> value
 
     DT.IsStr string ->
       strictEq value (JS.String (Utf8.toBuilder string))
@@ -913,7 +936,7 @@ generateCaseValue mode test =
     DT.IsCtor home name index _ _ ->
       case mode of
         Mode.Dev  _ -> JS.String (Name.toBuilder name)
-        Mode.Prod _ -> JS.Int (ctorToInt home name index)
+        Mode.Prod _ _ -> JS.Int (ctorToInt home name index)
 
     DT.IsInt  i -> JS.Int i
     DT.IsChr  c -> JS.String (P.primBounded charUtf8 c)
@@ -936,7 +959,7 @@ generateCaseTest mode root path exampleTest =
       else
         case mode of
           Mode.Dev  _ -> JS.Access value JsName.dollar
-          Mode.Prod _ ->
+          Mode.Prod _ _ ->
             case opts of
               Can.Normal -> JS.Access value JsName.dollar
               Can.Enum   -> value
@@ -947,7 +970,7 @@ generateCaseTest mode root path exampleTest =
     DT.IsChr _ ->
       case mode of
         Mode.Dev  _ -> JS.Call (JS.Access value (JsName.fromLocal "valueOf")) []
-        Mode.Prod _ -> value
+        Mode.Prod _ _ -> value
 
     DT.IsBool _ -> error "COMPILER BUG - there should never be three tests on a list"
     DT.IsCons   -> error "COMPILER BUG - there should never be three tests on a list"
@@ -968,7 +991,7 @@ pathToJsExpr mode root path =
     DT.Unbox p ->
       case mode of
         Mode.Dev  _ -> JS.Access (pathToJsExpr mode root p) (JsName.fromIndex Index.first)
-        Mode.Prod _ -> pathToJsExpr mode root p
+        Mode.Prod _ _ -> pathToJsExpr mode root p
 
     DT.Empty ->
       JS.Ref (JsName.fromLocal root)
@@ -1033,7 +1056,7 @@ generateMain mode home main =
 toDebugMetadata :: Mode.Mode -> Can.Type -> JS.Expr
 toDebugMetadata mode msgType =
   case mode of
-    Mode.Prod _ ->
+    Mode.Prod _ _ ->
       JS.Int 0
 
     Mode.Dev Nothing ->

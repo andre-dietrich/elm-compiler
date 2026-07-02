@@ -60,7 +60,7 @@ addMain mode graph home _ state =
 perfNote :: Mode.Mode -> B.Builder
 perfNote mode =
   case mode of
-    Mode.Prod _ ->
+    Mode.Prod _ _ ->
       ""
 
     Mode.Dev Nothing ->
@@ -283,7 +283,7 @@ generateCycle mode (Opt.Global home _) names values functions =
 
         realBlock@(_:_) ->
             case mode of
-              Mode.Prod _ ->
+              Mode.Prod _ _ ->
                 JS.Block realBlock
 
               Mode.Dev _ ->
@@ -371,7 +371,7 @@ addChunk mode chunk builder =
         Mode.Dev _ ->
           builder
 
-        Mode.Prod _ ->
+        Mode.Prod _ _ ->
           "_UNUSED" <> builder
 
     K.Prod ->
@@ -379,7 +379,7 @@ addChunk mode chunk builder =
         Mode.Dev _ ->
           "_UNUSED" <> builder
 
-        Mode.Prod _ ->
+        Mode.Prod _ _ ->
           builder
 
 
@@ -394,7 +394,7 @@ generateEnum mode global@(Opt.Global home name) index =
       Mode.Dev _ ->
         Expr.codeToExpr (Expr.generateCtor mode global index 0)
 
-      Mode.Prod _ ->
+      Mode.Prod _ _ ->
         JS.Int (Index.toMachine index)
 
 
@@ -409,7 +409,7 @@ generateBox mode global@(Opt.Global home name) =
       Mode.Dev _ ->
         Expr.codeToExpr (Expr.generateCtor mode global Index.first 1)
 
-      Mode.Prod _ ->
+      Mode.Prod _ _ ->
         JS.Ref (JsName.fromGlobal ModuleName.basics Name.identity)
 
 
