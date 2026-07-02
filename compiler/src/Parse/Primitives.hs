@@ -19,7 +19,7 @@ module Parse.Primitives
   , inContext, specialize
   , getPosition, getRegion, addLocation, addEnd
   , withIndent, withBacksetIndent
-  , word1, word2
+  , word1, word2, word1Reject
   , Snippet(..)
   , fromSnippet
   --
@@ -406,6 +406,18 @@ word2 w1 w2 toError =
       cok () newState
     else
       eerr cur toError
+
+
+-- Succeeds without consuming input, unless the next byte is `word`; in that
+-- case it fails with `toError`. A negative byte-lookahead -- e.g. to reject an
+-- empty `.{}` update group.
+word1Reject :: Word8# -> (Cursor -> x) -> Parser x ()
+word1Reject word toError =
+  Parser $ \_ (State pos end indent cur) _ eok _ eerr ->
+    if ltAddr pos end && eqIndex pos 0# word then
+      eerr cur toError
+    else
+      eok () (State pos end indent cur)
 
 
 

@@ -235,6 +235,7 @@ data Record
   = RecordOpen Cursor
   | RecordEnd Cursor
   | RecordField Cursor
+  | RecordEmptyGroup Cursor
   | RecordEquals Cursor
   | RecordExpr Expr Cursor
   | RecordSpace Space Cursor
@@ -4163,6 +4164,28 @@ toRecordReport source context record startCur =
                   , noteForRecordError
                   ]
               )
+
+    RecordEmptyGroup cur ->
+      let
+        surroundings = A.Region startCur cur
+        region = toRegion cur
+      in
+      Report.Report "EMPTY UPDATE GROUP" region [] $
+        Code.toSnippet source surroundings (Just region)
+          (
+            D.reflow $
+              "This record-update group does not have any fields in it:"
+          ,
+            D.stack
+              [ D.reflow $
+                  "A `.{ ... }` group must update at least one field. Add some fields like this:"
+              , D.indent 4 $ D.dullyellow $ D.fromChars "{ model | a.{ x = 1, y = 2 } }"
+              , D.reflow $
+                  "Or, if you only meant to change a single field, drop the braces and write the\
+                  \ path directly:"
+              , D.indent 4 $ D.dullyellow $ D.fromChars "{ model | a.x = 1 }"
+              ]
+          )
 
     RecordEquals cur ->
       let

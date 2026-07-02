@@ -285,6 +285,7 @@ chompFieldRest path =
           oneOf E.RecordOpen
             [ do  word1 0x7B#Word8 {- { -} E.RecordOpen  -- `.{` opens a group
                   Space.chompAndCheckIndent E.RecordSpace E.RecordIndentField
+                  word1Reject 0x7D#Word8 {- } -} E.RecordEmptyGroup
                   fields <- chompUpdateGroup path
                   Space.chompAndCheckIndent E.RecordSpace E.RecordIndentEnd
                   return fields
