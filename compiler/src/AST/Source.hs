@@ -1,5 +1,6 @@
 module AST.Source
   ( Expr, Expr_(..), VarType(..)
+  , UpdateOp(..)
   , Def(..)
   , Pattern, Pattern_(..)
   , Type, Type_(..)
@@ -59,11 +60,17 @@ data Expr_
   | Case Expr [(Pattern, Expr)]
   | Accessor Name
   | Access Expr (A.Located Name)
-  | Update (A.Located Name) [([A.Located Name], Expr)]
+  | Update (A.Located Name) [([A.Located Name], UpdateOp, Expr)]
   | Record [(A.Located Name, Expr)]
   | Unit
   | Tuple Expr Expr [Expr]
   | Shader Shader.Source Shader.Types
+
+
+-- How a record-update field combines with the old value:
+--   Set    (`=` ) replaces the field
+--   Modify (`<-`) applies the right-hand function to the old value
+data UpdateOp = Set | Modify
 
 
 data VarType = LowVar | CapVar

@@ -205,8 +205,8 @@ record start =
                 oneOf E.RecordEquals
                   [ do  word1 0x7C#Word8 {-|-} E.RecordEquals
                         Space.chompAndCheckIndent E.RecordSpace E.RecordIndentField
-                        firstField <- chompUpdateField
-                        fields <- chompUpdateFields [firstField]
+                        firstFields <- chompUpdateField []
+                        fields <- chompUpdateFields (reverse firstFields)
                         addEnd start (Src.Update starter fields)
                   , do  word1 0x3D#Word8 {-=-} E.RecordEquals
                         Space.chompAndCheckIndent E.RecordSpace E.RecordIndentExpr
@@ -244,44 +244,95 @@ chompField =
       return (key, value)
 
 
--- UPDATE FIELDS (with dotted paths, e.g. `a.b.c = value`)
+-- UPDATE FIELDS
+--
+-- A field's left-hand side is a dotted path. Each leaf is written either with
+-- `=` (replace, `Src.Set`) or `<-` (apply a function to the old value,
+-- `Src.Modify`). A path may also end in a `.{ ... }` group, which is sugar for
+-- several updates sharing that prefix, e.g. `a.b.{ x = 1, y <- f }` desugars to
+-- `a.b.x = 1, a.b.y <- f`. Groups nest, so one field on the left may expand to
+-- several `UpdateField`s -- hence the list results below.
 
 
-type UpdateField = ( [A.Located Name.Name], Src.Expr )
+type UpdateField = ( [A.Located Name.Name], Src.UpdateOp, Src.Expr )
 
 
 chompUpdateFields :: [UpdateField] -> Parser E.Record [UpdateField]
-chompUpdateFields fields =
+chompUpdateFields revFields =
   oneOf E.RecordEnd
     [ do  word1 0x2C#Word8 {-,-} E.RecordEnd
           Space.chompAndCheckIndent E.RecordSpace E.RecordIndentField
-          f <- chompUpdateField
-          chompUpdateFields (f : fields)
+          fs <- chompUpdateField []
+          chompUpdateFields (reverse fs ++ revFields)
     , do  word1 0x7D#Word8 {-}-} E.RecordEnd
-          return (reverse fields)
+          return (reverse revFields)
     ]
 
 
-chompUpdateField :: Parser E.Record UpdateField
-chompUpdateField =
+-- Reads one left-hand entry, `prefix` holding any path segments consumed by an
+-- enclosing group. Returns every `UpdateField` the entry expands to (one for a
+-- plain leaf, several for a `.{ ... }` group).
+chompUpdateField :: [A.Located Name.Name] -> Parser E.Record [UpdateField]
+chompUpdateField prefix =
   do  key <- addLocation (Var.lower E.RecordField)
-      path <- chompPath [key]
-      Space.chompAndCheckIndent E.RecordSpace E.RecordIndentEquals
-      word1 0x3D#Word8 {-=-} E.RecordEquals
-      Space.chompAndCheckIndent E.RecordSpace E.RecordIndentExpr
+      chompFieldRest (prefix ++ [key])
+
+
+chompFieldRest :: [A.Located Name.Name] -> Parser E.Record [UpdateField]
+chompFieldRest path =
+  oneOf E.RecordEquals
+    [ do  word1 0x2E#Word8 {-.-} E.RecordField
+          oneOf E.RecordOpen
+            [ do  word1 0x7B#Word8 {- { -} E.RecordOpen  -- `.{` opens a group
+                  Space.chompAndCheckIndent E.RecordSpace E.RecordIndentField
+                  fields <- chompUpdateGroup path
+                  Space.chompAndCheckIndent E.RecordSpace E.RecordIndentEnd
+                  return fields
+            , do  field <- addLocation (Var.lower E.RecordField)  -- deeper segment
+                  chompFieldRest (path ++ [field])
+            ]
+    , do  Space.chompAndCheckIndent E.RecordSpace E.RecordIndentEquals
+          op <- chompUpdateOp
+          value <- chompUpdateValue
+          return [ (path, op, value) ]
+    ]
+
+
+chompUpdateOp :: Parser E.Record Src.UpdateOp
+chompUpdateOp =
+  oneOf E.RecordEquals
+    [ do  word1 0x3D#Word8 {-=-} E.RecordEquals
+          return Src.Set
+    , do  word1 0x3C#Word8 {-<-} E.RecordEquals
+          word1 0x2D#Word8 {---} E.RecordEquals
+          return Src.Modify
+    ]
+
+
+chompUpdateValue :: Parser E.Record Src.Expr
+chompUpdateValue =
+  do  Space.chompAndCheckIndent E.RecordSpace E.RecordIndentExpr
       (value, end) <- specialize E.RecordExpr expression
       Space.checkIndent end E.RecordIndentEnd
-      return (path, value)
+      return value
 
 
-chompPath :: [A.Located Name.Name] -> Parser E.Record [A.Located Name.Name]
-chompPath revSegments =
-  oneOfWithFallback
-    [ do  word1 0x2E#Word8 {-.-} E.RecordField
-          field <- addLocation (Var.lower E.RecordField)
-          chompPath (field : revSegments)
+chompUpdateGroup :: [A.Located Name.Name] -> Parser E.Record [UpdateField]
+chompUpdateGroup prefix =
+  do  first <- chompUpdateField prefix
+      chompUpdateGroupMore prefix first
+
+
+chompUpdateGroupMore :: [A.Located Name.Name] -> [UpdateField] -> Parser E.Record [UpdateField]
+chompUpdateGroupMore prefix acc =
+  oneOf E.RecordEnd
+    [ do  word1 0x2C#Word8 {-,-} E.RecordEnd
+          Space.chompAndCheckIndent E.RecordSpace E.RecordIndentField
+          more <- chompUpdateField prefix
+          chompUpdateGroupMore prefix (acc ++ more)
+    , do  word1 0x7D#Word8 {-}-} E.RecordEnd
+          return acc
     ]
-    (reverse revSegments)
 
 
 
