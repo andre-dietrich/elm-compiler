@@ -1,0 +1,171 @@
+name: Build & Release Binaries
+
+# Builds the `elm` compiler for every supported target and stores each binary as
+# a workflow artifact. On a version tag (`v*`) -- or a manual run with
+# `release=true` -- the binaries are also attached to a GitHub Release.
+#
+# Targets:
+#   linux/x86_64    static musl binary (portable across distros)   [Dockerfile]
+#   linux/aarch64   static musl binary                             [Dockerfile]
+#   macos/x86_64    native (Intel)                                 [setup-haskell]
+#   macos/aarch64   native (Apple Silicon)                         [setup-haskell]
+#   windows/x86_64  native                                         [setup-haskell]
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Also create a GitHub release from this run"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # required to create releases and upload assets
+
+# Keep GHC/cabal in one place so every native job stays in lock-step with the
+# versions the project is built with (see installers/linux/Dockerfile).
+env:
+  GHC_VERSION: '9.8.4'
+  CABAL_VERSION: '3.12.1.0'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux: fully static binaries via the existing Alpine/musl Dockerfile.
+  # amd64 runs on the x64 runner; arm64 runs on the native GitHub arm64 runner
+  # (avoids emulating the whole GHC build under QEMU, which is extremely slow).
+  #
+  # NOTE: `ubuntu-24.04-arm` is free for public repos. On a private repo it needs
+  # a plan with arm64 runners -- drop that matrix entry or switch it to QEMU.
+  # ---------------------------------------------------------------------------
+  linux:
+    name: linux / ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static binary (Alpine/musl)
+        run: |
+          docker build -f installers/linux/Dockerfile -t elm-build .
+          cid=$(docker create elm-build)
+          docker cp "$cid:/usr/local/bin/elm" ./elm
+          docker rm "$cid"
+          file ./elm
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp elm "dist/elm-linux-${{ matrix.arch }}"
+          gzip -c elm > "dist/elm-linux-${{ matrix.arch }}.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elm-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS + Windows: native builds. The binaries link only libraries that ship
+  # with the OS, so they are portable across machines of the same arch.
+  # ---------------------------------------------------------------------------
+  native:
+    name: ${{ matrix.os }} / ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13        # Intel
+            os: macos
+            arch: x86_64
+          - runner: macos-14        # Apple Silicon
+            os: macos
+            arch: aarch64
+          - runner: windows-latest
+            os: windows
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - name: Cache cabal store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-cabal-${{ hashFiles('elm.cabal') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cabal-
+
+      # The reactor front-end is compiled at build time (Template Haskell) by the
+      # freshly built compiler, which downloads Elm packages -- hence the network
+      # is needed here. GitHub runners have it, so no extra setup is required.
+      - name: Build
+        run: |
+          cabal update
+          cabal build elm
+
+      - name: Package (unix)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          bin=$(cabal list-bin elm)
+          cp "$bin" elm
+          strip elm || true
+          cp elm "dist/elm-${{ matrix.os }}-${{ matrix.arch }}"
+          gzip -c elm > "dist/elm-${{ matrix.os }}-${{ matrix.arch }}.gz"
+
+      - name: Package (windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          bin=$(cabal list-bin elm)
+          cp "$bin" elm.exe
+          cp elm.exe "dist/elm-windows-${{ matrix.arch }}.exe"
+          7z a "dist/elm-windows-${{ matrix.arch }}.zip" elm.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elm-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Collect every artifact and publish a GitHub Release (tags, or manual run
+  # with release=true).
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [linux, native]
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List collected assets
+        run: ls -lR artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
