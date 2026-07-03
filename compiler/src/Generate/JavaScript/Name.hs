@@ -13,6 +13,10 @@ module Generate.JavaScript.Name
   , makeA
   , makeLabel
   , makeTemp
+  , makeMCStart
+  , makeMCEnd
+  , makeMCCell
+  , makeMCHead
   , dollar
   )
   where
@@ -115,6 +119,29 @@ makeLabel name index =
 makeTemp :: Name.Name -> Name
 makeTemp name =
   Name ("$temp$" <> Name.toBuilder name)
+
+
+-- Sentinel/accumulator locals for a Tail-Call-Modulo-Cons loop, keyed by
+-- the function's own name (collision-free: `$` cannot appear in Elm
+-- identifiers, so these can never collide with argNames or user locals).
+makeMCStart :: Name.Name -> Name
+makeMCStart name =
+  Name ("$start$" <> Name.toBuilder name)
+
+
+makeMCEnd :: Name.Name -> Name
+makeMCEnd name =
+  Name ("$end$" <> Name.toBuilder name)
+
+
+makeMCCell :: Name.Name -> Name
+makeMCCell name =
+  Name ("$cell$" <> Name.toBuilder name)
+
+
+makeMCHead :: Name.Name -> Name
+makeMCHead name =
+  Name ("$head$" <> Name.toBuilder name)
 
 
 dollar :: Name

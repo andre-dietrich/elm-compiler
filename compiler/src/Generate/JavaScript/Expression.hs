@@ -6,6 +6,7 @@ module Generate.JavaScript.Expression
   , generateCtor
   , generateField
   , generateTailDef
+  , generateTailDefCons
   , generateMain
   , generateUnwrapped
   , generateUnwrappedTail
@@ -104,6 +105,8 @@ generate mode expression =
 
     Opt.Call f xs     -> JsExpr $ generateCall mode f xs
     Opt.TailCall n xs -> JsBlock $ generateTailCall mode n xs
+    Opt.TailCallCons n headExpr xs -> JsBlock $ generateTailCallCons mode n headExpr xs
+    Opt.TailCallConsBase n valueExpr -> JsBlock $ generateTailCallConsBase mode n valueExpr
     Opt.If bs f       -> generateIf mode bs f
 
     Opt.Let def body ->
@@ -865,6 +868,59 @@ generateTailCall mode name args =
 
 
 
+-- TAIL RECURSION MODULO CONS (Kernel List `::` only, see Optimize.Expression)
+
+
+listCons :: JS.Expr
+listCons =
+  JS.Ref (JsName.fromKernel Name.list "Cons")
+
+
+listNil :: JS.Expr
+listNil =
+  JS.Ref (JsName.fromKernel Name.list "Nil")
+
+
+-- the accumulator's currently-open cell always has the head value at
+-- field "a" (unused once filled) and the hole at field "b" (tail)
+mcHoleField :: JsName.Name
+mcHoleField =
+  JsName.fromIndex Index.second
+
+
+generateTailCallCons :: Mode.Mode -> Name.Name -> Opt.Expr -> [(Name.Name, Opt.Expr)] -> [JS.Stmt]
+generateTailCallCons mode name headExpr args =
+  let
+    headTemp = JsName.makeMCHead name
+    cellName = JsName.makeMCCell name
+    endName = JsName.makeMCEnd name
+
+    toTempVars (argName, arg) =
+      ( JsName.makeTemp argName, generateJsExpr mode arg )
+
+    toRealVars (argName, _) =
+      JS.ExprStmt $
+        JS.Assign (JS.LRef (JsName.fromLocal argName)) (JS.Ref (JsName.makeTemp argName))
+  in
+  JS.Vars ((headTemp, generateJsExpr mode headExpr) : map toTempVars args)
+  : map toRealVars args
+  ++
+  [ JS.Var cellName (JS.Call listCons [JS.Ref headTemp, listNil])
+  , JS.ExprStmt $ JS.Assign (JS.LDot (JS.Ref endName) mcHoleField) (JS.Ref cellName)
+  , JS.ExprStmt $ JS.Assign (JS.LRef endName) (JS.Ref cellName)
+  , JS.Continue (Just (JsName.fromLocal name))
+  ]
+
+
+generateTailCallConsBase :: Mode.Mode -> Name.Name -> Opt.Expr -> [JS.Stmt]
+generateTailCallConsBase mode name valueExpr =
+  [ JS.ExprStmt $
+      JS.Assign (JS.LDot (JS.Ref (JsName.makeMCEnd name)) mcHoleField) (generateJsExpr mode valueExpr)
+  , JS.Return $ JS.Access (JS.Ref (JsName.makeMCStart name)) mcHoleField
+  ]
+
+
+
 -- DEFINITIONS
 
 
@@ -877,11 +933,25 @@ generateDef mode def =
     Opt.TailDef name argNames body ->
       JS.Var (JsName.fromLocal name) (codeToExpr (generateTailDef mode name argNames body))
 
+    Opt.TailDefCons name argNames body ->
+      JS.Var (JsName.fromLocal name) (codeToExpr (generateTailDefCons mode name argNames body))
+
 
 generateTailDef :: Mode.Mode -> Name.Name -> [Name.Name] -> Opt.Expr -> Code
 generateTailDef mode name argNames body =
   generateFunction (map JsName.fromLocal argNames) $ JsBlock $
     [ JS.Labelled (JsName.fromLocal name) $
+        JS.While (JS.Bool True) $
+          codeToStmt $ generate mode body
+    ]
+
+
+generateTailDefCons :: Mode.Mode -> Name.Name -> [Name.Name] -> Opt.Expr -> Code
+generateTailDefCons mode name argNames body =
+  generateFunction (map JsName.fromLocal argNames) $ JsBlock $
+    [ JS.Var (JsName.makeMCStart name) (JS.Call listCons [JS.Null, listNil])
+    , JS.Var (JsName.makeMCEnd name) (JS.Ref (JsName.makeMCStart name))
+    , JS.Labelled (JsName.fromLocal name) $
         JS.While (JS.Bool True) $
           codeToStmt $ generate mode body
     ]

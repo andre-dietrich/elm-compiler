@@ -465,6 +465,140 @@ destructCtorArg path revDs (Can.PatternCtorArg index _ arg) =
 
 
 
+-- TAIL RECURSION MODULO CONS
+--
+-- `f x :: recurse rest` (Kernel List `::` whose right operand is a
+-- saturated self-call, in tail position) compiles to a loop that builds
+-- the result list top-down and fills a "hole" via mutation, instead of a
+-- non-tail recursive call whose stack depth is bounded by input length.
+-- See memory/trmc-plan.md for the design and Schritt-0 benchmark data.
+--
+-- V1 scope: only the Kernel `List.cons` constructor (2 fields, hole is
+-- the tail/second field), and only a direct self-call as the right
+-- operand (no further nesting through If/Case on that side). Branches
+-- that are a bare self-call with no `::` wrapper (Opt.TailCall) may
+-- coexist with TailCallCons branches in the same function: they simply
+-- continue the loop without opening a new cell.
+
+
+isListCons :: ModuleName.Canonical -> Name.Name -> Bool
+isListCons home name =
+  home == ModuleName.list && name == "cons"
+
+
+-- Does a Can.Expr, if it is exactly a saturated self-call, match the
+-- function being defined? Used for both the ordinary Opt.TailCall case
+-- and (here) the recursive operand of a `::` modulo-cons step.
+matchTailSelfCall :: Hints -> Cycle -> Name.Name -> [Name.Name] -> Can.Expr -> Names.Tracker (Maybe [(Name.Name, Opt.Expr)])
+matchTailSelfCall hints cycle rootName argNames (A.At _ expression) =
+  case expression of
+    Can.Call func args ->
+      let
+        isMatchingName =
+          case A.toValue func of
+            Can.VarLocal      name -> rootName == name
+            Can.VarTopLevel _ name -> rootName == name
+            _                      -> False
+      in
+      if isMatchingName then
+        do  oargs <- traverse (optimize hints cycle) args
+            case Index.indexedZipWith (\_ a b -> (a,b)) argNames oargs of
+              Index.LengthMatch pairs  -> pure (Just pairs)
+              Index.LengthMismatch _ _ -> pure Nothing
+      else
+        pure Nothing
+
+    _ ->
+      pure Nothing
+
+
+-- Does this (already optimized) tail body contain a TailCallCons anywhere
+-- reachable in tail position? If so, the whole def needs the sentinel/
+-- hole-mutation wrapper instead of the plain label+while loop.
+hasTailCallCons :: Opt.Expr -> Bool
+hasTailCallCons expression =
+  case expression of
+    Opt.TailCallCons _ _ _ ->
+      True
+
+    Opt.If branches finally ->
+      hasTailCallCons finally || any (hasTailCallCons . snd) branches
+
+    Opt.Let _ body ->
+      hasTailCallCons body
+
+    Opt.Destruct _ body ->
+      hasTailCallCons body
+
+    Opt.Case _ _ decider jumps ->
+      deciderHasTailCallCons decider || any (hasTailCallCons . snd) jumps
+
+    _ ->
+      False
+
+
+deciderHasTailCallCons :: Opt.Decider Opt.Choice -> Bool
+deciderHasTailCallCons decider =
+  case decider of
+    Opt.Leaf (Opt.Inline expr) ->
+      hasTailCallCons expr
+
+    Opt.Leaf (Opt.Jump _) ->
+      False
+
+    Opt.Chain _ success failure ->
+      deciderHasTailCallCons success || deciderHasTailCallCons failure
+
+    Opt.FanOut _ tests fallback ->
+      deciderHasTailCallCons fallback || any (deciderHasTailCallCons . snd) tests
+
+
+-- Once a def is known to need the modulo-cons wrapper, every leaf that is
+-- not already a recursive step (TailCall/TailCallCons) is a base case:
+-- wrap it so codegen fills the open hole and returns, instead of just
+-- returning the value directly.
+wrapConsBase :: Name.Name -> Opt.Expr -> Opt.Expr
+wrapConsBase rootName expression =
+  case expression of
+    Opt.TailCall _ _ ->
+      expression
+
+    Opt.TailCallCons _ _ _ ->
+      expression
+
+    Opt.If branches finally ->
+      Opt.If (map (\(c,b) -> (c, wrapConsBase rootName b)) branches) (wrapConsBase rootName finally)
+
+    Opt.Let def body ->
+      Opt.Let def (wrapConsBase rootName body)
+
+    Opt.Destruct destructor body ->
+      Opt.Destruct destructor (wrapConsBase rootName body)
+
+    Opt.Case label root decider jumps ->
+      Opt.Case label root (wrapConsBaseDecider rootName decider) (map (\(i,e) -> (i, wrapConsBase rootName e)) jumps)
+
+    _ ->
+      Opt.TailCallConsBase rootName expression
+
+
+wrapConsBaseDecider :: Name.Name -> Opt.Decider Opt.Choice -> Opt.Decider Opt.Choice
+wrapConsBaseDecider rootName decider =
+  case decider of
+    Opt.Leaf (Opt.Inline expr) ->
+      Opt.Leaf (Opt.Inline (wrapConsBase rootName expr))
+
+    Opt.Leaf (Opt.Jump index) ->
+      Opt.Leaf (Opt.Jump index)
+
+    Opt.Chain testChain success failure ->
+      Opt.Chain testChain (wrapConsBaseDecider rootName success) (wrapConsBaseDecider rootName failure)
+
+    Opt.FanOut path tests fallback ->
+      Opt.FanOut path (map (\(t,d) -> (t, wrapConsBaseDecider rootName d)) tests) (wrapConsBaseDecider rootName fallback)
+
+
+
 -- TAIL CALL
 
 
@@ -509,6 +643,16 @@ optimizeTail hints cycle rootName argNames locExpr@(A.At _ expression) =
             else
               do  ofunc <- optimize hints cycle func
                   pure $ Opt.Call ofunc oargs
+
+    Can.Binop _ home name _ left right | isListCons home name ->
+      do  maybeRebinds <- matchTailSelfCall hints cycle rootName argNames right
+          case maybeRebinds of
+            Just rebinds ->
+              do  optHead <- optimize hints cycle left
+                  Names.registerKernel Name.list (Opt.TailCallCons rootName optHead rebinds)
+
+            Nothing ->
+              optimize hints cycle locExpr
 
     Can.If branches finally ->
       let
@@ -569,7 +713,9 @@ optimizeTail hints cycle rootName argNames locExpr@(A.At _ expression) =
 
 toTailDef :: Name.Name -> [Name.Name] -> [Opt.Destructor] -> Opt.Expr -> Opt.Def
 toTailDef name argNames destructors body =
-  if hasTailCall body then
+  if hasTailCallCons body then
+    Opt.TailDefCons name argNames (wrapConsBase name (foldr Opt.Destruct body destructors))
+  else if hasTailCall body then
     Opt.TailDef name argNames (foldr Opt.Destruct body destructors)
   else
     Opt.Def name (Opt.Function argNames (foldr Opt.Destruct body destructors))
@@ -579,6 +725,9 @@ hasTailCall :: Opt.Expr -> Bool
 hasTailCall expression =
   case expression of
     Opt.TailCall _ _ ->
+      True
+
+    Opt.TailCallCons _ _ _ ->
       True
 
     Opt.If branches finally ->

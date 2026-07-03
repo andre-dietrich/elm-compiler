@@ -315,6 +315,10 @@ generateCycleFunc mode home def =
       JS.Var (JsName.fromGlobal home name) (Expr.codeToExpr (Expr.generateTailDef mode name args expr))
         : Maybe.maybeToList (Expr.generateUnwrappedTail mode (Opt.Global home name) args expr)
 
+    -- no `$unwrapped` sibling for TRMC defs yet (V1; see trmc-plan.md)
+    Opt.TailDefCons name args expr ->
+      [ JS.Var (JsName.fromGlobal home name) (Expr.codeToExpr (Expr.generateTailDefCons mode name args expr)) ]
+
 
 generateSafeCycle :: Mode.Mode -> ModuleName.Canonical -> (Name.Name, Opt.Expr) -> JS.Stmt
 generateSafeCycle mode home (name, expr) =
