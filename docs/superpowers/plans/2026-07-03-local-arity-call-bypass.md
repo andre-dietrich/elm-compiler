@@ -117,29 +117,35 @@ partialApplication xs =
     List.length (List.filter (inRange 0) xs)
 
 
--- Forward reference / mutual recursion between local let-peers.
+-- Forward reference / mutual recursion between local let-peers. Both
+-- functions take a second `steps` parameter (a genuine recursion-depth
+-- accumulator, not a dummy) specifically to make them arity 2: an arity-1
+-- function has no A-dispatch layer to bypass in the first place (there is
+-- no `A1` helper -- `f(x)` already is the direct call), so an arity-1
+-- version of this pair couldn't demonstrate anything about this change
+-- either way.
 -- `isEven`'s call to `isOdd` is a forward reference (isOdd's arity isn't
 -- known yet when isEven's body is generated) and must keep using A2.
 -- `isOdd`'s call to `isEven` is a backward reference (isEven's arity is
 -- already known) and should get the direct-call bypass after this change.
-isEvenViaMutual : Int -> Bool
+isEvenViaMutual : Int -> ( Bool, Int )
 isEvenViaMutual n =
     let
-        isEven k =
+        isEven k steps =
             if k == 0 then
-                True
+                ( True, steps )
 
             else
-                isOdd (k - 1)
+                isOdd (k - 1) (steps + 1)
 
-        isOdd k =
+        isOdd k steps =
             if k == 0 then
-                False
+                ( False, steps )
 
             else
-                isEven (k - 1)
+                isEven (k - 1) (steps + 1)
     in
-    isEven n
+    isEven n 0
 
 
 boolToString : Bool -> String
@@ -157,7 +163,7 @@ results =
         [ boolToString (validate 1 2 3)
         , String.fromInt (sumList (List.range 1 10))
         , String.fromInt (partialApplication (List.range (-5) 15))
-        , boolToString (isEvenViaMutual 10)
+        , boolToString (Tuple.first (isEvenViaMutual 10))
         ]
 
 
@@ -214,14 +220,16 @@ Expected: the first three all appear as `A2(...)` — none should be `.f(...)` y
 ```bash
 node -e "
 global.XMLHttpRequest = function () {};
-require('/tmp/elm-local-arity/baseline/prod.js');
-var app = this.Elm.Main.init();
+var Elm = require('/tmp/elm-local-arity/baseline/prod.js').Elm;
+var app = Elm.Main.init();
 app.ports.output.subscribe(function (msg) {
   console.log(msg);
   process.exit(0);
 });
 " | tee /tmp/elm-local-arity/baseline/node-output.txt
 ```
+
+(Note: reading `Elm` off `require(...)`'s return value, not off `this` — under Node's CommonJS module wrapper, a required file's top-level `this` is that module's own `module.exports`, not the caller's, so `this.Elm` in the `node -e` script is always `undefined` regardless of what was required.)
 
 Expected output: `True, 55, 11, True` (`partialApplication`'s `List.range (-5) 15` yields `[-5..15]`; `inRange 0` keeps `0..10`, 11 values)
 
@@ -691,8 +699,8 @@ Expected: `A2(isOdd` count ≥ 1 (the not-yet-accelerated forward reference), `A
 ```bash
 node -e "
 global.XMLHttpRequest = function () {};
-require('/tmp/elm-local-arity/after/prod.js');
-var app = this.Elm.Main.init();
+var Elm = require('/tmp/elm-local-arity/after/prod.js').Elm;
+var app = Elm.Main.init();
 app.ports.output.subscribe(function (msg) {
   console.log(msg);
   process.exit(0);
