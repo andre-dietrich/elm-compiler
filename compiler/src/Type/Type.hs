@@ -8,6 +8,8 @@ module Type.Type
   , Descriptor(Descriptor)
   , Content(..)
   , SuperType(..)
+  , PrimType(..)
+  , toPrimType
   , noRank
   , outermostRank
   , Mark
@@ -55,6 +57,7 @@ data Constraint
   | CLocal A.Region Name.Name (E.Expected Type)
   | CForeign A.Region Name.Name Can.Annotation (E.Expected Type)
   | CPattern A.Region E.PCategory Type (E.PExpected Type)
+  | CProbe A.Region Variable Variable
   | CAnd [Constraint]
   | CLet
       { _rigidVars :: [Variable]
@@ -223,6 +226,38 @@ bool = AppN ModuleName.basics "Bool" []
 {-# NOINLINE never #-}
 never :: Type
 never = AppN ModuleName.basics "Never" []
+
+
+
+-- PRIM TYPE PROBES
+--
+-- Used to record, for a `CProbe` constraint, whether a solved Variable
+-- ended up as a JS-primitive-safe monomorphic type. Deliberately excludes
+-- Char (boxed in --debug mode, see Elm.Kernel.Utils) and everything else
+-- (custom types, records, comparable/appendable type variables, ...).
+
+
+data PrimType = PInt | PFloat | PBool | PStr
+  deriving (Eq)
+
+
+toPrimType :: Variable -> IO (Maybe PrimType)
+toPrimType variable =
+  do  (Descriptor content _ _ _) <- UF.get variable
+      case content of
+        Structure (App1 home name []) ->
+          return $
+            if      home == ModuleName.basics && name == "Int"   then Just PInt
+            else if home == ModuleName.basics && name == "Float" then Just PFloat
+            else if home == ModuleName.basics && name == "Bool"  then Just PBool
+            else if home == ModuleName.string && name == "String" then Just PStr
+            else Nothing
+
+        Alias _ _ _ realVariable ->
+          toPrimType realVariable
+
+        _ ->
+          return Nothing
 
 
 

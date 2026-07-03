@@ -29,16 +29,18 @@ import qualified Type.UnionFind as UF
 -- RUN SOLVER
 
 
-run :: Constraint -> IO (Either (NE.List Error.Error) (Map.Map Name.Name Can.Annotation))
+run :: Constraint -> IO (Either (NE.List Error.Error) (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType))
 run constraint =
   do  pools <- MVector.replicate 8 []
 
-      (State env _ errors) <-
+      (State env _ errors probes) <-
         solve Map.empty outermostRank pools emptyState constraint
 
       case errors of
         [] ->
-          Right <$> traverse Type.toAnnotation env
+          do  annotations <- traverse Type.toAnnotation env
+              hints <- resolveProbes probes
+              return $ Right (annotations, hints)
 
         e:es ->
           return $ Left (NE.List e es)
@@ -48,7 +50,25 @@ run constraint =
 {-# NOINLINE emptyState #-}
 emptyState :: State
 emptyState =
-  State Map.empty (nextMark noMark) []
+  State Map.empty (nextMark noMark) [] []
+
+
+
+-- PRIM TYPE HINTS
+
+
+resolveProbes :: [(A.Region, Variable, Variable)] -> IO (Map.Map A.Region Type.PrimType)
+resolveProbes probes =
+  foldM addProbe Map.empty probes
+
+
+addProbe :: Map.Map A.Region Type.PrimType -> (A.Region, Variable, Variable) -> IO (Map.Map A.Region Type.PrimType)
+addProbe hints (region, leftVar, rightVar) =
+  do  maybeLeft <- Type.toPrimType leftVar
+      maybeRight <- Type.toPrimType rightVar
+      return $ case (maybeLeft, maybeRight) of
+        (Just left, Just right) | left == right -> Map.insert region left hints
+        _                                       -> hints
 
 
 
@@ -68,6 +88,7 @@ data State =
     { _env :: Env
     , _mark :: Mark
     , _errors :: [Error.Error]
+    , _probes :: [(A.Region, Variable, Variable)]
     }
 
 
@@ -140,6 +161,9 @@ solve env rank pools state constraint =
                     Error.BadPattern region category actualType
                       (Error.ptypeReplace expectation expectedType)
 
+    CProbe region leftVar rightVar ->
+      return $ state { _probes = (region, leftVar, rightVar) : _probes state }
+
     CAnd constraints ->
       foldM (solve env rank pools) state constraints
 
@@ -173,7 +197,7 @@ solve env rank pools state constraint =
 
           -- run solver in next pool
           locals <- traverse (A.traverse (typeToVariable nextRank nextPools)) header
-          (State savedEnv mark errors) <-
+          (State savedEnv mark errors probes) <-
             solve env nextRank nextPools state headerCon
 
           let youngMark = mark
@@ -188,7 +212,7 @@ solve env rank pools state constraint =
           mapM_ isGeneric rigids
 
           let newEnv = Map.union env (Map.map A.toValue locals)
-          let tempState = State savedEnv finalMark errors
+          let tempState = State savedEnv finalMark errors probes
           newState <- solve newEnv rank nextPools tempState subCon
 
           foldM occurs newState (Map.toList locals)
@@ -244,8 +268,8 @@ patternExpectationToVariable rank pools expectation =
 
 
 addError :: State -> Error.Error -> State
-addError (State savedEnv rank errors) err =
-  State savedEnv rank (err:errors)
+addError (State savedEnv rank errors probes) err =
+  State savedEnv rank (err:errors) probes
 
 
 

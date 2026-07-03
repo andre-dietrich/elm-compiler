@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Type.Constrain.Expression
   ( constrain
   , constrainDef
@@ -260,7 +261,20 @@ constrainBinop rtv region op annotation leftExpr rightExpr expected =
           , leftCon
           , rightCon
           , CEqual region (CallResult (OpName op)) answerType expected
+          , primOpProbe region op leftVar rightVar
           ]
+
+
+-- Record the resolved operand type of comparison/append binops so
+-- Generate.JavaScript can emit a raw JS operator instead of calling
+-- into the generic runtime dispatch (_Utils_eq/_Utils_cmp/_Utils_ap).
+-- See AST.Optimized's PrimOp and Optimize.Expression's use of Hints.
+primOpProbe :: A.Region -> Name.Name -> Variable -> Variable -> Constraint
+primOpProbe region op leftVar rightVar =
+  if op `elem` ["==", "/=", "<", ">", "<=", ">=", "++"] then
+    CProbe region leftVar rightVar
+  else
+    CTrue
 
 
 

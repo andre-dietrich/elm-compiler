@@ -169,6 +169,9 @@ generate mode expression =
         , ( JsName.fromLocal "uniforms", toTranslationObject uniforms )
         ]
 
+    Opt.PrimOp op left right ->
+      JsExpr $ generatePrimOp mode op left right
+
 
 
 -- CODE CHUNKS
@@ -665,6 +668,9 @@ toSeqs mode expr =
       | home == ModuleName.basics ->
           generateJsExpr mode left : toSeqs mode right
 
+    Opt.PrimOp Opt.PrimAppend left right ->
+      generateJsExpr mode left : toSeqs mode right
+
     _ ->
       [generateJsExpr mode expr]
 
@@ -702,6 +708,22 @@ strictNEq left right =
         JS.Int  0 -> JS.Prefix JS.PrefixNot (JS.Prefix JS.PrefixNot left)
         JS.Bool b -> if b then JS.Prefix JS.PrefixNot left else left
         _         -> JS.Infix JS.OpNe left right
+
+
+-- Emitted for Opt.PrimOp, i.e. when the type checker already proved both
+-- operands are a JS-primitive-safe monomorphic type (see Type.Type's
+-- PrimType and Optimize.Expression's toPrimBinop) — safe to use the raw JS
+-- operator unconditionally, no _Utils_eq/_Utils_cmp/_Utils_ap dispatch needed.
+generatePrimOp :: Mode.Mode -> Opt.PrimBinop -> Opt.Expr -> Opt.Expr -> JS.Expr
+generatePrimOp mode op left right =
+  case op of
+    Opt.PrimEq     -> strictEq  (generateJsExpr mode left) (generateJsExpr mode right)
+    Opt.PrimNeq    -> strictNEq (generateJsExpr mode left) (generateJsExpr mode right)
+    Opt.PrimLt     -> JS.Infix JS.OpLt (generateJsExpr mode left) (generateJsExpr mode right)
+    Opt.PrimGt     -> JS.Infix JS.OpGt (generateJsExpr mode left) (generateJsExpr mode right)
+    Opt.PrimLe     -> JS.Infix JS.OpLe (generateJsExpr mode left) (generateJsExpr mode right)
+    Opt.PrimGe     -> JS.Infix JS.OpGe (generateJsExpr mode left) (generateJsExpr mode right)
+    Opt.PrimAppend -> foldr1 (JS.Infix JS.OpAdd) (generateJsExpr mode left : toSeqs mode right)
 
 
 

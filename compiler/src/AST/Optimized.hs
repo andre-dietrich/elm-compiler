@@ -1,6 +1,7 @@
 module AST.Optimized
   ( Def(..)
   , Expr(..)
+  , PrimBinop(..)
   , Global(..)
   , Path(..)
   , Destructor(..)
@@ -71,6 +72,21 @@ data Expr
   | Unit
   | Tuple Expr Expr (Maybe Expr)
   | Shader Shader.Source (Set.Set Name) (Set.Set Name)
+  | PrimOp PrimBinop Expr Expr
+
+
+-- Specialized comparison/append operators emitted when the type checker has
+-- proven both operands are a JS-primitive-safe monomorphic type (Int, Float,
+-- Bool, or String). Lets Generate.JavaScript skip the generic runtime
+-- dispatch in _Utils_eq/_Utils_cmp/_Utils_ap. See Type.Type's PrimType.
+data PrimBinop
+  = PrimEq
+  | PrimNeq
+  | PrimLt
+  | PrimGt
+  | PrimLe
+  | PrimGe
+  | PrimAppend
 
 
 data Global = Global ModuleName.Canonical Name
@@ -276,6 +292,7 @@ instance Binary Expr where
       Unit             -> putWord8 24
       Tuple a b c      -> putWord8 25 >> put a >> put b >> put c
       Shader a b c     -> putWord8 26 >> put a >> put b >> put c
+      PrimOp a b c     -> putWord8 27 >> put a >> put b >> put c
 
   get =
     do  word <- getWord8
@@ -307,7 +324,33 @@ instance Binary Expr where
           24 -> pure   Unit
           25 -> liftM3 Tuple get get get
           26 -> liftM3 Shader get get get
+          27 -> liftM3 PrimOp get get get
           _  -> fail "problem getting Opt.Expr binary"
+
+
+instance Binary PrimBinop where
+  put op =
+    putWord8 $
+      case op of
+        PrimEq     -> 0
+        PrimNeq    -> 1
+        PrimLt     -> 2
+        PrimGt     -> 3
+        PrimLe     -> 4
+        PrimGe     -> 5
+        PrimAppend -> 6
+
+  get =
+    do  word <- getWord8
+        case word of
+          0 -> pure PrimEq
+          1 -> pure PrimNeq
+          2 -> pure PrimLt
+          3 -> pure PrimGt
+          4 -> pure PrimLe
+          5 -> pure PrimGe
+          6 -> pure PrimAppend
+          _ -> fail "problem getting Opt.PrimBinop binary"
 
 
 instance Binary Def where
