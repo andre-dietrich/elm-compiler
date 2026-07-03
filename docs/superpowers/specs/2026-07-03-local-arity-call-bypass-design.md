@@ -106,6 +106,22 @@ after a `rest` branch automatically reverts to the outer map, and an inner
 `let` reusing an outer name simply overwrites the map entry for its own
 subtree.
 
+**Correction (discovered during implementation, 2026-07-03):** this
+shadowing-safety property, while correct as designed, cannot actually be
+exercised by valid Elm 0.19.2 source — Elm's Canonicalize phase
+unconditionally rejects any local binding that reuses a name already bound
+in an ancestor lexical scope (`Reporting/Error/Canonicalize.hs`'s
+`Shadowing` constructor, reported as a hard `SHADOWING` error, not a
+warning, with no `--optimize`-only or dev-only exemption; see
+<https://elm-lang.org/0.19.2/shadowing>). So two `Opt.Let` bindings with
+the same source-level `Name.Name` can never be nested inside one another
+in `AST.Optimized` produced from real Elm input. The `Map.insert`-based
+overwrite behavior in `Mode.addLocalArity` remains the structurally
+correct thing to do (defensive, and free), but it is unreachable from any
+program that actually compiles — there is no way to construct a scratch
+`.elm` test case for it. Verification for this design should drop the
+shadowing scenario rather than attempt to force it.
+
 ## Examples
 
 **Case A — plain local helper, called directly twice:**

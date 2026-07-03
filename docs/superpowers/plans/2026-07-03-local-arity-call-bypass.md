@@ -29,7 +29,9 @@
 - Consumes: the `elm` binary built from the repo at its current (pre-change) commit.
 - Produces: `/tmp/elm-local-arity/baseline/dev.js`, `/tmp/elm-local-arity/baseline/prod.js`, `/tmp/elm-local-arity/baseline/node-output.txt` — the "before" snapshot that Task 4 diffs against.
 
-This scratch project exercises four shapes from the design doc: a plain local helper called twice (Case A), a `TailDef` loop kicked off from outside its own body (Case B), same-name shadowing between nested `let`s, and forward/mutual local recursion (which the v1 design explicitly does *not* accelerate — this proves the fallback stays correct).
+This scratch project exercises four shapes from the design doc: a plain local helper called twice (Case A), a `TailDef` loop kicked off from outside its own body (Case B), a local function called both fully-saturated and partially-applied (proving the bypass's `arity == length args` guard correctly leaves undersaturated calls alone), and forward/mutual local recursion (which the v1 design explicitly does *not* accelerate — this proves the fallback stays correct).
+
+**Correction from the design doc's original "same-name shadowing between nested `let`s" case:** Elm 0.19.2 unconditionally rejects any local binding that reuses a name already bound in an ancestor lexical scope (a hard `SHADOWING` compiler error, not a warning — see `compiler/src/Reporting/Error/Canonicalize.hs`'s `Shadowing` constructor and <https://elm-lang.org/0.19.2/shadowing>). That scenario can never be expressed in valid Elm source, so it cannot be exercised by any scratch project; the case below replaces it with something that both compiles and has real verification value (see `docs/superpowers/specs/2026-07-03-local-arity-call-bypass-design.md`'s "Correction" note for the full explanation).
 
 - [ ] **Step 1: Create the scratch project directory and `elm.json`**
 
@@ -37,7 +39,7 @@ This scratch project exercises four shapes from the design doc: a plain local he
 mkdir -p /tmp/elm-local-arity/src /tmp/elm-local-arity/baseline
 ```
 
-Write `/tmp/elm-local-arity/elm.json`:
+Write `/tmp/elm-local-arity/elm.json` (`elm/json` is required because the scratch module below is a `port module` — every port payload is encoded/decoded through it):
 
 ```json
 {
@@ -48,7 +50,8 @@ Write `/tmp/elm-local-arity/elm.json`:
     "elm-version": "0.19.2",
     "dependencies": {
         "direct": {
-            "elm/core": "1.0.5"
+            "elm/core": "1.0.5",
+            "elm/json": "1.1.3"
         },
         "indirect": {}
     },
@@ -99,22 +102,19 @@ sumList list =
     go 0 list
 
 
--- Shadowing: inner `check` (arity 1) shadows outer `check` (arity 2)
-shadowing : Int -> Int -> Bool
-shadowing a b =
+-- Partial application of a local function: `inRange 0` supplies only 1 of
+-- `inRange`'s 2 arguments, so this call site's `length args` (1) never
+-- equals `inRange`'s arity (2). The direct-call bypass's guard
+-- (`arity == length args`) must leave this alone -- it should compile
+-- and behave exactly as it did before this change (a plain `inRange(0)`
+-- call producing a curried 1-argument function, handed to List.filter).
+partialApplication : List Int -> Int
+partialApplication xs =
     let
-        check x y =
-            x == y
+        inRange lo x =
+            x >= lo && x <= lo + 10
     in
-    if check a b then
-        let
-            check x =
-                x > 0
-        in
-        check a
-
-    else
-        False
+    List.length (List.filter (inRange 0) xs)
 
 
 -- Forward reference / mutual recursion between local let-peers.
@@ -156,7 +156,7 @@ results =
     String.join ", "
         [ boolToString (validate 1 2 3)
         , String.fromInt (sumList (List.range 1 10))
-        , boolToString (shadowing 5 5)
+        , String.fromInt (partialApplication (List.range (-5) 15))
         , boolToString (isEvenViaMutual 10)
         ]
 
@@ -206,9 +206,10 @@ Expected: both commands succeed and produce `/tmp/elm-local-arity/baseline/dev.j
 grep -o 'A2(check' /tmp/elm-local-arity/baseline/prod.js | sort | uniq -c
 grep -o 'A2(go' /tmp/elm-local-arity/baseline/prod.js
 grep -o 'A2(isOdd\|A2(isEven' /tmp/elm-local-arity/baseline/prod.js
+grep -c 'inRange(0)' /tmp/elm-local-arity/baseline/prod.js
 ```
 
-Expected: all of these calls appear as `A2(...)` — none should be `.f(...)` yet, since this is the pre-change compiler.
+Expected: the first three all appear as `A2(...)` — none should be `.f(...)` yet, since this is the pre-change compiler. The fourth (`inRange(0)`) is a plain call, count ≥ 1 — partial application never went through `A2` even before this change, since `List.length args (1) /= inRange's arity (2)`; this establishes the pre-change baseline for that shape too, so Task 4 can confirm it's *unchanged*, not newly accelerated.
 
 ```bash
 node -e "
@@ -222,7 +223,7 @@ app.ports.output.subscribe(function (msg) {
 " | tee /tmp/elm-local-arity/baseline/node-output.txt
 ```
 
-Expected output: `True, 55, True, True`
+Expected output: `True, 55, 11, True` (`partialApplication`'s `List.range (-5) 15` yields `[-5..15]`; `inRange 0` keeps `0..10`, 11 values)
 
 - [ ] **Step 6: Save a copy of the generated JS text for later diffing**
 
@@ -420,7 +421,23 @@ docker run --rm -v "$PWD":/work -w /work \
 
 Expected: build succeeds. `addLocalArity`/`lookupLocalArity` are unused at this point, but since they're in the module's export list, `-Wall` will not flag them as unused top-level bindings.
 
-- [ ] **Step 5: Do not commit yet** — this task's edit is only type-checked, not yet wired up or behavior-verified. Commit happens once at the end of Task 4, after end-to-end verification passes (matching this repo's existing pattern of one commit per landed optimization, e.g. `be2c061f`, `2d47134d`).
+- [ ] **Step 5: Commit**
+
+```bash
+git add compiler/src/Generate/Mode.hs
+git commit -m "$(cat <<'EOF'
+perf: add local-arity tracking to Generate.Mode
+
+Extends Arities with a map of locally in-scope, known-arity let-bound
+functions, threaded the same way the existing raw-local mechanism is.
+Not yet wired into codegen -- see the following task.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+This task's edit is only type-checked, not yet wired up or behavior-verified — that happens in Task 3 and Task 4. This commit exists for a clean per-task review diff; Task 4 squashes it together with Task 3's commit into the single `perf: ...` commit this optimization lands as (matching this repo's existing pattern of one commit per landed optimization, e.g. `be2c061f`, `2d47134d`).
 
 ---
 
@@ -583,7 +600,23 @@ docker run --rm -v "$PWD":/work -w /work \
 
 Expected: build succeeds, no warnings.
 
-- [ ] **Step 5: Do not commit yet** — proceed to Task 4 for end-to-end verification first.
+- [ ] **Step 5: Commit**
+
+```bash
+git add compiler/src/Generate/JavaScript/Expression.hs
+git commit -m "$(cat <<'EOF'
+perf: wire local-arity direct-call bypass into codegen
+
+Opt.Let now threads the extended local-arity Mode into both the def's
+own body and the following expression; generateCall gains a matching
+Opt.VarLocal branch. End-to-end behavior is verified in the next task.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+End-to-end behavior verification against the Task 1 baseline happens in Task 4, which squashes this commit together with Task 2's into the single `perf: ...` commit this optimization lands as.
 
 ---
 
@@ -630,7 +663,13 @@ diff /tmp/elm-local-arity/baseline/prod.saved.js /tmp/elm-local-arity/after/prod
 Expected: a non-empty diff. Specifically:
 - The two `check(...)` calls in `validate` (Case A) change from `A2(check, ...)` to `check.f(...)`.
 - The `go(...)` entry call in `sumList` (Case B) changes from `A2(go, 0, list)` to `go.f(0, list)`.
-- In `shadowing`, both `check` calls change to direct `.f` calls (each resolving to its own in-scope binding).
+- In `partialApplication`, `inRange(0)` stays exactly as it was — untouched, since that call site is undersaturated (1 arg against `inRange`'s arity of 2) and never went through `A2` in the first place. Confirm no change here explicitly:
+
+  ```bash
+  diff <(grep -o 'inRange(0)' /tmp/elm-local-arity/baseline/prod.saved.js) <(grep -o 'inRange(0)' /tmp/elm-local-arity/after/prod.js)
+  ```
+
+  Expected: no output (identical).
 - In `isEvenViaMutual`, the `Let` chain generates in written order (`isEven`'s `Let` wraps `isOdd`'s `Let` wraps the final `isEven n` call), so:
   - `isEven`'s call to `isOdd` is a **forward** reference (`isOdd`'s arity isn't recorded yet when `isEven`'s body is generated) — stays `A2(isOdd, ...)`.
   - `isOdd`'s call to `isEven` is a **backward** reference (`isEven`'s arity was already recorded) — becomes `isEven.f(...)`.
@@ -661,12 +700,14 @@ app.ports.output.subscribe(function (msg) {
 "
 ```
 
-Expected output: `True, 55, True, True` — identical to the baseline run in Task 1, Step 5.
+Expected output: `True, 55, 11, True` (`partialApplication`'s `List.range (-5) 15` yields `[-5..15]`; `inRange 0` keeps `0..10`, 11 values) — identical to the baseline run in Task 1, Step 5.
 
-- [ ] **Step 5: Commit the implementation**
+- [ ] **Step 5: Squash Task 2 and Task 3's commits into the single landed commit**
+
+Tasks 2 and 3 each committed separately (for clean per-task review diffs). Now that end-to-end behavior is verified, squash them into the one commit this optimization lands as — reset back to before Task 2's commit, keeping the changes staged, then make a single commit:
 
 ```bash
-git add compiler/src/Generate/Mode.hs compiler/src/Generate/JavaScript/Expression.hs
+git reset --soft HEAD~2
 git commit -m "$(cat <<'EOF'
 perf: direct-call bypass for local let-bound functions
 
