@@ -165,8 +165,11 @@ follows the same manual protocol used for prior perf commits:
 
 1. Build the compiler in the Docker toolchain (`-O0` for the iterate loop).
 2. Write a scratch `.elm` module exercising: the plain-local-helper case
-   (Case A), the `TailDef`-entry-call case (Case B), a shadowing case, and
-   a forward-reference case (to confirm the v1 fallback is silent and
+   (Case A), the `TailDef`-entry-call case (Case B), a partial-application
+   case (confirming the `arity == length args` guard correctly leaves
+   undersaturated calls alone — see the Correction note above; a same-name
+   shadowing case is inexpressible in valid Elm 0.19.2), and a
+   forward-reference case (to confirm the v1 fallback is silent and
    correct, not broken).
 3. Compile with `elm make --optimize`; inspect the emitted JS for the
    expected `.f(...)` direct calls, and confirm the forward-reference case
