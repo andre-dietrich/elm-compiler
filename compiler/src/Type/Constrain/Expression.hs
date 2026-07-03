@@ -204,7 +204,22 @@ constrainCall rtv region func@(A.At funcRegion _) args expected =
           , CEqual funcRegion category funcType (FromContext region (CallArity maybeName (length args)) arityType)
           , CAnd argCons
           , CEqual region category resultType expected
+          , primCallProbe region func argVars
           ]
+
+
+-- Like primOpProbe, but for saturated calls to Basics.compare/min/max.
+-- Records the resolved argument type so Optimize.Expression can inline
+-- these calls as raw JS comparisons; see toPrimCall over there.
+primCallProbe :: A.Region -> Can.Expr -> [Variable] -> Constraint
+primCallProbe region (A.At _ func) argVars =
+  case (func, argVars) of
+    (Can.VarForeign home name _, [leftVar, rightVar])
+      | home == ModuleName.basics && name `elem` ["compare", "min", "max"] ->
+          CProbe region leftVar rightVar
+
+    _ ->
+      CTrue
 
 
 constrainArg :: RTV -> A.Region -> MaybeName -> Index.ZeroBased -> Can.Expr -> IO (Variable, Type, Constraint)

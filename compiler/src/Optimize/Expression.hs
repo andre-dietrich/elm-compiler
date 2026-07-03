@@ -108,9 +108,21 @@ optimize hints cycle (A.At region expression) =
           pure $ Opt.Function argNames (foldr Opt.Destruct obody destructors)
 
     Can.Call func args ->
-      Opt.Call
-        <$> optimize hints cycle func
-        <*> traverse (optimize hints cycle) args
+      case toPrimCall hints region func args of
+        Just spec ->
+          do  optArgs <- traverse (optimize hints cycle) args
+              case optArgs of
+                [left, right] | isCheap left && isCheap right ->
+                  makePrimCall spec left right
+
+                _ ->
+                  do  optFunc <- optimize hints cycle func
+                      pure (Opt.Call optFunc optArgs)
+
+        Nothing ->
+          Opt.Call
+            <$> optimize hints cycle func
+            <*> traverse (optimize hints cycle) args
 
     Can.If branches finally ->
       let
@@ -212,6 +224,79 @@ toPrimBinop home name prim =
       "ge"     -> Just Opt.PrimGe
       "append" -> if prim == Type.PStr then Just Opt.PrimAppend else Nothing
       _        -> Nothing
+
+
+
+-- PRIM CALL
+
+
+-- Saturated calls to Basics.compare/min/max whose argument type was proven
+-- JS-primitive-safe (see Type.Constrain.Expression's primCallProbe). They
+-- inline to raw JS comparisons, but only when both arguments are cheap to
+-- re-evaluate, since the operands appear twice in the inlined form.
+data PrimCall
+  = CallCompare
+  | CallMin
+  | CallMax
+
+
+toPrimCall :: Hints -> A.Region -> Can.Expr -> [Can.Expr] -> Maybe PrimCall
+toPrimCall hints region (A.At _ func) args =
+  case (func, args) of
+    (Can.VarForeign home name _, [_, _]) | home == ModuleName.basics ->
+      case Map.lookup region hints of
+        Nothing ->
+          Nothing
+
+        Just _ ->
+          case name of
+            "compare" -> Just CallCompare
+            "min"     -> Just CallMin
+            "max"     -> Just CallMax
+            _         -> Nothing
+
+    _ ->
+      Nothing
+
+
+-- Pure expressions whose duplication neither repeats work nor grows the
+-- output noticeably. Anything else keeps the generic Basics call.
+isCheap :: Opt.Expr -> Bool
+isCheap expr =
+  case expr of
+    Opt.VarLocal _    -> True
+    Opt.VarGlobal _   -> True
+    Opt.VarEnum _ _   -> True
+    Opt.Bool _        -> True
+    Opt.Int _         -> True
+    Opt.Float _       -> True
+    Opt.Str _         -> True
+    Opt.Access e _    -> isCheap e
+    _                 -> False
+
+
+-- `min a b` becomes `if a < b then a else b` (and analogously for max),
+-- which Generate.JavaScript emits as a raw ternary. `compare a b` becomes
+-- the LT/EQ/GT chain, so the Order constructors must be registered as
+-- dependencies here.
+makePrimCall :: PrimCall -> Opt.Expr -> Opt.Expr -> Names.Tracker Opt.Expr
+makePrimCall spec left right =
+  case spec of
+    CallMin ->
+      pure $ Opt.If [(Opt.PrimOp Opt.PrimLt left right, left)] right
+
+    CallMax ->
+      pure $ Opt.If [(Opt.PrimOp Opt.PrimGt left right, left)] right
+
+    CallCompare ->
+      do  lt <- Names.registerCtor ModuleName.basics "LT" Index.first Can.Enum
+          eq <- Names.registerCtor ModuleName.basics "EQ" Index.second Can.Enum
+          gt <- Names.registerCtor ModuleName.basics "GT" Index.third Can.Enum
+          pure $ Opt.If
+            [ (Opt.PrimOp Opt.PrimLt left right, lt)
+            , (Opt.PrimOp Opt.PrimEq left right, eq)
+            ]
+            gt
 
 
 
