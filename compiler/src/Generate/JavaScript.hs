@@ -200,9 +200,9 @@ addGlobalHelp mode graph global state =
         var global (Expr.generateTailDef mode name argNames body)
       )
 
-    Opt.Ctor index arity ->
+    Opt.Ctor index arity maxArity ->
       addStmt state (
-        var global (Expr.generateCtor mode global index arity)
+        var global (Expr.generateCtor mode global index arity maxArity)
       )
 
     Opt.Link linkedGlobal ->
@@ -392,7 +392,7 @@ generateEnum mode global@(Opt.Global home name) index =
   JS.Var (JsName.fromGlobal home name) $
     case mode of
       Mode.Dev _ ->
-        Expr.codeToExpr (Expr.generateCtor mode global index 0)
+        Expr.codeToExpr (Expr.generateCtor mode global index 0 0)
 
       Mode.Prod _ _ ->
         JS.Int (Index.toMachine index)
@@ -407,7 +407,7 @@ generateBox mode global@(Opt.Global home name) =
   JS.Var (JsName.fromGlobal home name) $
     case mode of
       Mode.Dev _ ->
-        Expr.codeToExpr (Expr.generateCtor mode global Index.first 1)
+        Expr.codeToExpr (Expr.generateCtor mode global Index.first 1 1)
 
       Mode.Prod _ _ ->
         JS.Ref (JsName.fromGlobal ModuleName.basics Name.identity)

@@ -107,7 +107,7 @@ nodeArity nodes (Opt.Global _ name) node =
     case node of
       Opt.Define expr _           -> functionArity expr
       Opt.DefineTailFunc args _ _ -> Just (length args)
-      Opt.Ctor _ arity            -> Just arity
+      Opt.Ctor _ arity _          -> Just arity
       Opt.Link linked             -> cycleArity nodes linked name
       _                           -> Nothing
 

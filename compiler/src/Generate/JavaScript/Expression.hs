@@ -233,11 +233,19 @@ toChar =
 -- CTOR
 
 
-generateCtor :: Mode.Mode -> Opt.Global -> Index.ZeroBased -> Int -> Code
-generateCtor mode (Opt.Global home name) index arity =
+generateCtor :: Mode.Mode -> Opt.Global -> Index.ZeroBased -> Int -> Int -> Code
+generateCtor mode (Opt.Global home name) index arity maxArity =
   let
     argNames =
       Index.indexedMap (\i _ -> JsName.fromIndex i) [1 .. arity]
+
+    -- pad all variants of a union to the same object shape (monomorphic
+    -- shapes let JS engines share hidden classes across variants)
+    padNames =
+      case mode of
+        Mode.Dev  _ -> []
+        Mode.Prod _ _ ->
+          drop arity (Index.indexedMap (\i _ -> JsName.fromIndex i) [1 .. maxArity])
 
     ctorTag =
       case mode of
@@ -245,7 +253,9 @@ generateCtor mode (Opt.Global home name) index arity =
         Mode.Prod _ _ -> JS.Int (ctorToInt home name index)
   in
   generateFunction argNames $ JsExpr $ JS.Object $
-    (JsName.dollar, ctorTag) : map (\n -> (n, JS.Ref n)) argNames
+    (JsName.dollar, ctorTag)
+      : map (\n -> (n, JS.Ref n)) argNames
+     ++ map (\n -> (n, JS.Null)) padNames
 
 
 ctorToInt :: ModuleName.Canonical -> Name.Name -> Index.ZeroBased -> Int

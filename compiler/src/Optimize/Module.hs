@@ -63,15 +63,19 @@ addUnions home unions (Opt.LocalGraph main nodes fields) =
 
 addUnion :: ModuleName.Canonical -> Can.Union -> Nodes -> Nodes
 addUnion home (Can.Union _ ctors _ opts) nodes =
-  List.foldl' (addCtorNode home opts) nodes ctors
+  let
+    maxArity =
+      List.foldl' (\high (Can.Ctor _ _ numArgs _) -> max high numArgs) 0 ctors
+  in
+  List.foldl' (addCtorNode home opts maxArity) nodes ctors
 
 
-addCtorNode :: ModuleName.Canonical -> Can.CtorOpts -> Nodes -> Can.Ctor -> Nodes
-addCtorNode home opts nodes (Can.Ctor name index numArgs _) =
+addCtorNode :: ModuleName.Canonical -> Can.CtorOpts -> Int -> Nodes -> Can.Ctor -> Nodes
+addCtorNode home opts maxArity nodes (Can.Ctor name index numArgs _) =
   let
     node =
       case opts of
-        Can.Normal -> Opt.Ctor index numArgs
+        Can.Normal -> Opt.Ctor index numArgs maxArity
         Can.Unbox -> Opt.Box
         Can.Enum -> Opt.Enum index
   in

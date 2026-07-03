@@ -166,7 +166,7 @@ data Main
 data Node
   = Define Expr (Set.Set Global)
   | DefineTailFunc [Name] Expr (Set.Set Global)
-  | Ctor Index.ZeroBased Int
+  | Ctor Index.ZeroBased Int Int
   | Enum Index.ZeroBased
   | Box
   | Link Global
@@ -450,7 +450,7 @@ instance Binary Node where
     case node of
       Define a b           -> putWord8  0 >> put a >> put b
       DefineTailFunc a b c -> putWord8  1 >> put a >> put b >> put c
-      Ctor a b             -> putWord8  2 >> put a >> put b
+      Ctor a b c           -> putWord8  2 >> put a >> put b >> put c
       Enum a               -> putWord8  3 >> put a
       Box                  -> putWord8  4
       Link a               -> putWord8  5 >> put a
@@ -465,7 +465,7 @@ instance Binary Node where
         case word of
           0  -> liftM2 Define get get
           1  -> liftM3 DefineTailFunc get get get
-          2  -> liftM2 Ctor get get
+          2  -> liftM3 Ctor get get get
           3  -> liftM  Enum get
           4  -> return Box
           5  -> liftM  Link get
