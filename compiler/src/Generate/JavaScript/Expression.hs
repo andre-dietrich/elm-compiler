@@ -110,8 +110,9 @@ generate mode expression =
     Opt.If bs f       -> generateIf mode bs f
 
     Opt.Let def body ->
+      let mode' = extendWithLocalArity mode def in
       JsBlock $
-        generateDef mode def : codeToStmtList (generate mode body)
+        generateDef mode' def : codeToStmtList (generate mode' body)
 
     Opt.Destruct (Opt.Destructor name path) body ->
       let
@@ -462,6 +463,13 @@ generateCall mode func args =
                    , arity == length args ->
       JS.Call (JS.Ref (JsName.fromLocal x)) (map (generateJsExpr mode) args)
 
+    -- a call to a local let-bound function whose arity is known from its
+    -- own binding (see Opt.Let handling / extendWithLocalArity): skip
+    -- A2..A9 and call its raw `.f` field directly, the same way
+    -- generateDirectCall does for globals.
+    Opt.VarLocal x | Just arity <- Mode.lookupLocalArity mode x, arity == length args ->
+      generateDirectLocalCall mode x args
+
     Opt.VarGlobal global@(Opt.Global (ModuleName.Canonical pkg _) _) | pkg == Pkg.core ->
       generateCoreCall mode global args
 
@@ -501,6 +509,15 @@ generateDirectCall :: Mode.Mode -> Opt.Global -> [Opt.Expr] -> JS.Expr
 generateDirectCall mode (Opt.Global home name) args =
   JS.Call
     (JS.Access (JS.Ref (JsName.fromGlobal home name)) rawFunctionField)
+    (map (generateJsExpr mode) args)
+
+
+-- Same idea as generateDirectCall, but for a local let-bound function
+-- instead of a global.
+generateDirectLocalCall :: Mode.Mode -> Name.Name -> [Opt.Expr] -> JS.Expr
+generateDirectLocalCall mode name args =
+  JS.Call
+    (JS.Access (JS.Ref (JsName.fromLocal name)) rawFunctionField)
     (map (generateJsExpr mode) args)
 
 
@@ -922,6 +939,23 @@ generateTailCallConsBase mode name valueExpr =
 
 
 -- DEFINITIONS
+
+
+-- Record the arity of a local let-bound named function so that direct
+-- calls to it (in its own body, for local recursion, and in the
+-- following expression) can skip A2..A9. Deliberately v1-scoped:
+-- destructured function values aren't covered (arity isn't syntactically
+-- visible at the binding site), and this only grows the map top-down, so
+-- a forward reference to a sibling defined *later* in the same let-chain
+-- still falls back to A2..A9 -- correct, just not accelerated. See
+-- docs/superpowers/specs/2026-07-03-local-arity-call-bypass-design.md.
+extendWithLocalArity :: Mode.Mode -> Opt.Def -> Mode.Mode
+extendWithLocalArity mode def =
+  case def of
+    Opt.Def name (Opt.Function args _) -> Mode.addLocalArity name (length args) mode
+    Opt.Def _ _                        -> mode
+    Opt.TailDef name args _            -> Mode.addLocalArity name (length args) mode
+    Opt.TailDefCons name args _        -> Mode.addLocalArity name (length args) mode
 
 
 generateDef :: Mode.Mode -> Opt.Def -> JS.Stmt

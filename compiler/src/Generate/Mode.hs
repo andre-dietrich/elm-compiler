@@ -9,6 +9,8 @@ module Generate.Mode
   , lookupUnwrapped
   , lookupRawLocal
   , setRawLocal
+  , lookupLocalArity
+  , addLocalArity
   )
   where
 
@@ -94,20 +96,21 @@ data Arities =
     { _arities :: Map.Map Opt.Global Int
     , _unwrapped :: Map.Map Opt.Global (Int, Int)
     , _rawLocal :: Maybe (Name.Name, Int)
+    , _localArities :: Map.Map Name.Name Int
     }
 
 
 computeArities :: Opt.GlobalGraph -> Arities
 computeArities (Opt.GlobalGraph nodes _) =
   let arities = Map.mapMaybeWithKey (nodeArity nodes) nodes in
-  Arities arities (computeUnwrapped nodes arities) Nothing
+  Arities arities (computeUnwrapped nodes arities) Nothing Map.empty
 
 
 lookupArity :: Mode -> Opt.Global -> Maybe Int
 lookupArity mode global =
   case mode of
     Dev _ -> Nothing
-    Prod _ (Arities arities _ _) -> Map.lookup global arities
+    Prod _ (Arities arities _ _ _) -> Map.lookup global arities
 
 
 -- Which globals have an `$unwrapped` sibling definition, which of their
@@ -117,7 +120,7 @@ lookupUnwrapped :: Mode -> Opt.Global -> Maybe (Int, Int)
 lookupUnwrapped mode global =
   case mode of
     Dev _ -> Nothing
-    Prod _ (Arities _ unwrapped _) -> Map.lookup global unwrapped
+    Prod _ (Arities _ unwrapped _ _) -> Map.lookup global unwrapped
 
 
 -- While generating the body of an `$unwrapped` variant, the callback
@@ -127,15 +130,41 @@ lookupRawLocal :: Mode -> Maybe (Name.Name, Int)
 lookupRawLocal mode =
   case mode of
     Dev _ -> Nothing
-    Prod _ (Arities _ _ raw) -> raw
+    Prod _ (Arities _ _ raw _) -> raw
 
 
 setRawLocal :: Name.Name -> Int -> Mode -> Mode
 setRawLocal name arity mode =
   case mode of
     Dev _ -> mode
-    Prod fields (Arities arities unwrapped _) ->
-      Prod fields (Arities arities unwrapped (Just (name, arity)))
+    Prod fields (Arities arities unwrapped _ locals) ->
+      Prod fields (Arities arities unwrapped (Just (name, arity)) locals)
+
+
+-- Look up the arity of a local let-bound named function currently in
+-- scope (see `addLocalArity` and Generate.JavaScript.Expression's
+-- handling of `Opt.Let`). Only arities in `restrictRange` are ever
+-- present, since only those go through A2..A9 in the first place.
+lookupLocalArity :: Mode -> Name.Name -> Maybe Int
+lookupLocalArity mode name =
+  case mode of
+    Dev _ -> Nothing
+    Prod _ (Arities _ _ _ locals) -> Map.lookup name locals
+
+
+-- Record that a local let-bound function of the given arity is now in
+-- scope, so direct calls to it (in its own body, for local recursion, and
+-- in the following expression) can skip A2..A9 the same way known-arity
+-- global calls do. Only arities 2..9 are tracked, since outside that
+-- range there is no A-dispatch to bypass.
+addLocalArity :: Name.Name -> Int -> Mode -> Mode
+addLocalArity name arity mode =
+  case mode of
+    Dev _ -> mode
+    Prod fields (Arities arities unwrapped raw locals) ->
+      case restrictRange arity of
+        Nothing -> mode
+        Just n  -> Prod fields (Arities arities unwrapped raw (Map.insert name n locals))
 
 
 nodeArity :: Map.Map Opt.Global Opt.Node -> Opt.Global -> Opt.Node -> Maybe Int
