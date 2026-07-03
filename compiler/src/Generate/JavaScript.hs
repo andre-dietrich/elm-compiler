@@ -12,6 +12,7 @@ import qualified Data.ByteString.Builder as B
 import qualified Data.List as List
 import Data.Map ((!))
 import qualified Data.Map as Map
+import qualified Data.Maybe as Maybe
 import qualified Data.Name as Name
 import qualified Data.Set as Set
 import qualified Data.Utf8 as Utf8
@@ -190,15 +191,17 @@ addGlobalHelp mode graph global state =
   in
   case graph ! global of
     Opt.Define expr deps ->
-      addStmt (addDeps deps state) (
-        var global (Expr.generate mode expr)
-      )
+      addMaybeStmt (Expr.generateUnwrapped mode global expr) $
+        addStmt (addDeps deps state) (
+          var global (Expr.generate mode expr)
+        )
 
     Opt.DefineTailFunc argNames body deps ->
-      addStmt (addDeps deps state) (
-        let (Opt.Global _ name) = global in
-        var global (Expr.generateTailDef mode name argNames body)
-      )
+      addMaybeStmt (Expr.generateUnwrappedTail mode global argNames body) $
+        addStmt (addDeps deps state) (
+          let (Opt.Global _ name) = global in
+          var global (Expr.generateTailDef mode name argNames body)
+        )
 
     Opt.Ctor index arity maxArity ->
       addStmt state (
@@ -248,6 +251,11 @@ addStmt state stmt =
   addBuilder state (JS.stmtToBuilder stmt)
 
 
+addMaybeStmt :: Maybe JS.Stmt -> State -> State
+addMaybeStmt maybeStmt state =
+  maybe state (addStmt state) maybeStmt
+
+
 addBuilder :: State -> B.Builder -> State
 addBuilder (State revKernels revBuilders seen) builder =
   State revKernels (builder:revBuilders) seen
@@ -275,7 +283,7 @@ isDebugger (Opt.Global (ModuleName.Canonical _ home) _) =
 generateCycle :: Mode.Mode -> Opt.Global -> [Name.Name] -> [(Name.Name, Opt.Expr)] -> [Opt.Def] -> JS.Stmt
 generateCycle mode (Opt.Global home _) names values functions =
   JS.Block
-    [ JS.Block $ map (generateCycleFunc mode home) functions
+    [ JS.Block $ concatMap (generateCycleFunc mode home) functions
     , JS.Block $ map (generateSafeCycle mode home) values
     , case map (generateRealCycle home) values of
         [] ->
@@ -296,14 +304,16 @@ generateCycle mode (Opt.Global home _) names values functions =
     ]
 
 
-generateCycleFunc :: Mode.Mode -> ModuleName.Canonical -> Opt.Def -> JS.Stmt
+generateCycleFunc :: Mode.Mode -> ModuleName.Canonical -> Opt.Def -> [JS.Stmt]
 generateCycleFunc mode home def =
   case def of
     Opt.Def name expr ->
       JS.Var (JsName.fromGlobal home name) (Expr.codeToExpr (Expr.generate mode expr))
+        : Maybe.maybeToList (Expr.generateUnwrapped mode (Opt.Global home name) expr)
 
     Opt.TailDef name args expr ->
       JS.Var (JsName.fromGlobal home name) (Expr.codeToExpr (Expr.generateTailDef mode name args expr))
+        : Maybe.maybeToList (Expr.generateUnwrappedTail mode (Opt.Global home name) args expr)
 
 
 generateSafeCycle :: Mode.Mode -> ModuleName.Canonical -> (Name.Name, Opt.Expr) -> JS.Stmt

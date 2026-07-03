@@ -7,6 +7,8 @@ module Generate.JavaScript.Expression
   , generateField
   , generateTailDef
   , generateMain
+  , generateUnwrapped
+  , generateUnwrappedTail
   , Code
   , codeToExpr
   , codeToStmtList
@@ -447,6 +449,16 @@ funcHelpers =
 generateCall :: Mode.Mode -> Opt.Expr -> [Opt.Expr] -> JS.Expr
 generateCall mode func args =
   case func of
+    Opt.VarGlobal global | Just unwrappedCall <- generateUnwrappedCall mode global args ->
+      unwrappedCall
+
+    -- inside an `$unwrapped` variant the callback parameter holds a raw
+    -- JS function, so a saturated call of it must not go through A2..A9
+    Opt.VarLocal x | Just (raw, arity) <- Mode.lookupRawLocal mode
+                   , x == raw
+                   , arity == length args ->
+      JS.Call (JS.Ref (JsName.fromLocal x)) (map (generateJsExpr mode) args)
+
     Opt.VarGlobal global@(Opt.Global (ModuleName.Canonical pkg _) _) | pkg == Pkg.core ->
       generateCoreCall mode global args
 
@@ -492,6 +504,101 @@ generateDirectCall mode (Opt.Global home name) args =
 rawFunctionField :: JsName.Name
 rawFunctionField =
   JsName.fromLocal "f"
+
+
+-- UNWRAPPED HOF CALLS
+--
+-- A saturated call of a higher-order function that qualifies per
+-- Mode.lookupUnwrapped, whose callback argument has statically known
+-- arity, is redirected to the function's `$unwrapped` variant with the
+-- callback passed as a raw JS function (no F2..F9 wrapper). Inside the
+-- variant the callback is called directly, so per-element A2 dispatch
+-- and the wrapper frame disappear.
+
+
+generateUnwrappedCall :: Mode.Mode -> Opt.Global -> [Opt.Expr] -> Maybe JS.Expr
+generateUnwrappedCall mode global@(Opt.Global home name) args =
+  case Mode.lookupUnwrapped mode global of
+    Just (index, arity) | Mode.lookupArity mode global == Just (length args) ->
+      case generateRawCallback mode arity (args !! index) of
+        Just rawCallback ->
+          Just $ JS.Call (JS.Ref (JsName.fromGlobalUnwrapped home name)) $
+            zipWith
+              (\i arg -> if i == index then rawCallback else generateJsExpr mode arg)
+              [ (0 :: Int) .. ]
+              args
+
+        Nothing ->
+          Nothing
+
+    _ ->
+      Nothing
+
+
+generateRawCallback :: Mode.Mode -> Int -> Opt.Expr -> Maybe JS.Expr
+generateRawCallback mode arity expr =
+  case expr of
+    -- a function literal of matching arity: emit it without the wrapper
+    Opt.Function params body | length params == arity ->
+      Just $ JS.Function Nothing (map JsName.fromLocal params) $
+        codeToStmtList (generate mode body)
+
+    -- a reference to a top-level definition of matching arity: its `.f`
+    -- field is the raw function behind the F2..F9 wrapper
+    Opt.VarGlobal cb@(Opt.Global cbHome cbName) | Mode.lookupArity mode cb == Just arity ->
+      Just $ JS.Access (JS.Ref (JsName.fromGlobal cbHome cbName)) rawFunctionField
+
+    -- inside an `$unwrapped` variant: pass the raw callback right along
+    Opt.VarLocal x | Mode.lookupRawLocal mode == Just (x, arity) ->
+      Just $ JS.Ref (JsName.fromLocal x)
+
+    _ ->
+      Nothing
+
+
+-- UNWRAPPED VARIANTS
+
+
+generateUnwrapped :: Mode.Mode -> Opt.Global -> Opt.Expr -> Maybe JS.Stmt
+generateUnwrapped mode global expr =
+  case expr of
+    Opt.Function params body -> generateUnwrappedHelp False mode global params body
+    _ -> Nothing
+
+
+generateUnwrappedTail :: Mode.Mode -> Opt.Global -> [Name.Name] -> Opt.Expr -> Maybe JS.Stmt
+generateUnwrappedTail =
+  generateUnwrappedHelp True
+
+
+-- The `$unwrapped` sibling of a qualifying higher-order function: a plain
+-- JS function (it is only ever called saturated, from call sites rewritten
+-- by generateUnwrappedCall, so it needs no wrapper itself) whose callback
+-- parameter is a raw JS function.
+generateUnwrappedHelp :: Bool -> Mode.Mode -> Opt.Global -> [Name.Name] -> Opt.Expr -> Maybe JS.Stmt
+generateUnwrappedHelp isTailFunc mode global@(Opt.Global home name) params body =
+  case Mode.lookupUnwrapped mode global of
+    Nothing ->
+      Nothing
+
+    Just (index, arity) ->
+      let
+        rawMode =
+          Mode.setRawLocal (params !! index) arity mode
+
+        bodyCode =
+          if isTailFunc then
+            JsBlock
+              [ JS.Labelled (JsName.fromLocal name) $
+                  JS.While (JS.Bool True) $
+                    codeToStmt $ generate rawMode body
+              ]
+          else
+            generate rawMode body
+      in
+      Just $ JS.Var (JsName.fromGlobalUnwrapped home name) $
+        JS.Function Nothing (map JsName.fromLocal params) $
+          codeToStmtList bodyCode
 
 
 generateNormalCall :: JS.Expr -> [JS.Expr] -> JS.Expr

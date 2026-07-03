@@ -6,6 +6,7 @@ module Generate.JavaScript.Name
   , fromInt
   , fromLocal
   , fromGlobal
+  , fromGlobalUnwrapped
   , fromCycle
   , fromKernel
   , makeF
@@ -62,6 +63,13 @@ fromLocal name =
 fromGlobal :: ModuleName.Canonical -> Name.Name -> Name
 fromGlobal home name =
   Name $ homeToBuilder home <> usd <> Name.toBuilder name
+
+
+-- the variant of a higher-order function whose callback parameter is a
+-- raw JS function; collision-free since Elm names cannot contain `$`
+fromGlobalUnwrapped :: ModuleName.Canonical -> Name.Name -> Name
+fromGlobalUnwrapped home name =
+  Name $ homeToBuilder home <> usd <> Name.toBuilder name <> "$unwrapped"
 
 
 fromCycle :: ModuleName.Canonical -> Name.Name -> Name
