@@ -5,7 +5,7 @@ module Combine exposing
     , primitive, app, lazy, trackedLazy, advance
     , fail, succeed, string, end, whitespace, whitespace1
     , regex, regexSub, regexWith, regexWithSub
-    , map, onsuccess, mapError, onerror
+    , map, onsuccess, mapError, expecting, onerror
     , andThen, andMap, sequence
     , keep, ignore, lookAhead, notFollowedBy, while, or, choice, backtrackable, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
     , withState, putState, modifyState, withLocation, withLine, withColumn, withSourceLine, modifyInput, putInput, modifyPosition, putPosition
@@ -60,7 +60,7 @@ into concrete Elm values.
 
 ### Transforming Parsers
 
-@docs map, onsuccess, mapError, onerror
+@docs map, onsuccess, mapError, expecting, onerror
 
 
 ### Chaining Parsers
@@ -1938,31 +1938,49 @@ whitespace1 =
 
 
 {-| Replace the parser's error with a single `Expecting` dead end, positioned
-at the stream on entry to `p` (not wherever `p` itself failed).
+at the stream on entry to `p` (not wherever `p` itself failed). This only applies
+to **uncommitted** failures (failures that didn't consume any input); committed
+failures pass through unchanged, keeping their precise, detailed error positions.
 
-    parse (string "a" |> onerror "gimme an 'a'") "b"
+    parse (string "a" |> expecting "gimme an 'a'") "b"
     -- Err [ { row = 1, col = 1, problem = Expecting "gimme an 'a'", contextStack = [] } ]
 
+    parse (expecting "a pair" (string "(" |> keep (string "1"))) "(x"
+    -- Err [ { row = 1, col = 2, problem = Expecting "\"1\"", contextStack = [] } ]
+    -- The second error is kept because "(" was consumed (committed).
+
 -}
-onerror : String -> Parser s a -> Parser s a
-onerror label p =
+expecting : String -> Parser s a -> Parser s a
+expecting label p =
     Parser <|
         \state stream ->
             case app p state stream of
                 ( _, _, Ok _ ) as res ->
                     res
 
-                ( estate, estream, Err _ ) ->
-                    ( estate
-                    , estream
-                    , Err
-                        [ { row = stream.row
-                          , col = stream.col
-                          , problem = Expecting label
-                          , contextStack = stream.contexts
-                          }
-                        ]
-                    )
+                ( estate, estream, Err ms ) as eres ->
+                    if estream.position > stream.position then
+                        eres
+
+                    else
+                        ( estate
+                        , estream
+                        , Err
+                            [ { row = stream.row
+                              , col = stream.col
+                              , problem = Expecting label
+                              , contextStack = stream.contexts
+                              }
+                            ]
+                        )
+
+
+{-| Alias for `expecting`. Provided for backwards compatibility.
+
+-}
+onerror : String -> Parser s a -> Parser s a
+onerror =
+    expecting
 
 
 {-| Run a parser and return the value on the right on success.
