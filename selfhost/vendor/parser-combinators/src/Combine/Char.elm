@@ -38,9 +38,9 @@ satisfy pred =
                     "could not satisfy predicate"
             in
             case String.uncons stream.input of
-                Just ( h, rest ) ->
+                Just ( h, _ ) ->
                     if pred h then
-                        ( state, { stream | input = rest, position = stream.position + 1 }, Ok h )
+                        ( state, Combine.advance (String.fromChar h) stream, Ok h )
 
                     else
                         ( state, stream, Err [ message ] )

@@ -1,7 +1,7 @@
 module Combine exposing
-    ( Parser, InputStream, ParseLocation, ParseContext, ParseResult, ParseError, ParseOk
+    ( Parser, InputStream, ContextFrame, ParseLocation, ParseContext, ParseResult, ParseError, ParseOk
     , parse, runParser
-    , primitive, app, lazy, trackedLazy
+    , primitive, app, lazy, trackedLazy, advance
     , fail, succeed, string, end, whitespace, whitespace1
     , regex, regexSub, regexWith, regexWithSub
     , map, onsuccess, mapError, onerror
@@ -30,7 +30,7 @@ into concrete Elm values.
 
 ## Core Types
 
-@docs Parser, InputStream, ParseLocation, ParseContext, ParseResult, ParseError, ParseOk
+@docs Parser, InputStream, ContextFrame, ParseLocation, ParseContext, ParseResult, ParseError, ParseOk
 
 
 ## Running Parsers
@@ -40,7 +40,7 @@ into concrete Elm values.
 
 ## Constructing Parsers
 
-@docs primitive, app, lazy, trackedLazy
+@docs primitive, app, lazy, trackedLazy, advance
 
 
 ## Parsers
@@ -93,6 +93,10 @@ import String
   - `data` is the initial input provided by the user
   - `input` is the remainder after running a parse
   - `position` is the starting position of `input` in `data` after a parse
+  - `row` is the current 1-based line number, maintained incrementally by `advance`
+  - `col` is the current 1-based column number, maintained incrementally by `advance`
+  - `indent` tracks the current indentation level (unused until later tasks in this series)
+  - `contexts` tracks a stack of named parse contexts for error reporting (unused until later tasks)
   - `lazyDepth` tracks consecutive lazy calls without input consumption (for infinite loop detection)
   - `lazyTracking` tracks depth per unique lazy parser ID (for trackedLazy)
 
@@ -101,20 +105,40 @@ type alias InputStream =
     { data : String
     , input : String
     , position : Int
+    , row : Int
+    , col : Int
+    , indent : Int
+    , contexts : List ContextFrame
     , lazyTracking : Dict String Int
     }
 
 
+{-| A single entry in the `InputStream`'s context stack: the row/column where
+a named parse context (e.g. "record literal", "if expression") was entered.
+Unused until later tasks in this series (error reporting).
+-}
+type alias ContextFrame =
+    { row : Int, col : Int, context : String }
+
+
 initStream : String -> InputStream
 initStream s =
-    InputStream s s 0 Dict.empty
+    { data = s
+    , input = s
+    , position = 0
+    , row = 1
+    , col = 1
+    , indent = 0
+    , contexts = []
+    , lazyTracking = Dict.empty
+    }
 
 
 {-| A record representing the current parse location in an InputStream.
 
   - `source` the current line of source code
-  - `line` the current line number (starting at 1)
-  - `column` the current column (starting at 1)
+  - `line` the current line number (1-based)
+  - `column` the current column (1-based)
 
 -}
 type alias ParseLocation =
@@ -222,6 +246,37 @@ Here's how you would implement a greedy version of `manyTill` using
 app : Parser state res -> state -> InputStream -> ParseContext state res
 app (Parser inner) =
     inner
+
+
+{-| Advance the stream past `consumed`, updating offset/row/col. For `primitive`
+authors: every parser that consumes input from `stream.input` must route that
+consumption through this function so `row`/`col` (and therefore `currentLocation`)
+stay accurate. `consumed` must be a prefix of `stream.input`.
+-}
+advance : String -> InputStream -> InputStream
+advance consumed stream =
+    let
+        len =
+            String.length consumed
+
+        newlines =
+            String.indexes "\n" consumed
+    in
+    case List.maximum newlines of
+        Nothing ->
+            { stream
+                | input = String.dropLeft len stream.input
+                , position = stream.position + len
+                , col = stream.col + len
+            }
+
+        Just lastIdx ->
+            { stream
+                | input = String.dropLeft len stream.input
+                , position = stream.position + len
+                , row = stream.row + List.length newlines
+                , col = len - lastIdx
+            }
 
 
 {-| Parse a string. See `runParser` if your parser needs to manage
@@ -537,34 +592,21 @@ withSourceLine f =
             app (f <| currentSourceLine stream) state stream
 
 
-{-| Get the current `(line, column)` in the input stream.
+{-| Get the current `(line, column)` in the input stream. O(1) for line/column
+since `row`/`col` are maintained incrementally by `advance`; `source` (the
+current source line's text) is still extracted on demand.
 -}
 currentLocation : InputStream -> ParseLocation
 currentLocation stream =
-    let
-        find position currentLine_ lines =
-            case lines of
-                [] ->
-                    ParseLocation "" currentLine_ position
-
-                line :: rest ->
-                    let
-                        length =
-                            String.length line
-
-                        lengthPlusNL =
-                            length + 1
-                    in
-                    if position == length then
-                        ParseLocation line currentLine_ position
-
-                    else if position > length then
-                        find (position - lengthPlusNL) (currentLine_ + 1) rest
-
-                    else
-                        ParseLocation line currentLine_ position
-    in
-    find stream.position 0 (String.split "\n" stream.data)
+    { source =
+        stream.data
+            |> String.split "\n"
+            |> List.drop (stream.row - 1)
+            |> List.head
+            |> Maybe.withDefault ""
+    , line = stream.row
+    , column = stream.col
+    }
 
 
 {-| Get the current source line in the input stream.
@@ -597,6 +639,12 @@ currentStream =
 
 {-| Modify the parser's current InputStream input (String).
 
+**Warning:** this is a raw, low-level escape hatch — it does not maintain
+`row`/`col` (or `position`). Prefer `advance` in `primitive` parsers that
+consume input; only reach for this when you genuinely need to replace the
+input out of band (e.g. macro expansion) and are prepared for `currentLocation`
+to go stale until row/col are otherwise corrected.
+
     parse
         (modifyInput String.toUpper
             |> keep (many (string "A"))
@@ -614,6 +662,8 @@ modifyInput f =
 
 {-| Replace the remaining input with a new string.
 
+**Warning:** does not maintain `row`/`col` (or `position`). See `modifyInput`.
+
     parse
         (string "a"
             |> ignore (putInput "AAA")
@@ -629,6 +679,10 @@ putInput i =
 
 
 {-| Modify the parser's InputStream position (Int).
+
+**Warning:** this is a raw, low-level escape hatch — it does not maintain
+`row`/`col`. Prefer `advance` in `primitive` parsers that consume input; only
+reach for this when you're prepared for `currentLocation` to go stale.
 
     let
         parser =
@@ -647,6 +701,8 @@ modifyPosition f =
 
 
 {-| Replace the parser position.
+
+**Warning:** does not maintain `row`/`col`. See `modifyPosition`.
 
     let
         parser =
@@ -846,17 +902,7 @@ string s =
     Parser <|
         \state stream ->
             if String.startsWith s stream.input then
-                let
-                    len =
-                        String.length s
-
-                    rem =
-                        String.dropLeft len stream.input
-
-                    pos =
-                        stream.position + len
-                in
-                ( state, { stream | input = rem, position = pos }, Ok s )
+                ( state, advance s stream, Ok s )
 
             else
                 ( state, stream, Err [ "expected \"" ++ s ++ "\"" ] )
@@ -996,17 +1042,7 @@ regexer input output pat =
     \state stream ->
         case Regex.findAtMost 1 compiledRegex stream.input of
             [ match ] ->
-                let
-                    len =
-                        String.length match.match
-
-                    rem =
-                        String.dropLeft len stream.input
-
-                    pos =
-                        stream.position + len
-                in
-                ( state, { stream | input = rem, position = pos }, Ok (output match) )
+                ( state, advance match.match stream, Ok (output match) )
 
             _ ->
                 ( state, stream, Err [ "expected input matching Regexp /" ++ pattern ++ "/" ] )
@@ -1020,30 +1056,31 @@ regexer input output pat =
 -}
 while : (Char -> Bool) -> Parser s String
 while pred =
-    let
-        accumulate acc state stream =
-            case String.uncons stream.input of
-                Just ( h, rest ) ->
-                    if pred h then
-                        let
-                            pos =
-                                stream.position + 1
-                        in
-                        accumulate (h :: acc) state { stream | input = rest, position = pos }
-
-                    else
-                        ( state, stream, String.fromList (List.reverse acc) )
-
-                Nothing ->
-                    ( state, stream, String.fromList (List.reverse acc) )
-    in
     Parser <|
         \state stream ->
             let
-                ( rstate, rstream, res ) =
-                    accumulate [] state stream
+                consumed =
+                    takeWhileString pred stream.input
             in
-            ( rstate, rstream, Ok res )
+            ( state, advance consumed stream, Ok consumed )
+
+
+takeWhileString : (Char -> Bool) -> String -> String
+takeWhileString pred input =
+    let
+        go acc rest =
+            case String.uncons rest of
+                Just ( h, tl ) ->
+                    if pred h then
+                        go (h :: acc) tl
+
+                    else
+                        String.fromList (List.reverse acc)
+
+                Nothing ->
+                    String.fromList (List.reverse acc)
+    in
+    go [] input
 
 
 {-| Fail when the input is not empty.
@@ -1457,10 +1494,10 @@ skipUntil end_ =
                 ( rstate, rstream, Ok _ ) ->
                     ( rstate, rstream, Ok () )
 
-                ( estate, estream, Err _ ) ->
+                ( estate, estream, Err ms ) ->
                     case String.uncons stream.input of
-                        Just ( _, rest ) ->
-                            accumulate state { stream | input = rest, position = stream.position + 1 }
+                        Just ( h, _ ) ->
+                            accumulate state (advance (String.fromChar h) stream)
 
                         Nothing ->
                             ( estate, estream, Err [ "skipUntil: reached end of input without finding end parser" ] )
@@ -1484,25 +1521,7 @@ More efficient than `skipMany (satisfy pred)` as it doesn't build a list.
 -}
 skipWhile : (Char -> Bool) -> Parser s ()
 skipWhile pred =
-    Parser <|
-        \state stream ->
-            let
-                skipChars input pos =
-                    case String.uncons input of
-                        Just ( c, rest ) ->
-                            if pred c then
-                                skipChars rest (pos + 1)
-
-                            else
-                                ( input, pos )
-
-                        Nothing ->
-                            ( input, pos )
-
-                ( remainingInput, newPos ) =
-                    skipChars stream.input stream.position
-            in
-            ( state, { stream | input = remainingInput, position = newPos }, Ok () )
+    while pred |> onsuccess ()
 
 
 {-| Parse at least `n` occurrences of a parser.
