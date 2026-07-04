@@ -7,7 +7,7 @@ module Combine exposing
     , regex, regexSub, regexWith, regexWithSub
     , map, onsuccess, mapError, onerror
     , andThen, andMap, sequence
-    , keep, ignore, lookAhead, notFollowedBy, while, or, choice, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
+    , keep, ignore, lookAhead, notFollowedBy, while, or, choice, backtrackable, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
     , withState, putState, modifyState, withLocation, withLine, withColumn, withSourceLine, modifyInput, putInput, modifyPosition, putPosition
     , currentLocation, currentSourceLine, currentLine, currentColumn, currentStream
     )
@@ -70,7 +70,7 @@ into concrete Elm values.
 
 ### Parser Combinators
 
-@docs keep, ignore, lookAhead, notFollowedBy, while, or, choice, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
+@docs keep, ignore, lookAhead, notFollowedBy, while, or, choice, backtrackable, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
 
 
 ### State Combinators
@@ -1181,8 +1181,8 @@ lookAhead p =
                 ( rstate, _, Ok res ) ->
                     ( rstate, stream, Ok res )
 
-                err ->
-                    err
+                ( _, _, Err ms ) ->
+                    ( state, stream, Err ms )
 
 
 {-| Succeed if the given parser fails, without consuming any input.
@@ -1214,6 +1214,34 @@ notFollowedBy p =
                     ( state, stream, Ok () )
 
 
+{-| Make a parser's failure uncommitted, even if it consumed input before
+failing. Normally `or`/`choice` only try the next alternative when a branch
+fails without consuming any input (see `or`); wrapping a branch in
+`backtrackable` resets the failure stream back to the entry point so the
+branch is treated as if it never consumed anything, letting alternation
+continue past it.
+
+    parse
+        (or
+            (backtrackable (string "a" |> keep (string "x")))
+            (string "ab")
+        )
+        "ab"
+    -- Ok "ab"
+
+-}
+backtrackable : Parser s a -> Parser s a
+backtrackable p =
+    Parser <|
+        \state stream ->
+            case app p state stream of
+                ( _, _, Ok _ ) as res ->
+                    res
+
+                ( _, _, Err ms ) ->
+                    ( state, stream, Err ms )
+
+
 {-| Choose between two parsers.
 
     parse (or (string "a") (string "b")) "a"
@@ -1225,6 +1253,11 @@ notFollowedBy p =
     parse (or (string "a") (string "b")) "c"
     -- Err [ { row = 1, col = 1, problem = Expecting "\"a\"", contextStack = [] }, { row = 1, col = 1, problem = Expecting "\"b\"", contextStack = [] } ]
 
+    -- committed failure: a branch that consumes input before failing stops
+    -- alternation instead of falling through to the next branch
+    parse (or (string "a" |> keep (string "x")) (string "ab")) "ab"
+    -- Err [ { row = 1, col = 2, problem = Expecting "\"x\"", contextStack = [] } ]
+
 -}
 or : Parser s a -> Parser s a -> Parser s a
 or lp rp =
@@ -1234,13 +1267,21 @@ or lp rp =
                 ( _, _, Ok _ ) as res ->
                     res
 
-                ( _, _, Err lms ) ->
-                    case app rp state stream of
-                        ( _, _, Ok _ ) as res ->
-                            res
+                ( _, lstream, Err lms ) as lres ->
+                    if lstream.position > stream.position then
+                        lres
 
-                        ( _, _, Err rms ) ->
-                            ( state, stream, Err (lms ++ rms) )
+                    else
+                        case app rp state stream of
+                            ( _, _, Ok _ ) as res ->
+                                res
+
+                            ( _, rstream, Err rms ) as rres ->
+                                if rstream.position > stream.position then
+                                    rres
+
+                                else
+                                    ( state, stream, Err (lms ++ rms) )
 
 
 {-| Choose between a list of parsers.
@@ -1265,8 +1306,12 @@ choice xs =
                         ( _, _, Ok _ ) as res ->
                             res
 
-                        ( _, _, Err ms ) ->
-                            tryParsers rest state stream (errors ++ ms)
+                        ( _, estream, Err ms ) as eres ->
+                            if estream.position > stream.position then
+                                eres
+
+                            else
+                                tryParsers rest state stream (errors ++ ms)
     in
     Parser <| \state stream -> tryParsers xs state stream []
 
@@ -1299,14 +1344,7 @@ optional res p =
 -}
 maybe : Parser s a -> Parser s (Maybe a)
 maybe p =
-    Parser <|
-        \state stream ->
-            case app p state stream of
-                ( rstate, rstream, Ok res ) ->
-                    ( rstate, rstream, Ok (Just res) )
-
-                _ ->
-                    ( state, stream, Ok Nothing )
+    or (map Just p) (succeed Nothing)
 
 
 {-| Apply a parser zero or more times and return a list of the results.
@@ -1324,25 +1362,23 @@ maybe p =
 many : Parser s a -> Parser s (List a)
 many p =
     let
-        accumulate acc state stream =
-            case app p state stream of
+        accumulate acc accState accStream =
+            case app p accState accStream of
                 ( rstate, rstream, Ok res ) ->
-                    if stream.input == rstream.input then
-                        ( rstate, rstream, List.reverse acc )
+                    if accStream.input == rstream.input then
+                        ( rstate, rstream, Ok (List.reverse acc) )
 
                     else
                         accumulate (res :: acc) rstate rstream
 
-                _ ->
-                    ( state, stream, List.reverse acc )
+                ( _, estream, Err ms ) ->
+                    if estream.position > accStream.position then
+                        ( accState, estream, Err ms )
+
+                    else
+                        ( accState, accStream, Ok (List.reverse acc) )
     in
-    Parser <|
-        \state stream ->
-            let
-                ( rstate, rstream, res ) =
-                    accumulate [] state stream
-            in
-            ( rstate, rstream, Ok res )
+    Parser <| \state stream -> accumulate [] state stream
 
 
 {-| Parse at least one result.
@@ -1376,26 +1412,40 @@ succeeds. On success, the list of the first parser's results is returned.
 manyTill : Parser s a -> Parser s end -> Parser s (List a)
 manyTill p end_ =
     let
-        accumulate acc state stream =
-            case app end_ state stream of
+        accumulate acc accState accStream =
+            case app end_ accState accStream of
                 ( rstate, rstream, Ok _ ) ->
                     ( rstate, rstream, Ok (List.reverse acc) )
 
                 ( estate, estream, Err ms ) ->
-                    case app p state stream of
-                        ( rstate, rstream, Ok res ) ->
-                            if stream.input == rstream.input then
-                                ( estate, estream, Err (deadEnd stream (Custom "manyTill: parser succeeded without consuming input")) )
+                    if estream.position > accStream.position then
+                        -- end parser failed after consuming: its error is the precise one
+                        ( estate, estream, Err ms )
 
-                            else
-                                accumulate (res :: acc) rstate rstream
+                    else
+                        case app p accState accStream of
+                            ( rstate, rstream, Ok res ) ->
+                                if accStream.input == rstream.input then
+                                    ( estate
+                                    , estream
+                                    , Err (deadEnd accStream (Custom "manyTill: parser succeeded without consuming input"))
+                                    )
 
-                        ( _, _, Err _ ) ->
-                            if stream.input == "" then
-                                ( estate, estream, Err (deadEnd estream (Custom "reached end of input without finding end parser")) )
+                                else
+                                    accumulate (res :: acc) rstate rstream
 
-                            else
-                                ( estate, estream, Err ms )
+                            ( _, pstream, Err pms ) ->
+                                if pstream.position > accStream.position then
+                                    ( accState, pstream, Err pms )
+
+                                else if accStream.input == "" then
+                                    ( estate
+                                    , estream
+                                    , Err (deadEnd accStream (Custom "reached end of input without finding end parser"))
+                                    )
+
+                                else
+                                    ( estate, estream, Err ms )
     in
     Parser (accumulate [])
 
