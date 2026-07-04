@@ -22,7 +22,7 @@ for negative numbers.
 
     parse sign "-" == Ok -1
 
-    parse sign "a" == Err [ "expected a sign" ]
+    parse sign "a" == Ok 1 -- optional: no sign means positive
 
 -}
 sign : Parser s Int
@@ -38,7 +38,7 @@ sign =
 
     parse digit "1" == Ok 1
 
-    parse digit "a" == Err [ "expected a digit" ]
+    parse digit "a" == Err [ { row = 1, col = 1, problem = Expecting "a digit", contextStack = [] } ]
 
 -}
 digit : Parser s Int
@@ -55,7 +55,7 @@ digit =
 
     parse int "-123" == Ok -123
 
-    parse int "abc" == Err [ "expected an int" ]
+    parse int "abc" == Err [ { row = 1, col = 1, problem = Expecting "an int", contextStack = [] } ]
 
 -}
 int : Parser s Int
@@ -71,7 +71,7 @@ int =
 
     parse float "-123.456" == Ok -123.456
 
-    parse float "abc" == Err [ "expected a float" ]
+    parse float "abc" == Err [ { row = 1, col = 1, problem = Expecting "a float", contextStack = [] } ]
 
 -}
 float : Parser s Float

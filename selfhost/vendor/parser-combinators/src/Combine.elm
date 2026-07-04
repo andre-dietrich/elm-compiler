@@ -1,5 +1,6 @@
 module Combine exposing
     ( Parser, InputStream, ContextFrame, ParseLocation, ParseContext, ParseResult, ParseError, ParseOk
+    , Problem(..), DeadEnd, deadEnd, deadEndsToString
     , parse, runParser
     , primitive, app, lazy, trackedLazy, advance
     , fail, succeed, string, end, whitespace, whitespace1
@@ -31,6 +32,7 @@ into concrete Elm values.
 ## Core Types
 
 @docs Parser, InputStream, ContextFrame, ParseLocation, ParseContext, ParseResult, ParseError, ParseOk
+@docs Problem, DeadEnd, deadEnd, deadEndsToString
 
 
 ## Running Parsers
@@ -156,22 +158,78 @@ type alias ParseContext state res =
     ( state, InputStream, ParseResult res )
 
 
+{-| A specific reason a parser failed, without position information attached.
+-}
+type Problem
+    = Expecting String
+    | ExpectingEnd
+    | Custom String
+
+
+{-| A single, positioned parse failure. `row`/`col` are 1-based, taken from
+the `InputStream` at the point of failure. `contextStack` records the named
+parse contexts (see `ContextFrame`) active at that point; it is always `[]`
+until later tasks in this series populate `stream.contexts`.
+-}
+type alias DeadEnd =
+    { row : Int, col : Int, problem : Problem, contextStack : List ContextFrame }
+
+
 {-| Running a `Parser` results in one of two states:
 
   - `Ok res` when the parser has successfully parsed the input
-  - `Err messages` when the parser has failed with a list of error messages.
+  - `Err deadEnds` when the parser has failed with a list of `DeadEnd`s.
 
 -}
 type alias ParseResult res =
-    Result (List String) res
+    Result (List DeadEnd) res
 
 
 {-| A tuple representing a failed parse. It contains the state after
 running the parser, the remaining input stream and a list of
-error messages.
+dead ends.
 -}
 type alias ParseError state =
-    ( state, InputStream, List String )
+    ( state, InputStream, List DeadEnd )
+
+
+{-| Build a single-element dead-end list from the current stream and a
+`Problem`. This is the helper primitive authors should use instead of
+constructing `DeadEnd` records by hand.
+-}
+deadEnd : InputStream -> Problem -> List DeadEnd
+deadEnd stream problem =
+    [ { row = stream.row, col = stream.col, problem = problem, contextStack = stream.contexts } ]
+
+
+problemToString : Problem -> String
+problemToString problem =
+    case problem of
+        Expecting s ->
+            "expecting " ++ s
+
+        ExpectingEnd ->
+            "expecting end of input"
+
+        Custom s ->
+            s
+
+
+{-| Render a list of dead ends as a single human-readable string, for
+debugging and tests. Not meant to be the final user-facing error format.
+-}
+deadEndsToString : List DeadEnd -> String
+deadEndsToString deadEnds =
+    deadEnds
+        |> List.map
+            (\d ->
+                String.fromInt d.row
+                    ++ ":"
+                    ++ String.fromInt d.col
+                    ++ " "
+                    ++ problemToString d.problem
+            )
+        |> String.join "; "
 
 
 {-| A tuple representing a successful parse. It contains the state
@@ -291,8 +349,8 @@ some internal state.
         Ok (_, stream, result) ->
           Ok result
 
-        Err (_, stream, errors) ->
-          Err (String.join " or " errors)
+        Err (_, stream, deadEnds) ->
+          Err (deadEndsToString deadEnds)
 
     parseAnInteger "123"
     -- Ok 123
@@ -334,8 +392,8 @@ parse p =
         Ok (state, stream, ints) ->
           Ok { count = state, integers = ints }
 
-        Err (state, stream, errors) ->
-          Err (String.join " or " errors)
+        Err (state, stream, deadEnds) ->
+          Err (deadEndsToString deadEnds)
 
     parseIntegers ""
     -- Ok { count = 0, integers = [] }
@@ -405,7 +463,7 @@ trackedLazy id maxDepth t =
             if currentDepth >= maxDepth then
                 ( state
                 , stream
-                , Err [ "infinite loop detected: lazy parser '" ++ id ++ "' exceeded depth limit of " ++ String.fromInt maxDepth ]
+                , Err (deadEnd stream (Custom ("infinite loop detected: lazy parser '" ++ id ++ "' exceeded depth limit of " ++ String.fromInt maxDepth)))
                 )
 
             else
@@ -446,7 +504,7 @@ trackedLazy id maxDepth t =
 -}
 bimap :
     (a -> b)
-    -> (List String -> List String)
+    -> (List DeadEnd -> List DeadEnd)
     -> Parser s a
     -> Parser s b
 bimap fok ferr p =
@@ -744,13 +802,13 @@ map f p =
     let
       parser =
         string "a"
-          |> mapError (always ["bad input"])
+          |> mapError (always (deadEnd stream (Custom "bad input")))
     in
       parse parser b
-      -- Err ["bad input"]
+      -- Err [ { row = 1, col = 1, problem = Custom "bad input", contextStack = [] } ]
 
 -}
-mapError : (List String -> List String) -> Parser s a -> Parser s a
+mapError : (List DeadEnd -> List DeadEnd) -> Parser s a -> Parser s a
 mapError =
     bimap identity
 
@@ -858,14 +916,14 @@ sequence parsers =
 {-| Fail without consuming any input.
 
     parse (fail "some error") "hello"
-    -- Err ["some error"]
+    -- Err [ { row = 1, col = 1, problem = Custom "some error", contextStack = [] } ]
 
 -}
 fail : String -> Parser s a
 fail m =
     Parser <|
         \state stream ->
-            ( state, stream, Err [ m ] )
+            ( state, stream, Err (deadEnd stream (Custom m)) )
 
 
 emptyErr : Parser s a
@@ -894,7 +952,7 @@ succeed res =
     -- Ok "hello"
 
     parse (string "hello") "goodbye"
-    -- Err ["expected \"hello\""]
+    -- Err [ { row = 1, col = 1, problem = Expecting "\"hello\"", contextStack = [] } ]
 
 -}
 string : String -> Parser s String
@@ -905,7 +963,7 @@ string s =
                 ( state, advance s stream, Ok s )
 
             else
-                ( state, stream, Err [ "expected \"" ++ s ++ "\"" ] )
+                ( state, stream, Err (deadEnd stream (Expecting ("\"" ++ s ++ "\""))) )
 
 
 {-| Parse a Regex match.
@@ -918,7 +976,7 @@ every pattern unless one already exists.
     -- Ok "aaaaa"
 
     parse (regex "a+") "Aaaaab"
-    -- Err ["expected input matching Regexp /^a+/"]
+    -- Err [ { row = 1, col = 1, problem = Expecting "input matching Regexp /^a+/", contextStack = [] } ]
 
 Use `regexWith` for more options on allowing case-insensitive or multiline.
 
@@ -970,7 +1028,7 @@ the beginning of every pattern unless one already exists.
             "a+"
         )
         "AaaAAaAab"
-    -- Err ["expected input matching Regexp /^a+/"]
+    -- Err [ { row = 1, col = 1, problem = Expecting "input matching Regexp /^a+/", contextStack = [] } ]
 
 -}
 regexWith : { caseInsensitive : Bool, multiline : Bool } -> String -> Parser s String
@@ -1007,7 +1065,7 @@ the beginning of every pattern unless one already exists.
             "a+"
         )
         "AaaAAaAab"
-    -- Err ["expected input matching Regexp /^a+/"]
+    -- Err [ { row = 1, col = 1, problem = Expecting "input matching Regexp /^a+/", contextStack = [] } ]
 
 -}
 regexWithSub : { caseInsensitive : Bool, multiline : Bool } -> String -> Parser s ( String, List (Maybe String) )
@@ -1045,7 +1103,7 @@ regexer input output pat =
                 ( state, advance match.match stream, Ok (output match) )
 
             _ ->
-                ( state, stream, Err [ "expected input matching Regexp /" ++ pattern ++ "/" ] )
+                ( state, stream, Err (deadEnd stream (Expecting ("input matching Regexp /" ++ pattern ++ "/"))) )
 
 
 {-| Consume input while the predicate matches.
@@ -1089,7 +1147,7 @@ takeWhileString pred input =
     -- Ok ()
 
     parse end "a"
-    -- Err ["expected end of input"]
+    -- Err [ { row = 1, col = 1, problem = ExpectingEnd, contextStack = [] } ]
 
 -}
 end : Parser s ()
@@ -1100,7 +1158,7 @@ end =
                 ( state, stream, Ok () )
 
             else
-                ( state, stream, Err [ "expected end of input" ] )
+                ( state, stream, Err (deadEnd stream ExpectingEnd) )
 
 
 {-| Apply a parser without consuming any input on success.
@@ -1150,7 +1208,7 @@ notFollowedBy p =
         \state stream ->
             case app p state stream of
                 ( _, _, Ok _ ) ->
-                    ( state, stream, Err [ "unexpected input" ] )
+                    ( state, stream, Err (deadEnd stream (Custom "unexpected input")) )
 
                 ( _, _, Err _ ) ->
                     ( state, stream, Ok () )
@@ -1165,7 +1223,7 @@ notFollowedBy p =
     -- Ok "b"
 
     parse (or (string "a") (string "b")) "c"
-    -- Err ["expected \"a\"", "expected \"b\""]
+    -- Err [ { row = 1, col = 1, problem = Expecting "\"a\"", contextStack = [] }, { row = 1, col = 1, problem = Expecting "\"b\"", contextStack = [] } ]
 
 -}
 or : Parser s a -> Parser s a -> Parser s a
@@ -1182,7 +1240,7 @@ or lp rp =
                             res
 
                         ( _, _, Err rms ) ->
-                            ( state, stream, Err (List.foldl (::) lms rms |> List.reverse) )
+                            ( state, stream, Err (lms ++ rms) )
 
 
 {-| Choose between a list of parsers.
@@ -1200,7 +1258,7 @@ choice xs =
         tryParsers parsers state stream errors =
             case parsers of
                 [] ->
-                    ( state, stream, Err (List.reverse errors) )
+                    ( state, stream, Err errors )
 
                 p :: rest ->
                     case app p state stream of
@@ -1208,7 +1266,7 @@ choice xs =
                             res
 
                         ( _, _, Err ms ) ->
-                            tryParsers rest state stream (List.foldl (::) errors ms)
+                            tryParsers rest state stream (errors ++ ms)
     in
     Parser <| \state stream -> tryParsers xs state stream []
 
@@ -1327,14 +1385,14 @@ manyTill p end_ =
                     case app p state stream of
                         ( rstate, rstream, Ok res ) ->
                             if stream.input == rstream.input then
-                                ( estate, estream, Err [ "manyTill: parser succeeded without consuming input" ] )
+                                ( estate, estream, Err (deadEnd stream (Custom "manyTill: parser succeeded without consuming input")) )
 
                             else
                                 accumulate (res :: acc) rstate rstream
 
                         ( _, _, Err _ ) ->
                             if stream.input == "" then
-                                ( estate, estream, Err [ "manyTill: reached end of input without finding end parser" ] )
+                                ( estate, estream, Err (deadEnd estream (Custom "reached end of input without finding end parser")) )
 
                             else
                                 ( estate, estream, Err ms )
@@ -1500,7 +1558,7 @@ skipUntil end_ =
                             accumulate state (advance (String.fromChar h) stream)
 
                         Nothing ->
-                            ( estate, estream, Err [ "skipUntil: reached end of input without finding end parser" ] )
+                            ( estate, estream, Err (deadEnd estream (Custom "reached end of input without finding end parser")) )
     in
     Parser accumulate
 
@@ -1829,16 +1887,32 @@ whitespace1 =
     regex "\\s+" |> onerror "whitespace"
 
 
-{-| Variant of `mapError` that replaces the Parser's error with a List
-of a single string.
+{-| Replace the parser's error with a single `Expecting` dead end, positioned
+at the stream on entry to `p` (not wherever `p` itself failed).
 
     parse (string "a" |> onerror "gimme an 'a'") "b"
-    -- Err ["gimme an 'a'"]
+    -- Err [ { row = 1, col = 1, problem = Expecting "gimme an 'a'", contextStack = [] } ]
 
 -}
 onerror : String -> Parser s a -> Parser s a
-onerror m p =
-    mapError (always [ m ]) p
+onerror label p =
+    Parser <|
+        \state stream ->
+            case app p state stream of
+                ( _, _, Ok _ ) as res ->
+                    res
+
+                ( estate, estream, Err _ ) ->
+                    ( estate
+                    , estream
+                    , Err
+                        [ { row = stream.row
+                          , col = stream.col
+                          , problem = Expecting label
+                          , contextStack = stream.contexts
+                          }
+                        ]
+                    )
 
 
 {-| Run a parser and return the value on the right on success.

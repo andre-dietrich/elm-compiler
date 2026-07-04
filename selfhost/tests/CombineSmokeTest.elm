@@ -1,13 +1,13 @@
 module CombineSmokeTest exposing (suite)
 
-import Combine exposing (parse, string)
+import Combine exposing (Problem(..), parse, string)
 import Expect
 import Test exposing (Test, describe, test)
 
 
 suite : Test
 suite =
-    describe "Combine smoke (7.0.2 API)"
+    describe "Combine smoke"
         [ test "string success" <|
             \_ ->
                 case parse (string "hello") "hello world" of
@@ -22,6 +22,6 @@ suite =
                     Ok _ ->
                         Expect.fail "expected failure"
 
-                    Err ( _, _, messages ) ->
-                        Expect.equal [ "expected \"hello\"" ] messages
+                    Err ( _, _, deadEnds ) ->
+                        Expect.equal [ Expecting "\"hello\"" ] (List.map .problem deadEnds)
         ]

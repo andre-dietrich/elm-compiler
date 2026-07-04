@@ -15,7 +15,7 @@ much faster.
 -}
 
 import Char
-import Combine exposing (Parser, onerror, onsuccess, or, primitive, string)
+import Combine exposing (Parser, Problem(..), onerror, onsuccess, or, primitive, string)
 import Flip exposing (flip)
 import String
 
@@ -26,27 +26,23 @@ import String
     -- Ok 'a'
 
     parse (satisfy ((==) 'a')) "b" ==
-    -- Err ["could not satisfy predicate"]
+    -- Err [ { row = 1, col = 1, problem = Custom "could not satisfy predicate", contextStack = [] } ]
 
 -}
 satisfy : (Char -> Bool) -> Parser s Char
 satisfy pred =
     primitive <|
         \state stream ->
-            let
-                message =
-                    "could not satisfy predicate"
-            in
             case String.uncons stream.input of
                 Just ( h, _ ) ->
                     if pred h then
                         ( state, Combine.advance (String.fromChar h) stream, Ok h )
 
                     else
-                        ( state, stream, Err [ message ] )
+                        ( state, stream, Err (Combine.deadEnd stream (Custom "could not satisfy predicate")) )
 
                 Nothing ->
-                    ( state, stream, Err [ message ] )
+                    ( state, stream, Err (Combine.deadEnd stream (Custom "could not satisfy predicate")) )
 
 
 {-| Parse an exact character match.
