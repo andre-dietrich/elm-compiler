@@ -7,7 +7,7 @@ module Combine exposing
     , regex, regexSub, regexWith, regexWithSub
     , map, onsuccess, mapError, expecting, onerror
     , andThen, andMap, sequence
-    , keep, ignore, lookAhead, notFollowedBy, while, or, choice, backtrackable, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
+    , keep, ignore, inContext, lookAhead, notFollowedBy, while, or, choice, backtrackable, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
     , withState, putState, modifyState, withLocation, withLine, withColumn, withSourceLine, modifyInput, putInput, modifyPosition, putPosition
     , currentLocation, currentSourceLine, currentLine, currentColumn, currentStream
     )
@@ -70,7 +70,7 @@ into concrete Elm values.
 
 ### Parser Combinators
 
-@docs keep, ignore, lookAhead, notFollowedBy, while, or, choice, backtrackable, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
+@docs keep, ignore, inContext, lookAhead, notFollowedBy, while, or, choice, backtrackable, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
 
 
 ### State Combinators
@@ -2032,3 +2032,24 @@ ignore p1 p2 =
     p2
         |> map always
         |> andMap p1
+
+
+{-| Push a named context onto the parse context stack for the duration of
+a parser, then restore the previous stack afterwards. Dead ends created
+inside carry the full context stack at the time they were created, with
+innermost contexts first.
+
+    inContext "record field" (string "x" |> keep (string "="))
+
+-}
+inContext : String -> Parser s a -> Parser s a
+inContext name p =
+    Parser <|
+        \state stream ->
+            let
+                frame =
+                    { row = stream.row, col = stream.col, context = name }
+            in
+            case app p state { stream | contexts = frame :: stream.contexts } of
+                ( rstate, rstream, res ) ->
+                    ( rstate, { rstream | contexts = stream.contexts }, res )
