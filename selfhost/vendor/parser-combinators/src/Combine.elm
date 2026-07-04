@@ -8,7 +8,7 @@ module Combine exposing
     , map, onsuccess, mapError, expecting, onerror
     , andThen, andMap, sequence
     , keep, ignore, inContext, lookAhead, notFollowedBy, while, or, choice, backtrackable, optional, maybe, many, many1, manyTill, many1Till, sepBy, sepBy1, sepEndBy, sepEndBy1, skip, skipMany, skipMany1, skipUntil, skipWhile, atLeast, upTo, chainl, chainr, count, between, parens, braces, brackets
-    , withState, putState, modifyState, withLocation, withLine, withColumn, withSourceLine, modifyInput, putInput, modifyPosition, putPosition
+    , withState, putState, modifyState, withLocation, withLine, withColumn, withSourceLine, modifyInput, putInput, modifyPosition, putPosition, indentation, withIndent
     , currentLocation, currentSourceLine, currentLine, currentColumn, currentStream
     )
 
@@ -75,7 +75,7 @@ into concrete Elm values.
 
 ### State Combinators
 
-@docs withState, putState, modifyState, withLocation, withLine, withColumn, withSourceLine, modifyInput, putInput, modifyPosition, putPosition
+@docs withState, putState, modifyState, withLocation, withLine, withColumn, withSourceLine, modifyInput, putInput, modifyPosition, putPosition, indentation, withIndent
 
 
 ### Miscellaneous
@@ -2053,3 +2053,35 @@ inContext name p =
             case app p state { stream | contexts = frame :: stream.contexts } of
                 ( rstate, rstream, res ) ->
                     ( rstate, { rstream | contexts = stream.contexts }, res )
+
+
+{-| Get the current indentation floor (the minimum column for layout checks).
+This is used in grammar-level checks to ensure tokens are indented past
+a threshold, as in Elm's layout rules.
+
+    parse indentation ""
+    -- Ok ()
+
+-}
+indentation : Parser s Int
+indentation =
+    Parser <|
+        \state stream ->
+            ( state, stream, Ok stream.indent )
+
+
+{-| Set the indentation floor for the duration of a parser, then restore
+the previous floor afterwards. This is used to establish indentation
+thresholds for nested grammar rules.
+
+    parse (withIndent 2 indentation) ""
+    -- Ok 2
+
+-}
+withIndent : Int -> Parser s a -> Parser s a
+withIndent floor_ p =
+    Parser <|
+        \state stream ->
+            case app p state { stream | indent = floor_ } of
+                ( rstate, rstream, res ) ->
+                    ( rstate, { rstream | indent = stream.indent }, res )
