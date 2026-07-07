@@ -1,5 +1,6 @@
 module Canonicalize.Module
   ( canonicalize
+  , findCyclicKeys
   )
   where
 
@@ -7,6 +8,7 @@ module Canonicalize.Module
 import qualified Data.Graph as Graph
 import qualified Data.Map as Map
 import qualified Data.Name as Name
+import qualified Data.NonEmptyList as NE
 
 import qualified AST.Canonical as Can
 import qualified AST.Source as Src
@@ -99,6 +101,41 @@ detectCycles sccs =
                 d:ds -> Can.DeclareRec d ds <$> detectCycles otherSccs
 
 
+-- Generic version of the direct-dependency cycle check `detectBadCycles`
+-- performs for one module's own defs, factored out so a caller spanning
+-- multiple modules (see Canonicalize.Harvest / the cyclic-modules design)
+-- can reuse the exact same "a cyclic SCC among direct dependencies is an
+-- error" rule with its own choice of key. `nodes` uses the same shape as
+-- `Data.Graph.stronglyConnComp`'s input: (key, key, direct dep keys),
+-- where the key is used as both the node identifier and for dependency lookup.
+-- Returns the first offending cycle's keys, if any; the caller decides
+-- what to do with a Just (single-module code keeps throwing
+-- Error.RecursiveDecl via detectBadCycles below; cross-module code turns
+-- it into Exit.BP_CycleValue instead, since it spans multiple modules'
+-- source files and can't be rendered as one module's Canonicalize.Error).
+findCyclicKeys :: Ord key => [(key, key, [key])] -> Maybe (NE.List key)
+findCyclicKeys nodes =
+  findCyclicKeysHelp (Graph.stronglyConnComp nodes)
+
+
+findCyclicKeysHelp :: [Graph.SCC key] -> Maybe (NE.List key)
+findCyclicKeysHelp sccs =
+  case sccs of
+    [] ->
+      Nothing
+
+    Graph.AcyclicSCC _ : otherSccs ->
+      findCyclicKeysHelp otherSccs
+
+    Graph.CyclicSCC [] : otherSccs ->
+      findCyclicKeysHelp otherSccs
+
+    Graph.CyclicSCC (k:ks) : _ ->
+      Just (NE.List k ks)
+
+
+-- Single-module entry point (unchanged behavior). See findCyclicKeys
+-- above for the cross-module-reusable version of this same rule.
 detectBadCycles :: Graph.SCC Can.Def -> Result i w Can.Def
 detectBadCycles scc =
   case scc of
