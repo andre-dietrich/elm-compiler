@@ -464,6 +464,36 @@ EOF
 
 ### Task 4: The harvest pass (`Canonicalize.Harvest`)
 
+> **Note (post-implementation, added after three rounds of code review):**
+> Steps 3-6 below are the *original design sketch* and no longer describe
+> the shipped code. Review found two rounds of real bugs in the sketch's
+> single-pass approach — a module's own placeholder-bodied alias could
+> leak into a peer's resolved type body (and, more subtly, into a
+> harvested union's own constructor argument), because nothing guaranteed
+> alias-before-alias resolution order across the whole SCC. The shipped
+> `compiler/src/Canonicalize/Harvest.hs` restructures type-body resolution
+> into two explicit phases instead: Phase A (`resolveAliasesInOrder`)
+> resolves every SCC alias's real body one at a time, in true cross-module
+> topological dependency order (reusing `Graph.stronglyConnComp` over the
+> same edge set the alias-cycle check already computes), folding each
+> result into a running snapshot before the next alias resolves — a direct
+> generalization of `Canonicalize/Environment/Local.hs`'s own
+> `addAliases`/`addAlias`. Only once every alias has a real body does
+> Phase B (`resolveUnions`) resolve every union in one pass. A single
+> shared function, `withSccTypes` (parameterized by which alias-body
+> snapshot is available), replaces the sketch's separate
+> `addOwnTypes`/`addPeerImport`/`shapeToType` injection functions. `harvest`
+> also returns `Either Failure (...)` (not the `Result i w (...)` shown in
+> the Produces line below), and exports `Restriction(..)` alongside
+> `Failure(..)` (a v1 restriction check, rejecting ports/effect
+> managers/custom infix operators in any cyclic-SCC module, that isn't in
+> the sketch below at all). **Treat the actual `Harvest.hs` source as the
+> source of truth for this task's design** — Steps 3-6's code blocks are
+> useful for understanding the original intent and the single-module
+> patterns they're generalizing from, but do not reflect what's on `main`.
+> See `.superpowers/sdd/task-4-report.md` (gitignored, worktree-local) for
+> the full history across all three review rounds if you need it.
+
 **Files:**
 - Create: `compiler/src/Canonicalize/Harvest.hs`
 - Modify: `elm.cabal` (register the new module)
