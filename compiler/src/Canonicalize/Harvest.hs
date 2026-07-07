@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Canonicalize.Harvest
   ( Failure(..)
+  , Restriction(..)
   , harvest
   )
   where
@@ -45,6 +46,49 @@ data Failure
   = MissingAnnotation ModuleName.Raw Name.Name
   | AliasCycle (ModuleName.Raw, Name.Name) [(ModuleName.Raw, Name.Name)]
   | CanonicalizeError ModuleName.Raw CError.Error
+  | UnsupportedInCycle ModuleName.Raw Restriction
+
+
+-- A cyclic SCC module using any of these features is rejected outright
+-- (see the plan's Global Constraints). Ports and effect managers are
+-- rejected because this plan's harvested Interface has no
+-- representation for them -- I.fromHarvest always produces
+-- Can.NoEffects and no binops (see harvestOne), so a port/manager would
+-- otherwise just silently vanish from the harvested Interface instead
+-- of erroring. Custom infix operators are rejected because fixity /
+-- associativity resolution isn't reproduced by this pass.
+data Restriction
+  = RestrictedPort
+  | RestrictedEffectManager
+  | RestrictedCustomOperator
+
+
+
+-- REJECT PORTS / EFFECTS / CUSTOM OPERATORS
+--
+-- Checked explicitly, before any other harvest work, so an offending
+-- module produces a clear Left naming itself and the violated
+-- restriction, rather than harvestOne silently dropping its
+-- binops/effects when building the stub Interface.
+checkRestrictions :: Map.Map ModuleName.Raw Src.Module -> Either Failure ()
+checkRestrictions modules =
+  Map.foldrWithKey (\modName modul acc -> checkOne modName modul >> acc) (Right ()) modules
+
+
+checkOne :: ModuleName.Raw -> Src.Module -> Either Failure ()
+checkOne modName (Src.Module _ _ _ _ _ _ _ binops effects) =
+  case effects of
+    Src.Ports _ ->
+      Left (UnsupportedInCycle modName RestrictedPort)
+
+    Src.Manager _ _ ->
+      Left (UnsupportedInCycle modName RestrictedEffectManager)
+
+    Src.NoEffects ->
+      if null binops then
+        Right ()
+      else
+        Left (UnsupportedInCycle modName RestrictedCustomOperator)
 
 
 
@@ -299,6 +343,78 @@ getEdgesAcrossModules registry prefixes home edges (A.At _ tipe) =
 
 
 
+-- FINALIZE ENVS FOR SIGNATURE HARVESTING
+--
+-- buildEnv's per-member envs (used to resolve union/alias *bodies* in
+-- resolveTypeBodies) still carry shapeToType's placeholder alias bodies
+-- for every SCC union/alias -- correct for resolving bodies (nothing
+-- expands an alias while resolving bodies), but wrong for resolving
+-- *signatures* afterward: Type.canonicalize expands an alias reference
+-- by reading its Env.Alias's tipe field, so a signature naming any SCC
+-- alias (this module's own, or a peer's) must see the real resolved
+-- Can.Alias body from resolveTypeBodies, not the placeholder. This
+-- rebuilds each member's _types/_q_types tables from the real resolved
+-- (Can.Union, Can.Alias) pairs, the same way addOwnTypes/addPeerImport
+-- built them from the placeholder-bodied Registry, and is used only for
+-- the signature-harvesting pass in harvestOne (union entries need no
+-- such rebuild -- Type.canonicalize never inlines a union's own
+-- definition, only an alias's -- but rebuilding both uniformly is
+-- simpler than special-casing).
+finalizeEnv
+  :: Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias)
+  -> Map.Map ModuleName.Raw Src.Module
+  -> ModuleName.Raw
+  -> Env.Env
+  -> Env.Env
+finalizeEnv typeBodies modules modName (Env.Env home vs ts cs bs qvs qts qcs) =
+  let
+    Src.Module _ _ _ imports _ _ _ _ _ = modules ! modName
+    ownTypes = toEnvTypes home (typeBodies ! modName)
+    ts1 = Map.union ownTypes ts
+    qts1 = foldr (addPeerFinal typeBodies) qts imports
+  in
+  Env.Env home vs ts1 cs bs qvs qts1 qcs
+
+
+toEnvTypes :: ModuleName.Canonical -> (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias) -> Env.Exposed Env.Type
+toEnvTypes home (unions, aliases) =
+  Map.union
+    (Map.map (Env.Specific home . unionToEnvType) unions)
+    (Map.map (Env.Specific home . aliasToEnvType home) aliases)
+  where
+    unionToEnvType (Can.Union vars _ _ _) = Env.Union (length vars) home
+
+
+aliasToEnvType :: ModuleName.Canonical -> Can.Alias -> Env.Type
+aliasToEnvType home (Can.Alias vars tipe) =
+  Env.Alias (length vars) home vars tipe
+
+
+-- Only touches an import that names a fellow SCC member (present in
+-- typeBodies); an outside-the-SCC import's qualified types are already
+-- correct from buildEnv/Foreign.createInitialEnv and are left alone. A
+-- full Map.insert (not a merge) is deliberate: this prefix's peer types
+-- are being replaced wholesale with their real resolved versions, not
+-- added to.
+addPeerFinal
+  :: Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias)
+  -> Src.Import
+  -> Env.Qualified Env.Type
+  -> Env.Qualified Env.Type
+addPeerFinal typeBodies (Src.Import (A.At _ peerName) maybeAlias _) qts =
+  case Map.lookup peerName typeBodies of
+    Nothing ->
+      qts
+
+    Just bodies ->
+      let
+        prefix = maybe peerName id maybeAlias
+        peerHome = ModuleName.Canonical Pkg.dummyName peerName
+      in
+      Map.insert prefix (toEnvTypes peerHome bodies) qts
+
+
+
 -- HARVEST
 
 
@@ -308,10 +424,12 @@ harvest
   -> Map.Map ModuleName.Raw Src.Module
   -> Either Failure (Map.Map ModuleName.Raw I.Interface)
 harvest pkg outsideIfaces modules =
-  do  let registry = registerTypes modules
+  do  checkRestrictions modules
+      let registry = registerTypes modules
       envs <- Map.traverseWithKey (buildEnvFor registry outsideIfaces) modules
       typeBodies <- resolveTypeBodies registry envs modules
-      Map.traverseWithKey (harvestOne pkg envs typeBodies) modules
+      let finalEnvs = Map.mapWithKey (finalizeEnv typeBodies modules) envs
+      Map.traverseWithKey (harvestOne pkg finalEnvs typeBodies) modules
 
 
 buildEnvFor
