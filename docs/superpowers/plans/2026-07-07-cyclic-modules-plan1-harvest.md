@@ -220,54 +220,24 @@ findCyclicKeysHelp sccs =
 
 This needs `Ord key` for `Graph.stronglyConnComp`'s internal `Map`-based vertex numbering — check `Data.Graph`'s actual constraint by building (Step 3); if `stronglyConnComp` only requires `Ord` on the key component of each tuple, this is correct as written.
 
-- [ ] **Step 2: Reimplement `detectBadCycles`'s SCC branch on top of the new helper**
+- [ ] **Step 2: Document why `detectBadCycles` doesn't call the new helper**
 
-Replace:
+`detectBadCycles` itself needs no logic change — it keeps its own direct `Graph.CyclicSCC` match rather than routing through `findCyclicKeys`, since it needs the *whole* `Can.Def` payload back (to build `Error.RecursiveDecl`'s region/name), not just keys. Add a one-line comment above it so a future reader doesn't wonder why `findCyclicKeys` looks unused from this function.
 
-```haskell
-detectBadCycles :: Graph.SCC Can.Def -> Result i w Can.Def
-detectBadCycles scc =
-  case scc of
-    Graph.AcyclicSCC def ->
-      Result.ok def
-
-    Graph.CyclicSCC [] ->
-      error "The definition of Data.Graph.SCC should not allow empty CyclicSCC!"
-
-    Graph.CyclicSCC (def:defs) ->
-      let
-        (A.At region name) = extractDefName def
-        names = map (A.toValue . extractDefName) defs
-      in
-      Result.throw (Error.RecursiveDecl region name names)
-```
-
-with:
+In `compiler/src/Canonicalize/Module.hs`, change:
 
 ```haskell
 detectBadCycles :: Graph.SCC Can.Def -> Result i w Can.Def
 detectBadCycles scc =
-  case scc of
-    Graph.AcyclicSCC def ->
-      Result.ok def
-
-    Graph.CyclicSCC [] ->
-      error "The definition of Data.Graph.SCC should not allow empty CyclicSCC!"
-
-    Graph.CyclicSCC (def:defs) ->
-      let
-        (A.At region name) = extractDefName def
-        names = map (A.toValue . extractDefName) defs
-      in
-      Result.throw (Error.RecursiveDecl region name names)
 ```
 
-(No actual change here — `detectBadCycles` keeps its own direct `Graph.CyclicSCC` match rather than routing through `findCyclicKeys`, since it needs the *whole* `Can.Def` payload back, not just keys, to build the `Error.RecursiveDecl` region/name. Note this in a comment so a future reader doesn't wonder why `findCyclicKeys` looks unused from this function: add a one-line comment above `detectBadCycles`:)
+to:
 
 ```haskell
 -- Single-module entry point (unchanged behavior). See findCyclicKeys
 -- above for the cross-module-reusable version of this same rule.
 detectBadCycles :: Graph.SCC Can.Def -> Result i w Can.Def
+detectBadCycles scc =
 ```
 
 - [ ] **Step 3: Export `findCyclicKeys` for Task 4's use**
