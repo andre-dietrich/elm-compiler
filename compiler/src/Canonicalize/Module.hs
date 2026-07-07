@@ -1,5 +1,6 @@
 module Canonicalize.Module
   ( canonicalize
+  , canonicalizeExports
   , findCyclicKeys
   )
   where

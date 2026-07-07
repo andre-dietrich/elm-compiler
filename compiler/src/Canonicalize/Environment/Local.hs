@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Canonicalize.Environment.Local
   ( add
+  , canonicalizeUnion
+  , canonicalizeAlias
   )
   where
 
