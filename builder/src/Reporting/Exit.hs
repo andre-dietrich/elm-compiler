@@ -1769,6 +1769,8 @@ data BuildProjectProblem
   | BP_CannotLoadDependencies
   | BP_Cycle ModuleName.Raw [ModuleName.Raw]
   | BP_MissingExposed (NE.List (ModuleName.Raw, Import.Problem))
+  | BP_CycleValue (NE.List (ModuleName.Raw, N.Name))
+  | BP_CycleMissingAnnotation ModuleName.Raw N.Name
 
 
 toBuildProblemReport :: BuildProblem -> Help.Report
@@ -1871,6 +1873,30 @@ toProjectProblemReport projectProblem =
         , D.reflow $
             "Learn more about why this is disallowed and how to break cycles here:"
             ++ D.makeLink "import-cycles"
+        ]
+
+    BP_CycleValue (NE.List (m0, n0) rest) ->
+      Help.report "CYCLIC DEFINITION ACROSS MODULES" Nothing
+        "These modules depend on each other through a chain of plain (non-function) values, which never terminates:"
+        [ D.indent 4 $ D.vcat $
+            (D.dullyellow (D.fromName m0) <> "." <> D.fromName n0)
+            : map (\(m, n) -> D.dullyellow (D.fromName m) <> "." <> D.fromName n) rest
+        , D.reflow $
+            "A value defined in terms of itself through other modules has no well-defined\
+            \ order to evaluate in. Mutually recursive functions are fine here \8212 only\
+            \ plain values (no arguments) are the problem. Try turning one of these into a\
+            \ function, or breaking the cycle another way."
+        ]
+
+    BP_CycleMissingAnnotation home name ->
+      Help.report "ANNOTATION NEEDED FOR CYCLIC IMPORT" Nothing
+        "This value is exposed from a module that is part of an import cycle:"
+        [ D.indent 4 $ D.dullyellow (D.fromName home) <> "." <> D.fromName name
+        , D.reflow $
+            "Every value exposed from a module that participates in an import cycle needs\
+            \ an explicit type annotation, because I need to know its type before I can\
+            \ finish compiling the modules it cycles with. Add a top-level type annotation\
+            \ to fix this."
         ]
 
     BP_MissingExposed (NE.List (name, problem) _) ->
