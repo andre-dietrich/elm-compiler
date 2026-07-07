@@ -23,10 +23,29 @@ evaluated eagerly at binding time and a direct cycle among them is
 non-terminating or reads an uninitialized value. This design generalizes
 that exact rule across a module boundary instead of only within one file.
 
-Type/alias declarations are unaffected by this distinction — they have no
-runtime evaluation order — so mutually recursive types across modules are
-unconditionally fine, the same way mutually recursive types within one
-module already are today.
+**Correction (found while writing the implementation plan, 2026-07-07):**
+this is only true for `type` (union) declarations, not `type alias`.
+`Canonicalize/Environment/Local.hs:120-145` shows Elm already rejects
+recursive type *aliases* even within a single module
+(`Graph.CyclicSCC ... -> Result.throw (Error.RecursiveAlias ...)`) — an
+alias is substituted inline, so a cycle is an infinite type expansion,
+unlike a `union`, whose constructors are an implicit indirection/box. So:
+mutually recursive `type` declarations across modules are fine (same
+reasoning as within one module today); mutually recursive `type alias`
+declarations across modules must stay rejected, exactly as they already
+are within one module, just extended to span the module boundary.
+
+A second correction from the same pass: the two-pass compile below can't
+simply be spliced into `Build.hs`'s existing per-module scheduling
+unchanged. That scheduler forks one thread per module and each blocks via
+`readMVar` on its dependencies' result MVars (`Build.hs:459-460`) — two
+modules in a real cycle, run through that path unmodified, deadlock
+forever instead of failing cleanly. Members of an admissible cyclic SCC
+must be pulled out of that per-module fork/block scheme and compiled by a
+dedicated, non-concurrent two-pass routine (the SCC as a whole can still
+run concurrently with unrelated modules — just not internally). This is
+significant enough that it's split into its own follow-up plan; see
+`docs/superpowers/plans/2026-07-07-cyclic-modules-*.md`.
 
 A key finding that shapes the design: **codegen needs no changes**. Once
 past `Compile.compile`, everything funnels into one whole-program
@@ -42,13 +61,16 @@ finished before that module can be compiled (`Compile.hs:39`).
 ## Scope
 
 **Allowed**, once this ships:
-- Mutually recursive type/alias declarations across modules.
+- Mutually recursive `type` (union) declarations across modules.
 - Mutually recursive functions across modules — but only when every
   cross-module reference to such a function has an explicit top-level
   type annotation in its defining module (see Pass A below; this is a new
   hard requirement, not just a style nudge).
 
 **Still rejected**, exactly as today:
+- Mutually recursive `type alias` declarations across modules — same
+  reasoning, and the same error character, as today's intra-module
+  `RecursiveAlias`, just naming the modules involved.
 - Any direct cross-module cycle among argument-less values (CAFs) — same
   character of error as today's intra-module `RecursiveDecl`, just naming
   the modules involved.
