@@ -8,6 +8,7 @@ module Canonicalize.Harvest
 
 
 import Control.Monad (foldM)
+import qualified Data.Graph as Graph
 import qualified Data.List as List
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict ((!))
@@ -98,10 +99,16 @@ checkOne modName (Src.Module _ _ _ _ _ _ _ binops effects) =
 -- and owning module -- built with no bodies resolved yet, exactly like
 -- Local.addTypes registers a module's own type names before resolving
 -- any of them. Aliases are also registered here (for arity/lookup
--- purposes) even though a *cyclic* alias is always rejected in Step 5
--- -- an acyclic alias that merely lives in a cyclic-SCC module (e.g.
--- `type alias Pair = (A.Foo, Int)` where only Foo, not Pair, is part of
--- the cycle) is completely fine and still needs registering here.
+-- purposes) even though a *cyclic* alias is always rejected below -- an
+-- acyclic alias that merely lives in a cyclic-SCC module (e.g. `type
+-- alias Pair = (A.Foo, Int)` where only Foo, not Pair, is part of the
+-- cycle) is completely fine and still needs registering here.
+--
+-- A union's entry here is always the *complete* picture -- Env.Union
+-- only ever carries an arity and a home, never a body, so there's no
+-- staged-resolution concern for a reference *to* a union (only for a
+-- reference to an alias, whose Env.Alias entry does carry a body that
+-- can be a not-yet-resolved placeholder -- see typeForShape below).
 
 
 data TypeShape
@@ -127,133 +134,250 @@ registerTypes modules =
 
 
 
--- BUILD ENV
+-- BASE ENVS
 --
--- Build one SCC member's Env for resolving its own union/alias bodies
--- and signatures. It sees three groups of type names:
---
---   * outside-the-SCC imports, via the real Foreign.createInitialEnv;
---   * every *other* SCC member's registered (name, arity), injected as
---     if they were foreign qualified bindings (addPeerImport); and
---   * this module's *own* registered (name, arity), injected unqualified
---     (addOwnTypes) -- mirroring Local.addTypes, which puts a module's
---     own type names into its env before any body/signature resolves.
---
--- Peers are deliberately not routed through Foreign.createInitialEnv --
--- that function requires a real, finished I.Interface (real
--- Can.Union/Can.Alias values, since it also builds constructor
--- bindings), which peers don't have yet at registration time. And any
--- import whose module isn't among the provided outside interfaces (a
+-- One SCC member's Env covering only what's *outside* the SCC: real
+-- Foreign.createInitialEnv fed only the imports whose module has a
+-- supplied outside interface. A peer import (naming a fellow SCC
+-- member) is never in outsideIfaces, so filtering to isOutsideImport
+-- alone already excludes every peer import -- Foreign.createInitialEnv
+-- indexes ifaces with a partial (!) and would otherwise crash on a
 -- default import like Basics/List when the caller supplies no core
--- interfaces) is dropped rather than passed to createInitialEnv, which
--- indexes ifaces with a partial (!) and would otherwise crash. In the
--- real build every used import has an interface, so nothing gets
--- dropped there; harvest only resolves types, so an unused missing
--- import is irrelevant, and a *used* missing type still surfaces as a
--- clean NotFoundType rather than a Prelude error.
+-- interfaces, or on a peer. In the real build every used outside import
+-- has an interface, so nothing gets dropped there; harvest only
+-- resolves types, so an unused missing import is irrelevant, and a
+-- *used* missing type still surfaces as a clean NotFoundType rather
+-- than a Prelude error.
+--
+-- SCC-internal types (this module's own, and every peer's) are
+-- deliberately NOT added here -- that's withSccTypes's job below, and
+-- it needs to be re-run at different points with different amounts of
+-- alias-body information available (see the two-phase resolution
+-- section), so baking a fixed snapshot of SCC types into the env at
+-- this stage would be wrong.
 buildEnv
-  :: Registry
-  -> Map.Map ModuleName.Raw I.Interface
+  :: Map.Map ModuleName.Raw I.Interface
   -> ModuleName.Raw
   -> Src.Module
   -> Result.Result i w CError.Error Env.Env
-buildEnv registry outsideIfaces modName (Src.Module _ _ _ imports _ _ _ _ _) =
+buildEnv outsideIfaces modName (Src.Module _ _ _ imports _ _ _ _ _) =
   let
     home = ModuleName.Canonical Pkg.dummyName modName
-    isPeerImport (Src.Import (A.At _ n) _ _) =
-      n /= modName && any (\(m, _) -> m == n) (Map.keys registry)
     isOutsideImport (Src.Import (A.At _ n) _ _) =
       Map.member n outsideIfaces
     outsideImports = filter isOutsideImport imports
-    peerImports = filter isPeerImport imports
   in
-  do  env <- Foreign.createInitialEnv home outsideIfaces outsideImports
-      Result.ok $
-        addOwnTypes registry modName $
-          foldr (addPeerImport registry) env peerImports
+  Foreign.createInitialEnv home outsideIfaces outsideImports
 
 
+
+-- SCC TYPES -- STAGE-AWARE INJECTION
+--
 -- Turn a registered (name, arity) into the Env.Type a use site resolves
--- against. Env.Alias's args/tipe fields are only consulted when a use
--- site *expands* the alias (Type.canonicalize's alias-arg substitution);
--- at registration time nothing should be expanding a peer/own alias yet,
--- so a placeholder body is safe here. (A signature referencing an
--- acyclic alias would read this placeholder -- see the module's harvest
--- note; v1's tested surface is unions plus alias-cycle rejection.)
-shapeToType :: ModuleName.Canonical -> TypeShape -> Env.Type
-shapeToType h shape =
+-- against, given whatever subset of the SCC's aliases has a real
+-- resolved body *so far* (`resolvedAliases`). A union is always
+-- complete (see the TYPE REGISTRATION note above). An alias not yet
+-- present in `resolvedAliases` gets a placeholder body -- safe as long
+-- as nothing ever actually reads that placeholder, which the
+-- topological ordering in resolveAliasesInOrder below guarantees: an
+-- alias is only resolved after everything its own body references is
+-- already in `resolvedAliases`, so by the time any *use site* (another
+-- alias, a union, or a signature) can legitimately read a given alias's
+-- body, that alias is guaranteed to already be in `resolvedAliases`.
+typeForShape
+  :: Map.Map (ModuleName.Raw, Name.Name) Can.Alias
+  -> ModuleName.Canonical
+  -> (ModuleName.Raw, Name.Name)
+  -> TypeShape
+  -> Env.Type
+typeForShape resolvedAliases home key shape =
   case shape of
-    ShapeUnion arity -> Env.Union arity h
-    ShapeAlias arity -> Env.Alias arity h [] (Can.TVar "harvestPlaceholder")
+    ShapeUnion arity ->
+      Env.Union arity home
+
+    ShapeAlias arity ->
+      case Map.lookup key resolvedAliases of
+        Just (Can.Alias vars tipe) -> Env.Alias arity home vars tipe
+        Nothing                    -> Env.Alias arity home [] (Can.TVar "harvestPlaceholder")
 
 
--- Insert this module's own registered types (unqualified) into its env.
-addOwnTypes :: Registry -> ModuleName.Raw -> Env.Env -> Env.Env
-addOwnTypes registry modName (Env.Env home vs ts cs bs qvs qts qcs) =
-  let
-    ownTypes =
-      Map.fromList
-        [ (name, Env.Specific home (shapeToType home shape))
-        | ((m, name), shape) <- Map.toList registry
-        , m == modName
-        ]
-  in
-  Env.Env home vs (Map.union ownTypes ts) cs bs qvs qts qcs
+-- Every type (name, arity/body) registered as belonging to one SCC
+-- module, keyed unqualified -- used both to inject a module's own types
+-- (unqualified) and a peer's types (qualified, under whatever prefix
+-- imports it).
+sccTypesFor :: Registry -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias -> ModuleName.Raw -> Env.Exposed Env.Type
+sccTypesFor registry resolvedAliases modName =
+  let home = ModuleName.Canonical Pkg.dummyName modName in
+  Map.fromList
+    [ (name, Env.Specific home (typeForShape resolvedAliases home (m, name) shape))
+    | ((m, name), shape) <- Map.toList registry
+    , m == modName
+    ]
 
 
--- Inject a peer SCC member's registered types under its import prefix
--- (its alias if it has one, else its module name), so a qualified
--- reference like `B.Stmt` resolves via the qualified-types table.
-addPeerImport :: Registry -> Src.Import -> Env.Env -> Env.Env
-addPeerImport registry (Src.Import (A.At _ peerName) maybeAlias _) (Env.Env home vs ts cs bs qvs qts qcs) =
+-- Inject a peer SCC member's types under its import prefix (its alias
+-- if it has one, else its module name), so a qualified reference like
+-- `B.Stmt` resolves via the qualified-types table. A full replace
+-- (Map.insert, not a merge) is correct here: this prefix's peer types
+-- are always being (re)built wholesale from the current resolvedAliases
+-- snapshot, not added to.
+addPeerTypes
+  :: Registry
+  -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias
+  -> Src.Import
+  -> Env.Qualified Env.Type
+  -> Env.Qualified Env.Type
+addPeerTypes registry resolvedAliases (Src.Import (A.At _ peerName) maybeAlias _) qts =
   let
     prefix = maybe peerName id maybeAlias
-    peerHome = ModuleName.Canonical Pkg.dummyName peerName
-    peerTypes =
-      Map.fromList
-        [ (name, Env.Specific peerHome (shapeToType peerHome shape))
-        | ((m, name), shape) <- Map.toList registry
-        , m == peerName
-        ]
+    peerTypes = sccTypesFor registry resolvedAliases peerName
   in
-  Env.Env home vs ts cs bs qvs (Map.insertWith (Map.unionWith Env.mergeInfo) prefix peerTypes qts) qcs
+  Map.insert prefix peerTypes qts
+
+
+-- Extend one module's base (outside-only) env with the SCC's own +
+-- peer types, as of a given resolvedAliases snapshot. Called at
+-- different points with different snapshots: partially-filled (mid-way
+-- through resolveAliasesInOrder) and complete (resolving unions in
+-- Phase B, and again for signature harvesting).
+withSccTypes
+  :: Registry
+  -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias
+  -> Map.Map ModuleName.Raw Src.Module
+  -> ModuleName.Raw
+  -> Env.Env
+  -> Env.Env
+withSccTypes registry resolvedAliases modules modName (Env.Env home vs ts cs bs qvs qts qcs) =
+  let
+    Src.Module _ _ _ imports _ _ _ _ _ = modules ! modName
+    ownTypes = sccTypesFor registry resolvedAliases modName
+    ts1 = Map.union ownTypes ts
+    peerImports =
+      [ imp | imp@(Src.Import (A.At _ n) _ _) <- imports, n /= modName, Map.member n modules ]
+    qts1 = foldr (addPeerTypes registry resolvedAliases) qts peerImports
+  in
+  Env.Env home vs ts1 cs bs qvs qts1 qcs
 
 
 
--- RESOLVE TYPE BODIES
+-- TWO-PHASE TYPE BODY RESOLUTION
 --
--- Resolve every SCC member's real union/alias bodies, using the envs
--- from buildEnv (which can already see every peer's and its own
--- registered name+arity). Rejects a type-alias cycle across the SCC
--- boundary first, the same way Local.addAliases rejects one within a
--- single module -- generalized from Name.Name keys to (ModuleName.Raw,
--- Name.Name) keys spanning every SCC member's aliases at once.
+-- Phase A resolves every SCC alias's real body, one at a time, in true
+-- cross-module topological dependency order -- an order that exists
+-- because a cyclic alias dependency (across or within modules) is
+-- rejected up front by findCyclicKeys, before Phase A ever starts. Each
+-- alias is resolved against an env built from whatever's been resolved
+-- *so far*, and its result is folded into the running snapshot before
+-- the next alias resolves -- this is a direct generalization of
+-- Canonicalize.Environment.Local's own addAliases/addAlias
+-- (Local.hs:120-145), which does the exact same "topologically-ordered
+-- fold, each resolved alias visible to the next" for the single-module
+-- case via Graph.stronglyConnComp + foldM. Only once every alias has a
+-- real body does Phase B resolve every union -- unions never need
+-- ordering among themselves (a union is never inlined into another
+-- type, only an alias is), so Phase B builds each module's env once
+-- from the complete, final alias-body snapshot and resolves all of that
+-- module's unions in one pass, same shape as the original (pre-fix)
+-- single-pass design.
 
 
+-- One node per SCC alias, in the same shape aliasNodes already builds
+-- for cycle detection (payload doubles as key, as findCyclicKeys
+-- requires). Reused here for its ordering, not just its cycle check:
+-- Graph.stronglyConnComp's output list order is exactly the order
+-- Local.hs's own addAliases relies on (each SCC in the list has all its
+-- dependencies already appearing earlier in the list). Since Phase A
+-- only ever runs after findCyclicKeys has already confirmed this exact
+-- edge set is acyclic, every SCC here is guaranteed AcyclicSCC; the
+-- CyclicSCC arm is unreachable in practice and kept only so the match
+-- is total.
+topoAliasOrder :: Registry -> Map.Map ModuleName.Raw Src.Module -> [(ModuleName.Raw, Name.Name)]
+topoAliasOrder registry modules =
+  concatMap fromSCC (Graph.stronglyConnComp (aliasNodes registry modules))
+  where
+    fromSCC scc =
+      case scc of
+        Graph.AcyclicSCC key -> [key]
+        Graph.CyclicSCC keys -> keys
+
+
+buildAliasByKey :: Map.Map ModuleName.Raw Src.Module -> Map.Map (ModuleName.Raw, Name.Name) (A.Located Src.Alias)
+buildAliasByKey modules =
+  Map.fromList
+    [ ((modName, name), alias)
+    | (modName, Src.Module _ _ _ _ _ _ aliases _ _) <- Map.toList modules
+    , alias@(A.At _ (Src.Alias (A.At _ name) _ _)) <- aliases
+    ]
+
+
+resolveAliasesInOrder
+  :: Registry
+  -> Map.Map ModuleName.Raw Env.Env
+  -> Map.Map ModuleName.Raw Src.Module
+  -> Either Failure (Map.Map (ModuleName.Raw, Name.Name) Can.Alias)
+resolveAliasesInOrder registry baseEnvs modules =
+  foldM resolveOne Map.empty (topoAliasOrder registry modules)
+  where
+    aliasByKey = buildAliasByKey modules
+
+    resolveOne resolvedSoFar key@(modName, _) =
+      do  let aliasNode = aliasByKey ! key
+          let env = withSccTypes registry resolvedSoFar modules modName (baseEnvs ! modName)
+          (_, alias) <- resolveDecl modName (fmap fst . Local.canonicalizeAlias env) aliasNode
+          Right (Map.insert key alias resolvedSoFar)
+
+
+resolveUnions
+  :: Registry
+  -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias
+  -> Map.Map ModuleName.Raw Env.Env
+  -> Map.Map ModuleName.Raw Src.Module
+  -> Either Failure (Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union))
+resolveUnions registry finalAliases baseEnvs modules =
+  Map.traverseWithKey resolveOneModuleUnions modules
+  where
+    resolveOneModuleUnions modName (Src.Module _ _ _ _ _ unions _ _ _) =
+      do  let env = withSccTypes registry finalAliases modules modName (baseEnvs ! modName)
+          unionList <- traverse (resolveDecl modName (fmap fst . Local.canonicalizeUnion env)) unions
+          Right (Map.fromList unionList)
+
+
+combineTypeBodies
+  :: Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union)
+  -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias
+  -> Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias)
+combineTypeBodies unionsByModule finalAliases =
+  Map.mapWithKey (\modName unions -> (unions, aliasesForModule modName)) unionsByModule
+  where
+    aliasesForModule modName =
+      Map.fromList [ (name, alias) | ((m, name), alias) <- Map.toList finalAliases, m == modName ]
+
+
+-- Resolve every SCC member's real union/alias bodies. Rejects a
+-- type-alias cycle across the SCC boundary first, the same way
+-- Local.addAliases rejects one within a single module -- generalized
+-- from Name.Name keys to (ModuleName.Raw, Name.Name) keys spanning
+-- every SCC member's aliases at once. Returns both the flat
+-- cross-module alias-body map (reused directly by harvest to build the
+-- final signature-harvesting envs) and the per-module (unions, aliases)
+-- pairs that feed I.fromHarvest.
 resolveTypeBodies
   :: Registry
   -> Map.Map ModuleName.Raw Env.Env
   -> Map.Map ModuleName.Raw Src.Module
-  -> Either Failure (Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias))
-resolveTypeBodies registry envs modules =
+  -> Either Failure
+       ( Map.Map (ModuleName.Raw, Name.Name) Can.Alias
+       , Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias)
+       )
+resolveTypeBodies registry baseEnvs modules =
   case CModule.findCyclicKeys (aliasNodes registry modules) of
     Just (NE.List key keys) ->
       Left (AliasCycle key keys)
 
     Nothing ->
-      Map.traverseWithKey (resolveOneModule envs) modules
-
-
-resolveOneModule
-  :: Map.Map ModuleName.Raw Env.Env
-  -> ModuleName.Raw
-  -> Src.Module
-  -> Either Failure (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias)
-resolveOneModule envs modName (Src.Module _ _ _ _ _ unions aliases _ _) =
-  do  let env = envs ! modName
-      unionList <- traverse (resolveDecl modName (fmap fst . Local.canonicalizeUnion env)) unions
-      aliasList <- traverse (resolveDecl modName (fmap fst . Local.canonicalizeAlias env)) aliases
-      Right (Map.fromList unionList, Map.fromList aliasList)
+      do  finalAliases <- resolveAliasesInOrder registry baseEnvs modules
+          unionsByModule <- resolveUnions registry finalAliases baseEnvs modules
+          Right (finalAliases, combineTypeBodies unionsByModule finalAliases)
 
 
 resolveDecl :: ModuleName.Raw -> (decl -> Result.Result () [w] CError.Error a) -> decl -> Either Failure a
@@ -275,7 +399,10 @@ resolveDecl modName resolver decl =
 -- lands on a name in `registry` -- anything else (a builtin, an
 -- outside-the-SCC import) is irrelevant to whether *this* SCC has a
 -- cycle and is silently ignored, exactly like Local.hs's getEdges
--- ignores non-local names today.
+-- ignores non-local names today. Also reused (via topoAliasOrder above)
+-- for the topological order Phase A resolves aliases in -- the same
+-- edge set answers both "is there a cycle" and "what order resolves
+-- correctly", since both questions are about the same dependency graph.
 
 
 -- findCyclicKeys (Canonicalize.Module) uses each node's payload as its
@@ -343,78 +470,6 @@ getEdgesAcrossModules registry prefixes home edges (A.At _ tipe) =
 
 
 
--- FINALIZE ENVS FOR SIGNATURE HARVESTING
---
--- buildEnv's per-member envs (used to resolve union/alias *bodies* in
--- resolveTypeBodies) still carry shapeToType's placeholder alias bodies
--- for every SCC union/alias -- correct for resolving bodies (nothing
--- expands an alias while resolving bodies), but wrong for resolving
--- *signatures* afterward: Type.canonicalize expands an alias reference
--- by reading its Env.Alias's tipe field, so a signature naming any SCC
--- alias (this module's own, or a peer's) must see the real resolved
--- Can.Alias body from resolveTypeBodies, not the placeholder. This
--- rebuilds each member's _types/_q_types tables from the real resolved
--- (Can.Union, Can.Alias) pairs, the same way addOwnTypes/addPeerImport
--- built them from the placeholder-bodied Registry, and is used only for
--- the signature-harvesting pass in harvestOne (union entries need no
--- such rebuild -- Type.canonicalize never inlines a union's own
--- definition, only an alias's -- but rebuilding both uniformly is
--- simpler than special-casing).
-finalizeEnv
-  :: Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias)
-  -> Map.Map ModuleName.Raw Src.Module
-  -> ModuleName.Raw
-  -> Env.Env
-  -> Env.Env
-finalizeEnv typeBodies modules modName (Env.Env home vs ts cs bs qvs qts qcs) =
-  let
-    Src.Module _ _ _ imports _ _ _ _ _ = modules ! modName
-    ownTypes = toEnvTypes home (typeBodies ! modName)
-    ts1 = Map.union ownTypes ts
-    qts1 = foldr (addPeerFinal typeBodies) qts imports
-  in
-  Env.Env home vs ts1 cs bs qvs qts1 qcs
-
-
-toEnvTypes :: ModuleName.Canonical -> (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias) -> Env.Exposed Env.Type
-toEnvTypes home (unions, aliases) =
-  Map.union
-    (Map.map (Env.Specific home . unionToEnvType) unions)
-    (Map.map (Env.Specific home . aliasToEnvType home) aliases)
-  where
-    unionToEnvType (Can.Union vars _ _ _) = Env.Union (length vars) home
-
-
-aliasToEnvType :: ModuleName.Canonical -> Can.Alias -> Env.Type
-aliasToEnvType home (Can.Alias vars tipe) =
-  Env.Alias (length vars) home vars tipe
-
-
--- Only touches an import that names a fellow SCC member (present in
--- typeBodies); an outside-the-SCC import's qualified types are already
--- correct from buildEnv/Foreign.createInitialEnv and are left alone. A
--- full Map.insert (not a merge) is deliberate: this prefix's peer types
--- are being replaced wholesale with their real resolved versions, not
--- added to.
-addPeerFinal
-  :: Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias)
-  -> Src.Import
-  -> Env.Qualified Env.Type
-  -> Env.Qualified Env.Type
-addPeerFinal typeBodies (Src.Import (A.At _ peerName) maybeAlias _) qts =
-  case Map.lookup peerName typeBodies of
-    Nothing ->
-      qts
-
-    Just bodies ->
-      let
-        prefix = maybe peerName id maybeAlias
-        peerHome = ModuleName.Canonical Pkg.dummyName peerName
-      in
-      Map.insert prefix (toEnvTypes peerHome bodies) qts
-
-
-
 -- HARVEST
 
 
@@ -426,20 +481,19 @@ harvest
 harvest pkg outsideIfaces modules =
   do  checkRestrictions modules
       let registry = registerTypes modules
-      envs <- Map.traverseWithKey (buildEnvFor registry outsideIfaces) modules
-      typeBodies <- resolveTypeBodies registry envs modules
-      let finalEnvs = Map.mapWithKey (finalizeEnv typeBodies modules) envs
+      baseEnvs <- Map.traverseWithKey (buildBaseEnvFor outsideIfaces) modules
+      (finalAliases, typeBodies) <- resolveTypeBodies registry baseEnvs modules
+      let finalEnvs = Map.mapWithKey (\modName env -> withSccTypes registry finalAliases modules modName env) baseEnvs
       Map.traverseWithKey (harvestOne pkg finalEnvs typeBodies) modules
 
 
-buildEnvFor
-  :: Registry
-  -> Map.Map ModuleName.Raw I.Interface
+buildBaseEnvFor
+  :: Map.Map ModuleName.Raw I.Interface
   -> ModuleName.Raw
   -> Src.Module
   -> Either Failure Env.Env
-buildEnvFor registry outsideIfaces modName modul =
-  resolveDecl modName (const (buildEnv registry outsideIfaces modName modul)) ()
+buildBaseEnvFor outsideIfaces modName modul =
+  resolveDecl modName (const (buildEnv outsideIfaces modName modul)) ()
 
 
 harvestOne
