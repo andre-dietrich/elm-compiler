@@ -156,13 +156,14 @@ registerTypes modules =
 -- section), so baking a fixed snapshot of SCC types into the env at
 -- this stage would be wrong.
 buildEnv
-  :: Map.Map ModuleName.Raw I.Interface
+  :: Pkg.Name
+  -> Map.Map ModuleName.Raw I.Interface
   -> ModuleName.Raw
   -> Src.Module
   -> Result.Result i w CError.Error Env.Env
-buildEnv outsideIfaces modName (Src.Module _ _ _ imports _ _ _ _ _) =
+buildEnv pkg outsideIfaces modName (Src.Module _ _ _ imports _ _ _ _ _) =
   let
-    home = ModuleName.Canonical Pkg.dummyName modName
+    home = ModuleName.Canonical pkg modName
     isOutsideImport (Src.Import (A.At _ n) _ _) =
       Map.member n outsideIfaces
     outsideImports = filter isOutsideImport imports
@@ -204,10 +205,17 @@ typeForShape resolvedAliases home key shape =
 -- Every type (name, arity/body) registered as belonging to one SCC
 -- module, keyed unqualified -- used both to inject a module's own types
 -- (unqualified) and a peer's types (qualified, under whatever prefix
--- imports it).
-sccTypesFor :: Registry -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias -> ModuleName.Raw -> Env.Exposed Env.Type
-sccTypesFor registry resolvedAliases modName =
-  let home = ModuleName.Canonical Pkg.dummyName modName in
+-- imports it). Tags every produced Env.Type's home with the real `pkg`
+-- (matching Canonicalize.Module's real `home = ModuleName.Canonical pkg
+-- (Src.getName modul)`) rather than Pkg.dummyName -- for a package
+-- project (not an application), pkg is a real published package name,
+-- and a harvested type body must embed the exact same
+-- ModuleName.Canonical a real compile would, or later unification sees
+-- a mismatch between (dummyName, A) and (realPkg, A) for what's
+-- supposed to be the same type.
+sccTypesFor :: Pkg.Name -> Registry -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias -> ModuleName.Raw -> Env.Exposed Env.Type
+sccTypesFor pkg registry resolvedAliases modName =
+  let home = ModuleName.Canonical pkg modName in
   Map.fromList
     [ (name, Env.Specific home (typeForShape resolvedAliases home (m, name) shape))
     | ((m, name), shape) <- Map.toList registry
@@ -217,22 +225,56 @@ sccTypesFor registry resolvedAliases modName =
 
 -- Inject a peer SCC member's types under its import prefix (its alias
 -- if it has one, else its module name), so a qualified reference like
--- `B.Stmt` resolves via the qualified-types table. A full replace
--- (Map.insert, not a merge) is correct here: this prefix's peer types
--- are always being (re)built wholesale from the current resolvedAliases
--- snapshot, not added to.
+-- `B.Stmt` resolves via the qualified-types table. Merges via
+-- Map.insertWith (Map.unionWith Env.mergeInfo), matching the exact
+-- convention Foreign.hs's addQualified already uses for building a
+-- qualified-types table from outside imports -- not a wholesale replace,
+-- since two different peer imports could in principle share a prefix
+-- (e.g. two peers both aliased `as X`) and should merge, not clobber.
 addPeerTypes
-  :: Registry
+  :: Pkg.Name
+  -> Registry
   -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias
   -> Src.Import
   -> Env.Qualified Env.Type
   -> Env.Qualified Env.Type
-addPeerTypes registry resolvedAliases (Src.Import (A.At _ peerName) maybeAlias _) qts =
+addPeerTypes pkg registry resolvedAliases (Src.Import (A.At _ peerName) maybeAlias _) qts =
   let
     prefix = maybe peerName id maybeAlias
-    peerTypes = sccTypesFor registry resolvedAliases peerName
+    peerTypes = sccTypesFor pkg registry resolvedAliases peerName
   in
-  Map.insert prefix peerTypes qts
+  Map.insertWith (Map.unionWith Env.mergeInfo) prefix peerTypes qts
+
+
+-- Names exposed unqualified by a peer import's own `exposing` clause,
+-- mirroring how Foreign.hs's addExposedValue (the Src.Upper / Public|
+-- Private case) handles a type-exposing list for an *outside* import.
+-- Peer imports never reach Foreign.createInitialEnv at all (see BASE
+-- ENVS above -- that's the only place an exposing list otherwise gets
+-- honored), so without this, `import B exposing (Stmt)` used to bring
+-- in only the qualified `B.Stmt` form; bare `Stmt` would fail to
+-- resolve even though it's at least as common an idiom as the qualified
+-- form. harvest never builds Env.Ctor entries at all (it only resolves
+-- types/signatures, not values' bodies), so there's no ctor-exposing
+-- counterpart needed here the way Foreign.hs has one.
+peerExposedTypes
+  :: Pkg.Name
+  -> Registry
+  -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias
+  -> Src.Import
+  -> Env.Exposed Env.Type
+peerExposedTypes pkg registry resolvedAliases (Src.Import (A.At _ peerName) _ exposing) =
+  let peerTypes = sccTypesFor pkg registry resolvedAliases peerName in
+  case exposing of
+    Src.Open ->
+      peerTypes
+
+    Src.Explicit exposedList ->
+      Map.fromList
+        [ (name, info)
+        | Src.Upper (A.At _ name) _ <- exposedList
+        , Just info <- [Map.lookup name peerTypes]
+        ]
 
 
 -- Extend one module's base (outside-only) env with the SCC's own +
@@ -240,21 +282,31 @@ addPeerTypes registry resolvedAliases (Src.Import (A.At _ peerName) maybeAlias _
 -- different points with different snapshots: partially-filled (mid-way
 -- through resolveAliasesInOrder) and complete (resolving unions in
 -- Phase B, and again for signature harvesting).
+--
+-- ts1's Map.union nesting gives ownTypes top priority, then whatever a
+-- peer import's own exposing list brought in unqualified, then
+-- whatever the base env already had (an outside import's own Open
+-- exposing, e.g. Basics) -- "own name always wins" mirrors
+-- Local.hs/addVars's own "use union to overwrite foreign stuff"
+-- convention elsewhere in this codebase.
 withSccTypes
-  :: Registry
+  :: Pkg.Name
+  -> Registry
   -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias
   -> Map.Map ModuleName.Raw Src.Module
   -> ModuleName.Raw
   -> Env.Env
   -> Env.Env
-withSccTypes registry resolvedAliases modules modName (Env.Env home vs ts cs bs qvs qts qcs) =
+withSccTypes pkg registry resolvedAliases modules modName (Env.Env home vs ts cs bs qvs qts qcs) =
   let
     Src.Module _ _ _ imports _ _ _ _ _ = modules ! modName
-    ownTypes = sccTypesFor registry resolvedAliases modName
-    ts1 = Map.union ownTypes ts
+    ownTypes = sccTypesFor pkg registry resolvedAliases modName
     peerImports =
       [ imp | imp@(Src.Import (A.At _ n) _ _) <- imports, n /= modName, Map.member n modules ]
-    qts1 = foldr (addPeerTypes registry resolvedAliases) qts peerImports
+    peerExposed =
+      foldr (Map.union . peerExposedTypes pkg registry resolvedAliases) Map.empty peerImports
+    ts1 = Map.union ownTypes (Map.union peerExposed ts)
+    qts1 = foldr (addPeerTypes pkg registry resolvedAliases) qts peerImports
   in
   Env.Env home vs ts1 cs bs qvs qts1 qcs
 
@@ -311,33 +363,35 @@ buildAliasByKey modules =
 
 
 resolveAliasesInOrder
-  :: Registry
+  :: Pkg.Name
+  -> Registry
   -> Map.Map ModuleName.Raw Env.Env
   -> Map.Map ModuleName.Raw Src.Module
   -> Either Failure (Map.Map (ModuleName.Raw, Name.Name) Can.Alias)
-resolveAliasesInOrder registry baseEnvs modules =
+resolveAliasesInOrder pkg registry baseEnvs modules =
   foldM resolveOne Map.empty (topoAliasOrder registry modules)
   where
     aliasByKey = buildAliasByKey modules
 
     resolveOne resolvedSoFar key@(modName, _) =
       do  let aliasNode = aliasByKey ! key
-          let env = withSccTypes registry resolvedSoFar modules modName (baseEnvs ! modName)
+          let env = withSccTypes pkg registry resolvedSoFar modules modName (baseEnvs ! modName)
           (_, alias) <- resolveDecl modName (fmap fst . Local.canonicalizeAlias env) aliasNode
           Right (Map.insert key alias resolvedSoFar)
 
 
 resolveUnions
-  :: Registry
+  :: Pkg.Name
+  -> Registry
   -> Map.Map (ModuleName.Raw, Name.Name) Can.Alias
   -> Map.Map ModuleName.Raw Env.Env
   -> Map.Map ModuleName.Raw Src.Module
   -> Either Failure (Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union))
-resolveUnions registry finalAliases baseEnvs modules =
+resolveUnions pkg registry finalAliases baseEnvs modules =
   Map.traverseWithKey resolveOneModuleUnions modules
   where
     resolveOneModuleUnions modName (Src.Module _ _ _ _ _ unions _ _ _) =
-      do  let env = withSccTypes registry finalAliases modules modName (baseEnvs ! modName)
+      do  let env = withSccTypes pkg registry finalAliases modules modName (baseEnvs ! modName)
           unionList <- traverse (resolveDecl modName (fmap fst . Local.canonicalizeUnion env)) unions
           Right (Map.fromList unionList)
 
@@ -362,21 +416,22 @@ combineTypeBodies unionsByModule finalAliases =
 -- final signature-harvesting envs) and the per-module (unions, aliases)
 -- pairs that feed I.fromHarvest.
 resolveTypeBodies
-  :: Registry
+  :: Pkg.Name
+  -> Registry
   -> Map.Map ModuleName.Raw Env.Env
   -> Map.Map ModuleName.Raw Src.Module
   -> Either Failure
        ( Map.Map (ModuleName.Raw, Name.Name) Can.Alias
        , Map.Map ModuleName.Raw (Map.Map Name.Name Can.Union, Map.Map Name.Name Can.Alias)
        )
-resolveTypeBodies registry baseEnvs modules =
+resolveTypeBodies pkg registry baseEnvs modules =
   case CModule.findCyclicKeys (aliasNodes registry modules) of
     Just (NE.List key keys) ->
       Left (AliasCycle key keys)
 
     Nothing ->
-      do  finalAliases <- resolveAliasesInOrder registry baseEnvs modules
-          unionsByModule <- resolveUnions registry finalAliases baseEnvs modules
+      do  finalAliases <- resolveAliasesInOrder pkg registry baseEnvs modules
+          unionsByModule <- resolveUnions pkg registry finalAliases baseEnvs modules
           Right (finalAliases, combineTypeBodies unionsByModule finalAliases)
 
 
@@ -481,19 +536,20 @@ harvest
 harvest pkg outsideIfaces modules =
   do  checkRestrictions modules
       let registry = registerTypes modules
-      baseEnvs <- Map.traverseWithKey (buildBaseEnvFor outsideIfaces) modules
-      (finalAliases, typeBodies) <- resolveTypeBodies registry baseEnvs modules
-      let finalEnvs = Map.mapWithKey (\modName env -> withSccTypes registry finalAliases modules modName env) baseEnvs
+      baseEnvs <- Map.traverseWithKey (buildBaseEnvFor pkg outsideIfaces) modules
+      (finalAliases, typeBodies) <- resolveTypeBodies pkg registry baseEnvs modules
+      let finalEnvs = Map.mapWithKey (\modName env -> withSccTypes pkg registry finalAliases modules modName env) baseEnvs
       Map.traverseWithKey (harvestOne pkg finalEnvs typeBodies) modules
 
 
 buildBaseEnvFor
-  :: Map.Map ModuleName.Raw I.Interface
+  :: Pkg.Name
+  -> Map.Map ModuleName.Raw I.Interface
   -> ModuleName.Raw
   -> Src.Module
   -> Either Failure Env.Env
-buildBaseEnvFor outsideIfaces modName modul =
-  resolveDecl modName (const (buildEnv outsideIfaces modName modul)) ()
+buildBaseEnvFor pkg outsideIfaces modName modul =
+  resolveDecl modName (const (buildEnv pkg outsideIfaces modName modul)) ()
 
 
 harvestOne
