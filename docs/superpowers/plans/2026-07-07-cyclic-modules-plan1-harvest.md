@@ -829,14 +829,25 @@ harvestSignature modName env acc (A.At _ (Src.Value (A.At _ name) _ _ maybeType)
         Right ann  -> Right (Map.insert name ann acc)
 
 
-resultToEither :: Result.Result i w e a -> Either e a
+-- Result.run's real signature (Reporting/Result.hs:32) is
+-- `Result () [w] e a -> ([w], Either (OneOrMore.OneOrMore e) a)` --
+-- confirmed by reading it directly, and matches how Compile.hs's own
+-- `canonicalize` consumes Canonicalize.Module.canonicalize's result
+-- (`Error.BadNames (OneOrMore.OneOrMore Canonicalize.Error)`). The
+-- Left case is a *nonempty bag* of errors, not a single one -- reduce
+-- to one representative error via OneOrMore.destruct (first wins),
+-- consistent with how findCyclicKeys/AliasCycle above already report
+-- only the first offending thing found rather than everything at once.
+resultToEither :: Result.Result () [w] e a -> Either e a
 resultToEither result =
   case snd (Result.run result) of
-    Right a  -> Right a
-    Left e   -> Left e
+    Right a -> Right a
+    Left oneOrMore -> Left (OneOrMore.destruct (\e _ -> e) oneOrMore)
 ```
 
-(`Result.run`'s exact signature — check `Reporting/Result.hs` for whether it needs an initial `i`/warnings accumulator argument, matching how `Canonicalize.Module.canonicalize`'s own callers invoke `R.run` today, e.g. `Compile.hs`'s `canonicalize` function: `snd $ R.run $ Canonicalize.canonicalize pkg ifaces modul`. Mirror that call shape exactly rather than the sketch above if it differs once this is actually compiled.)
+This needs one more import at the top of `compiler/src/Canonicalize/Harvest.hs` (from Step 1): `import qualified Data.OneOrMore as OneOrMore`.
+
+(Since `resultToEither`'s type now fixes `Result.Result`'s first two parameters to `()`/`[w]` to match `Result.run`, double-check every call site — `Type.toAnnotation`, `Local.canonicalizeUnion`, `Local.canonicalizeAlias`, `CModule.canonicalizeExports` — actually produces a `Result () [w] CError.Error a` shape and not some other `i`/`w` instantiation; if any of them come back typed as `Result i w CError.Error a` with `i`/`w` left polymorphic rather than concretely `()`/`[SomethingList]`, GHC will unify them against `resultToEither`'s now-concrete signature automatically as long as nothing else pins `i`/`w` to something incompatible first — flag it here if that's not the case once this actually compiles.)
 
 - [ ] **Step 7: Register the new module in `elm.cabal` and build**
 
