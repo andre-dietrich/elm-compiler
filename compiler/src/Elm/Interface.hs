@@ -4,6 +4,7 @@ module Elm.Interface
   , Alias(..)
   , Binop(..)
   , fromModule
+  , fromHarvest
   , toPublicUnion
   , toPublicAlias
   , DependencyInterface(..)
@@ -79,6 +80,32 @@ fromModule home (Can.Module _ exports _ _ unions aliases binops _) annotations =
     , _unions = restrictUnions exports unions
     , _aliases = restrictAliases exports aliases
     , _binops = restrict exports (Map.map (toOp annotations) binops)
+    }
+
+
+-- A stub Interface for a module that's part of a cyclic import SCC and
+-- hasn't finished its own compile yet (see the cyclic-modules design
+-- doc). Unlike fromModule, there is no finished Can.Module or
+-- fully-inferred annotations map to pull from -- only whatever the
+-- harvest pass (Canonicalize.Harvest) managed to resolve without
+-- needing any SCC peer's full compile to finish first: real, fully
+-- resolved unions/aliases, and declared (not inferred) signatures for
+-- exposed values that had an explicit annotation. v1 never harvests
+-- custom infix operators, so _binops is always empty here.
+fromHarvest
+  :: Pkg.Name
+  -> Can.Exports
+  -> Map.Map Name.Name Can.Union
+  -> Map.Map Name.Name Can.Alias
+  -> Map.Map Name.Name Can.Annotation
+  -> Interface
+fromHarvest home exports unions aliases annotations =
+  Interface
+    { _home = home
+    , _values = restrict exports annotations
+    , _unions = restrictUnions exports unions
+    , _aliases = restrictAliases exports aliases
+    , _binops = Map.empty
     }
 
 
