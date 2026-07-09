@@ -124,10 +124,24 @@ fork work =
       return mvar
 
 
-{-# INLINE forkWithKey #-}
-forkWithKey :: (k -> a -> IO b) -> Map.Map k a -> IO (Map.Map k (MVar b))
-forkWithKey func dict =
-  Map.traverseWithKey (\k v -> fork (func k v)) dict
+-- Allocate one empty result MVar per module up front (so any caller
+-- already holding the returned ResultDict can start reading/blocking on
+-- individual entries immediately, exactly like forkWithKey's per-module
+-- fork used to allow), then fork one filler thread per module. This is
+-- pulled apart from a single forkWithKey call so a cyclic SCC (Task 4)
+-- can later fork exactly *one* filler thread that fills every member's
+-- own pre-allocated MVar itself, instead of deadlocking N independent
+-- per-module fillers that would each block reading each other's not-yet-
+-- filled MVar.
+checkModules :: Env -> Dependencies -> MVar ResultDict -> Map.Map ModuleName.Raw Status -> IO ResultDict
+checkModules env foreigns rmvar statuses =
+  do  resultMVars <- traverse (const newEmptyMVar) statuses
+      putMVar rmvar resultMVars
+      mapM_ (forkChecker resultMVars) (Map.toList statuses)
+      return resultMVars
+  where
+    forkChecker resultMVars (name, status) =
+      forkIO $ putMVar (resultMVars ! name) =<< checkModule env foreigns rmvar name status
 
 
 
@@ -156,8 +170,7 @@ fromExposed style root details docsGoal exposed@(NE.List e es) =
 
         Right foreigns ->
           do  rmvar <- newEmptyMVar
-              resultMVars <- forkWithKey (checkModule env foreigns rmvar) statuses
-              putMVar rmvar resultMVars
+              resultMVars <- checkModules env foreigns rmvar statuses
               results <- traverse readMVar resultMVars
               writeDetails root details results
               finalizeExposed root docsGoal exposed results
@@ -211,8 +224,7 @@ fromPaths style root details paths =
                 Right foreigns ->
                   do  -- compile
                       rmvar <- newEmptyMVar
-                      resultsMVars <- forkWithKey (checkModule env foreigns rmvar) statuses
-                      putMVar rmvar resultsMVars
+                      resultsMVars <- checkModules env foreigns rmvar statuses
                       rrootMVars <- traverse (fork . checkRoot env resultsMVars) sroots
                       results <- traverse readMVar resultsMVars
                       writeDetails root details results
@@ -913,8 +925,7 @@ fromRepl root details source =
 
                 Right foreigns ->
                   do  rmvar <- newEmptyMVar
-                      resultMVars <- forkWithKey (checkModule env foreigns rmvar) statuses
-                      putMVar rmvar resultMVars
+                      resultMVars <- checkModules env foreigns rmvar statuses
                       results <- traverse readMVar resultMVars
                       writeDetails root details results
                       depsStatus <- checkDeps root resultMVars deps 0
