@@ -19,6 +19,7 @@ module Reporting.Exit
   , RegistryProblem(..)
   , BuildProblem(..)
   , BuildProjectProblem(..)
+  , CycleRestriction(..)
   , DocsProblem(..)
   , Generate(..)
   --
@@ -1771,6 +1772,14 @@ data BuildProjectProblem
   | BP_MissingExposed (NE.List (ModuleName.Raw, Import.Problem))
   | BP_CycleValue (NE.List (ModuleName.Raw, N.Name))
   | BP_CycleMissingAnnotation ModuleName.Raw N.Name
+  | BP_CycleAlias (NE.List (ModuleName.Raw, N.Name))
+  | BP_CycleRestricted ModuleName.Raw CycleRestriction
+
+
+data CycleRestriction
+  = CR_Port
+  | CR_EffectManager
+  | CR_CustomOperator
 
 
 toBuildProblemReport :: BuildProblem -> Help.Report
@@ -1899,6 +1908,24 @@ toProjectProblemReport projectProblem =
             \ to fix this."
         ]
 
+    BP_CycleAlias (NE.List (m0, n0) rest) ->
+      Help.report "CYCLIC TYPE ALIAS ACROSS MODULES" Nothing
+        "These modules depend on each other through a chain of type aliases, which never resolves:"
+        [ D.indent 4 $ D.vcat $
+            (D.dullyellow (D.fromName m0) <> "." <> D.fromName n0)
+            : map (\(m, n) -> D.dullyellow (D.fromName m) <> "." <> D.fromName n) rest
+        , D.reflow $
+            "A type alias defined in terms of itself through other modules expands forever.\
+            \ Change one of these into a `type` instead, or break the cycle another way."
+        ]
+
+    BP_CycleRestricted home restriction ->
+      Help.report "UNSUPPORTED IN CYCLIC IMPORT" Nothing
+        "This module is part of a cycle of imports, but it uses a feature that cyclic modules cannot use yet:"
+        [ D.indent 4 $ D.dullyellow (D.fromName home)
+        , D.reflow $ cycleRestrictionMessage restriction
+        ]
+
     BP_MissingExposed (NE.List (name, problem) _) ->
       case problem of
         Import.NotFound ->
@@ -1940,6 +1967,19 @@ toProjectProblemReport projectProblem =
                 "It is not possible to \"re-export\" modules from other packages. You can only\
                 \ expose modules that you define in your own code."
             ]
+
+
+cycleRestrictionMessage :: CycleRestriction -> String
+cycleRestrictionMessage restriction =
+  case restriction of
+    CR_Port ->
+      "Modules that are part of an import cycle cannot declare ports."
+
+    CR_EffectManager ->
+      "Modules that are part of an import cycle cannot be effect managers."
+
+    CR_CustomOperator ->
+      "Modules that are part of an import cycle cannot declare custom infix operators."
 
 
 toModuleNameConventionTable :: FilePath -> [String] -> D.Doc
