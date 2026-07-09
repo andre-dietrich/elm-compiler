@@ -88,38 +88,46 @@ toNodes
   -> Can.Module
   -> [((ModuleName.Raw, Name.Name), (ModuleName.Raw, Name.Name), [(ModuleName.Raw, Name.Name)])]
 toNodes arglessNames modName (Can.Module _ _ _ decls _ _ _ _) =
-  [ ((modName, name), (modName, name), Set.toList (Set.fromList (collectDirectRefs arglessNames False body)))
+  [ ((modName, name), (modName, name), Set.toList (Set.fromList (collectDirectRefs arglessNames modName False body)))
   | def <- flattenDecls decls
   , (name, 0, body) <- [defInfo def]
   ]
 
 
--- Walk a Can.Expr collecting every direct VarForeign reference that
--- lands on a fellow SCC member's argless def. "Direct" means: not
--- underneath a Lambda, and not underneath the body of a locally
--- let-bound function (nonzero args) -- see this module's header comment
--- for exactly which two Canonicalize.Expression call sites this mirrors.
--- A single sticky "underLambda" flag, set (and never unset) on entering
--- either of those two, correctly reproduces the same direct/delayed
--- distinction Elm's own intra-module cycle check already relies on.
-collectDirectRefs :: Set.Set (ModuleName.Raw, Name.Name) -> Bool -> Can.Expr -> [(ModuleName.Raw, Name.Name)]
-collectDirectRefs sccArgless underLambda (A.At _ expr) =
-  let recur = collectDirectRefs sccArgless underLambda in
+-- Walk a Can.Expr collecting every direct reference (VarTopLevel *or*
+-- VarForeign) that lands on a fellow SCC member's argless def.
+-- "Direct" means: not underneath a Lambda, and not underneath the body
+-- of a locally let-bound function (nonzero args) -- see this module's
+-- header comment for exactly which two Canonicalize.Expression call
+-- sites this mirrors. A single sticky "underLambda" flag, set (and
+-- never unset) on entering either of those two, correctly reproduces
+-- the same direct/delayed distinction Elm's own intra-module cycle
+-- check already relies on.
+--
+-- VarTopLevel is a same-module reference, so it needs the *walked*
+-- module's own name (modName, threaded down from toNodes) to be tagged
+-- as (modName, name) and checked against sccArgless -- otherwise a
+-- same-module reference used as a relay hop inside a longer
+-- cross-module cycle (A.x = A.y, A.y = B.z, B.z = A.x) is invisible to
+-- this walker, even though Canonicalize.Module's own intra-module
+-- check never sees the foreign edges needed to catch that chain
+-- either. Pass B's own per-module cycle check only rejects a cycle
+-- closed *entirely* within one module; it is blind to this case.
+collectDirectRefs :: Set.Set (ModuleName.Raw, Name.Name) -> ModuleName.Raw -> Bool -> Can.Expr -> [(ModuleName.Raw, Name.Name)]
+collectDirectRefs sccArgless modName underLambda (A.At _ expr) =
+  let recur = collectDirectRefs sccArgless modName underLambda in
   case expr of
     Can.VarLocal _ ->
       []
 
-    Can.VarTopLevel _ _ ->
-      -- Same-module reference. Irrelevant here -- if Pass B succeeded
-      -- for this member at all, its own intra-module cycle check
-      -- (Canonicalize.Module.detectBadCycles, run unconditionally
-      -- inside every Compile.compile call) already rejected any
-      -- same-module argless cycle involving this def.
-      []
-
-    Can.VarForeign (ModuleName.Canonical _ modName) name _annotation ->
+    Can.VarTopLevel _ name ->
       if not underLambda && Set.member (modName, name) sccArgless
       then [(modName, name)]
+      else []
+
+    Can.VarForeign (ModuleName.Canonical _ foreignMod) name _annotation ->
+      if not underLambda && Set.member (foreignMod, name) sccArgless
+      then [(foreignMod, name)]
       else []
 
     Can.VarKernel _ _ ->
@@ -149,7 +157,7 @@ collectDirectRefs sccArgless underLambda (A.At _ expr) =
       recur left ++ recur right
 
     Can.Lambda _ body ->
-      collectDirectRefs sccArgless True body
+      collectDirectRefs sccArgless modName True body
 
     Can.Call func args ->
       recur func ++ concatMap recur args
@@ -158,10 +166,10 @@ collectDirectRefs sccArgless underLambda (A.At _ expr) =
       concatMap (\(cond, branch) -> recur cond ++ recur branch) branches ++ recur final
 
     Can.Let def body ->
-      collectDirectRefsDef sccArgless underLambda def ++ recur body
+      collectDirectRefsDef sccArgless modName underLambda def ++ recur body
 
     Can.LetRec defs body ->
-      concatMap (collectDirectRefsDef sccArgless underLambda) defs ++ recur body
+      concatMap (collectDirectRefsDef sccArgless modName underLambda) defs ++ recur body
 
     Can.LetDestruct _ e body ->
       recur e ++ recur body
@@ -191,7 +199,7 @@ collectDirectRefs sccArgless underLambda (A.At _ expr) =
       []
 
 
-collectDirectRefsDef :: Set.Set (ModuleName.Raw, Name.Name) -> Bool -> Can.Def -> [(ModuleName.Raw, Name.Name)]
-collectDirectRefsDef sccArgless underLambda def =
+collectDirectRefsDef :: Set.Set (ModuleName.Raw, Name.Name) -> ModuleName.Raw -> Bool -> Can.Def -> [(ModuleName.Raw, Name.Name)]
+collectDirectRefsDef sccArgless modName underLambda def =
   let (_, arity, body) = defInfo def in
-  collectDirectRefs sccArgless (underLambda || arity > 0) body
+  collectDirectRefs sccArgless modName (underLambda || arity > 0) body
