@@ -147,6 +147,7 @@ executable elm
         Canonicalize.Environment.Foreign
         Canonicalize.Environment.Local
         Canonicalize.Expression
+        Canonicalize.CycleCheck
         Canonicalize.Harvest
         Canonicalize.Module
         Canonicalize.Pattern
