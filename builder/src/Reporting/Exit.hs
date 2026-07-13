@@ -1768,7 +1768,6 @@ data BuildProjectProblem
   | BP_RootNameDuplicate ModuleName.Raw FilePath FilePath
   | BP_RootNameInvalid FilePath FilePath [String]
   | BP_CannotLoadDependencies
-  | BP_Cycle ModuleName.Raw [ModuleName.Raw]
   | BP_MissingExposed (NE.List (ModuleName.Raw, Import.Problem))
   | BP_CycleValue (NE.List (ModuleName.Raw, N.Name))
   | BP_CycleMissingAnnotation ModuleName.Raw N.Name
@@ -1874,15 +1873,6 @@ toProjectProblemReport projectProblem =
 
     BP_CannotLoadDependencies ->
       corruptCacheReport
-
-    BP_Cycle name names ->
-      Help.report "IMPORT CYCLE" Nothing
-        "Your module imports form a cycle:"
-        [ D.cycle 4 name names
-        , D.reflow $
-            "Learn more about why this is disallowed and how to break cycles here:"
-            ++ D.makeLink "import-cycles"
-        ]
 
     BP_CycleValue (NE.List (m0, n0) rest) ->
       Help.report "CYCLIC DEFINITION ACROSS MODULES" Nothing

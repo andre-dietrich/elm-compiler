@@ -1,5 +1,5 @@
 {-# OPTIONS_GHC -Wno-unused-do-bind #-}
-{-# LANGUAGE BangPatterns, GADTs, OverloadedStrings #-}
+{-# LANGUAGE BangPatterns, GADTs, OverloadedStrings, DoAndIfThenElse #-}
 module Build
   ( fromExposed
   , fromPaths
@@ -37,6 +37,8 @@ import System.FilePath ((</>), (<.>))
 import qualified AST.Canonical as Can
 import qualified AST.Source as Src
 import qualified AST.Optimized as Opt
+import qualified Canonicalize.CycleCheck as CycleCheck
+import qualified Canonicalize.Harvest as Harvest
 import qualified Compile
 import qualified Elm.Details as Details
 import qualified Elm.Docs as Docs
@@ -133,15 +135,27 @@ fork work =
 -- own pre-allocated MVar itself, instead of deadlocking N independent
 -- per-module fillers that would each block reading each other's not-yet-
 -- filled MVar.
-checkModules :: Env -> Dependencies -> MVar ResultDict -> Map.Map ModuleName.Raw Status -> IO ResultDict
-checkModules env foreigns rmvar statuses =
+checkModules :: Env -> Dependencies -> MVar ResultDict -> MVar (Maybe Exit.BuildProjectProblem) -> Map.Map ModuleName.Raw Status -> IO ResultDict
+checkModules env foreigns rmvar cycleMVar statuses =
   do  resultMVars <- traverse (const newEmptyMVar) statuses
       putMVar rmvar resultMVars
-      mapM_ (forkChecker resultMVars) (Map.toList statuses)
+      let sccs = findCyclicSccs statuses
+      let sccNames = Set.unions (map (Set.fromList . NE.toList) sccs)
+      let normalStatuses = Map.filterWithKey (\name _ -> Set.notMember name sccNames) statuses
+      mapM_ (forkChecker resultMVars) (Map.toList normalStatuses)
+      mapM_ (forkCycle resultMVars) sccs
       return resultMVars
   where
     forkChecker resultMVars (name, status) =
       forkIO $ putMVar (resultMVars ! name) =<< checkModule env foreigns rmvar name status
+
+    forkCycle resultMVars scc =
+      forkIO $
+        case scc of
+          NE.List name0 names ->
+            do  let members = NE.List (name0, statuses ! name0) (map (\name -> (name, statuses ! name)) names)
+                sccResults <- checkCycle env rmvar cycleMVar members
+                mapM_ (\(name, result) -> putMVar (resultMVars ! name) result) (Map.toList sccResults)
 
 
 
@@ -163,17 +177,24 @@ fromExposed style root details docsGoal exposed@(NE.List e es) =
       statuses <- traverse readMVar =<< readMVar mvar
 
       -- compile
-      midpoint <- checkMidpoint dmvar statuses
+      midpoint <- checkMidpoint dmvar
       case midpoint of
         Left problem ->
           return (Left (Exit.BuildProjectProblem problem))
 
         Right foreigns ->
           do  rmvar <- newEmptyMVar
-              resultMVars <- checkModules env foreigns rmvar statuses
+              cycleMVar <- newMVar Nothing
+              resultMVars <- checkModules env foreigns rmvar cycleMVar statuses
               results <- traverse readMVar resultMVars
-              writeDetails root details results
-              finalizeExposed root docsGoal exposed results
+              cycleProblem <- readMVar cycleMVar
+              case cycleProblem of
+                Just problem ->
+                  return (Left (Exit.BuildProjectProblem problem))
+
+                Nothing ->
+                  do  writeDetails root details results
+                      finalizeExposed root docsGoal exposed results
 
 
 
@@ -224,11 +245,18 @@ fromPaths style root details paths =
                 Right foreigns ->
                   do  -- compile
                       rmvar <- newEmptyMVar
-                      resultsMVars <- checkModules env foreigns rmvar statuses
+                      cycleMVar <- newMVar Nothing
+                      resultsMVars <- checkModules env foreigns rmvar cycleMVar statuses
                       rrootMVars <- traverse (fork . checkRoot env resultsMVars) sroots
                       results <- traverse readMVar resultsMVars
-                      writeDetails root details results
-                      toArtifacts env foreigns results <$> traverse readMVar rrootMVars
+                      cycleProblem <- readMVar cycleMVar
+                      case cycleProblem of
+                        Just problem ->
+                          return (Left (Exit.BuildProjectProblem problem))
+
+                        Nothing ->
+                          do  writeDetails root details results
+                              toArtifacts env foreigns results <$> traverse readMVar rrootMVars
 
 
 
@@ -585,64 +613,56 @@ loadInterface root (name, ciMvar) =
 -- CHECK PROJECT
 
 
-checkMidpoint :: MVar (Maybe Dependencies) -> Map.Map ModuleName.Raw Status -> IO (Either Exit.BuildProjectProblem Dependencies)
-checkMidpoint dmvar statuses =
-  case checkForCycles statuses of
+checkMidpoint :: MVar (Maybe Dependencies) -> IO (Either Exit.BuildProjectProblem Dependencies)
+checkMidpoint dmvar =
+  do  maybeForeigns <- readMVar dmvar
+      case maybeForeigns of
+        Nothing -> return (Left Exit.BP_CannotLoadDependencies)
+        Just fs -> return (Right fs)
+
+
+checkMidpointAndRoots :: MVar (Maybe Dependencies) -> Map.Map ModuleName.Raw Status -> NE.List RootStatus -> IO (Either Exit.BuildProjectProblem Dependencies)
+checkMidpointAndRoots dmvar statuses sroots =
+  case checkUniqueRoots statuses sroots of
     Nothing ->
       do  maybeForeigns <- readMVar dmvar
           case maybeForeigns of
             Nothing -> return (Left Exit.BP_CannotLoadDependencies)
             Just fs -> return (Right fs)
 
-    Just (NE.List name names) ->
+    Just problem ->
       do  _ <- readMVar dmvar
-          return (Left (Exit.BP_Cycle name names))
-
-
-checkMidpointAndRoots :: MVar (Maybe Dependencies) -> Map.Map ModuleName.Raw Status -> NE.List RootStatus -> IO (Either Exit.BuildProjectProblem Dependencies)
-checkMidpointAndRoots dmvar statuses sroots =
-  case checkForCycles statuses of
-    Nothing ->
-      case checkUniqueRoots statuses sroots of
-        Nothing ->
-          do  maybeForeigns <- readMVar dmvar
-              case maybeForeigns of
-                Nothing -> return (Left Exit.BP_CannotLoadDependencies)
-                Just fs -> return (Right fs)
-
-        Just problem ->
-          do  _ <- readMVar dmvar
-              return (Left problem)
-
-    Just (NE.List name names) ->
-      do  _ <- readMVar dmvar
-          return (Left (Exit.BP_Cycle name names))
+          return (Left problem)
 
 
 
--- CHECK FOR CYCLES
+-- FIND CYCLIC SCCS
+--
+-- Every cyclic SCC this finds is entirely local project modules: a
+-- foreign/package name always gets status SForeign, and addToGraph
+-- below (unchanged) gives SForeign zero outgoing edges, so it can never
+-- join a CyclicSCC (same reasoning Data.Graph.stronglyConnComp already
+-- gives any zero-out-degree node). A detected cycle is no longer
+-- automatically fatal (see checkCycle) -- this just enumerates every
+-- one so the compile phase (checkModules) can route each to Pass A/B
+-- instead of the ordinary per-module checkModule path.
 
 
-checkForCycles :: Map.Map ModuleName.Raw Status -> Maybe (NE.List ModuleName.Raw)
-checkForCycles modules =
+findCyclicSccs :: Map.Map ModuleName.Raw Status -> [NE.List ModuleName.Raw]
+findCyclicSccs modules =
   let
     !graph = Map.foldrWithKey addToGraph [] modules
     !sccs = Graph.stronglyConnComp graph
   in
-  checkForCyclesHelp sccs
+  Maybe.mapMaybe toCyclicNE sccs
 
 
-checkForCyclesHelp :: [Graph.SCC ModuleName.Raw] -> Maybe (NE.List ModuleName.Raw)
-checkForCyclesHelp sccs =
-  case sccs of
-    [] ->
-      Nothing
-
-    scc:otherSccs ->
-      case scc of
-        Graph.AcyclicSCC _     -> checkForCyclesHelp otherSccs
-        Graph.CyclicSCC []     -> checkForCyclesHelp otherSccs
-        Graph.CyclicSCC (m:ms) -> Just (NE.List m ms)
+toCyclicNE :: Graph.SCC ModuleName.Raw -> Maybe (NE.List ModuleName.Raw)
+toCyclicNE scc =
+  case scc of
+    Graph.AcyclicSCC _     -> Nothing
+    Graph.CyclicSCC []     -> Nothing
+    Graph.CyclicSCC (m:ms) -> Just (NE.List m ms)
 
 
 type Node =
@@ -757,6 +777,266 @@ projectTypeToPkg projectType =
   case projectType of
     Parse.Package pkg -> pkg
     Parse.Application -> Pkg.dummyName
+
+
+
+-- CHECK CYCLE
+--
+-- Pass A (Canonicalize.Harvest) + Pass B (a real per-member
+-- Compile.compile against Harvest's stub interfaces) + a post-check
+-- (Canonicalize.CycleCheck) for one cyclic SCC, run from a single
+-- forked thread (see checkModules) that fills every member's own
+-- pre-allocated result MVar itself. v1 simplification: SCC members are
+-- never treated as SCached for this purpose -- both SCached and
+-- SChanged members are re-parsed from source and re-run through
+-- Harvest+Pass B on every build that touches this SCC (see this plan's
+-- Global Constraints for why this doesn't cascade into the SCC's
+-- downstream dependents also always rebuilding: compileForCycle below
+-- reuses the same interface-diff logic `compile` already uses, so an
+-- unchanged interface still reports RSame).
+
+
+data MemberInput
+  = MIReady Details.Local B.ByteString Src.Module (Map.Map ModuleName.Raw I.Interface)
+  | MIBlocked
+  | MIProblem Error.Module
+
+
+toMemberInput :: FilePath -> Parse.ProjectType -> Map.Map ModuleName.Raw (MVar Result) -> Set.Set ModuleName.Raw -> (ModuleName.Raw, Status) -> IO (ModuleName.Raw, MemberInput)
+toMemberInput root projectType resultsDict sccNames (name, status) =
+  case status of
+    SChanged local source modul _docsNeed ->
+      do  mi <- resolveMember root resultsDict sccNames local source modul
+          return (name, mi)
+
+    SCached local@(Details.Local path time _ _ _ _) ->
+      do  source <- File.readUtf8 path
+          parseResult <- Parse.fromByteString projectType source
+          case parseResult of
+            Left err ->
+              return (name, MIProblem (Error.Module name path time source (Error.BadSyntax err)))
+
+            Right modul ->
+              do  mi <- resolveMember root resultsDict sccNames local source modul
+                  return (name, mi)
+
+    _ ->
+      error $
+        "checkCycle: module " ++ Name.toChars name ++
+        " in a cyclic SCC has an impossible Status -- SBadImport/SBadSyntax/SForeign/SKernel" ++
+        " never have outgoing edges in addToGraph, so they cannot be part of a CyclicSCC."
+
+
+-- Resolve one member's *outside-the-SCC* dependencies to real
+-- Interfaces, reusing checkDeps/loadInterfaces exactly as checkModule's
+-- own SChanged branch already does -- deliberately called per-member
+-- (not once for the SCC's pooled deps) so a DepsNotFound's existing
+-- toImportErrors call, which needs *this* member's own `imports` list,
+-- stays correct without any new cross-attribution logic.
+resolveMember :: FilePath -> Map.Map ModuleName.Raw (MVar Result) -> Set.Set ModuleName.Raw -> Details.Local -> B.ByteString -> Src.Module -> IO MemberInput
+resolveMember root resultsDict sccNames local@(Details.Local _ _ deps _ _ lastCompile) source modul@(Src.Module _ _ _ imports _ _ _ _ _) =
+  do  let outsideDeps = filter (`Set.notMember` sccNames) deps
+      depsStatus <- checkDeps root resultsDict outsideDeps lastCompile
+      case depsStatus of
+        DepsChange ifaces ->
+          return (MIReady local source modul ifaces)
+
+        DepsSame same cached ->
+          do  maybeLoaded <- loadInterfaces root same cached
+              case maybeLoaded of
+                Nothing     -> return MIBlocked
+                Just ifaces -> return (MIReady local source modul ifaces)
+
+        DepsBlock ->
+          return MIBlocked
+
+        DepsNotFound problems ->
+          do  let (Details.Local path time _ _ _ _) = local
+              return $ MIProblem $ Error.Module (Src.getName modul) path time source $
+                Error.BadImports (toImportErrors' resultsDict imports problems)
+  where
+    toImportErrors' rd imps probs =
+      let
+        knownModules =
+          Map.keysSet rd
+
+        unimportedModules =
+          Set.difference knownModules (Set.fromList (map Src.getImportName imps))
+
+        regionDict =
+          Map.fromList (map (\(Src.Import (A.At region n) _ _) -> (n, region)) imps)
+
+        toError (n, problem) =
+          Import.Error (regionDict ! n) n unimportedModules problem
+      in
+      fmap toError probs
+
+
+-- Pass B for one SCC member: a real Compile.compile against the
+-- member's combined (outside + harvested-peer-stub) interfaces. This
+-- deliberately duplicates roughly the second half of `compile` above
+-- (the RNew-vs-RSame-via-.elmi-diff / .elmo-write / Reporting.report
+-- tail) rather than reusing `compile` directly, because Pass B also
+-- needs the real Can.Module back for CycleCheck's post-check, and
+-- `compile`'s Result type has no field for it -- threading one through
+-- would touch every one of Result's several already-exhaustive
+-- pattern-match sites elsewhere in this file for a value only this one
+-- caller needs. DocsNeed is always False here: v1 does not support
+-- generating docs for a module that's part of a cyclic SCC (see Global
+-- Constraints).
+compileForCycle :: Reporting.BKey -> FilePath -> Details.BuildID -> Pkg.Name -> Details.Local -> B.ByteString -> Map.Map ModuleName.Raw I.Interface -> Src.Module -> IO (Result, Maybe Can.Module)
+compileForCycle key root buildID pkg (Details.Local path time deps main lastChange _) source ifaces modul =
+  case Compile.compile pkg ifaces modul of
+    Right (Compile.Artifacts canonical annotations objects) ->
+      do  let name = Src.getName modul
+          let iface = I.fromModule pkg canonical annotations
+          let elmi = Stuff.elmi root name
+          File.writeBinary (Stuff.elmo root name) objects
+          maybeOldi <- File.readBinary elmi
+          case maybeOldi of
+            Just oldi | oldi == iface ->
+              do  Reporting.report key Reporting.BDone
+                  let local = Details.Local path time deps main lastChange buildID
+                  return (RSame local iface objects Nothing, Just canonical)
+
+            _ ->
+              do  File.writeBinary elmi iface
+                  Reporting.report key Reporting.BDone
+                  let local = Details.Local path time deps main buildID buildID
+                  return (RNew local iface objects Nothing, Just canonical)
+
+    Left err ->
+      return (RProblem (Error.Module (Src.getName modul) path time source err), Nothing)
+
+
+checkCycle :: Env -> MVar ResultDict -> MVar (Maybe Exit.BuildProjectProblem) -> NE.List (ModuleName.Raw, Status) -> IO (Map.Map ModuleName.Raw Result)
+checkCycle (Env key root projectType _ buildID _ _) rmvar cycleMVar members0 =
+  do  let members = NE.toList members0
+      let sccNames = Set.fromList (map fst members)
+      resultsDict <- readMVar rmvar
+      inputs <- traverse (toMemberInput root projectType resultsDict sccNames) members
+
+      let problems = [ (name, err) | (name, MIProblem err) <- inputs ]
+      let problemNames = map fst problems
+
+      if not (null problems) || any (\(_, mi) -> isMemberBlocked mi) inputs then
+        return $ Map.fromList $
+          [ (name, RProblem err) | (name, err) <- problems ] ++
+          [ (name, RBlocked) | (name, _) <- inputs, name `notElem` problemNames ]
+
+      else
+        do  let ready = [ (name, local, source, modul, ifaces) | (name, MIReady local source modul ifaces) <- inputs ]
+            let pkg = projectTypeToPkg projectType
+            let outsideIfaces = Map.unions [ ifaces | (_, _, _, _, ifaces) <- ready ]
+            let sccModules = Map.fromList [ (name, modul) | (name, _, _, modul, _) <- ready ]
+
+            case Harvest.harvest pkg outsideIfaces sccModules of
+              Left failure ->
+                abortHarvest ready cycleMVar failure
+
+              Right stubIfaces ->
+                do  let memberIfaces = Map.union outsideIfaces stubIfaces
+                    passBOutputs <- traverse
+                      (\(_, local, source, modul, _) -> compileForCycle key root buildID pkg local source memberIfaces modul)
+                      ready
+                    finishPassB cycleMVar ready passBOutputs
+
+
+isMemberBlocked :: MemberInput -> Bool
+isMemberBlocked mi =
+  case mi of
+    MIBlocked -> True
+    _         -> False
+
+
+-- A Harvest.Failure naming one specific module's own genuine
+-- Canonicalize.Error (a malformed signature, unbound type variable,
+-- etc.) is surfaced as that module's own RProblem, same as any other
+-- per-module compile error -- every other member is RBlocked. The other
+-- three Failure cases (MissingAnnotation, AliasCycle, UnsupportedInCycle)
+-- are project-level, not renderable against one module's own source, so
+-- they go into cycleMVar instead (checked by fromExposed/fromPaths/
+-- fromRepl right after the whole compile phase finishes) and every
+-- member (including the one named in the failure) is RBlocked.
+abortHarvest
+  :: [(ModuleName.Raw, Details.Local, B.ByteString, Src.Module, Map.Map ModuleName.Raw I.Interface)]
+  -> MVar (Maybe Exit.BuildProjectProblem)
+  -> Harvest.Failure
+  -> IO (Map.Map ModuleName.Raw Result)
+abortHarvest ready cycleMVar failure =
+  case failure of
+    Harvest.CanonicalizeError modName err ->
+      case filter (\(n,_,_,_,_) -> n == modName) ready of
+        (name, Details.Local path time _ _ _ _, source, _, _) : _ ->
+          return $ Map.fromList $
+            (name, RProblem (Error.Module name path time source (Error.BadNames (OneOrMore.one err))))
+            : [ (n, RBlocked) | (n,_,_,_,_) <- ready, n /= name ]
+
+        [] ->
+          error $
+            "checkCycle: Harvest.CanonicalizeError named module " ++ Name.toChars modName ++
+            " which is not a member of this SCC's own ready list -- Harvest.harvest is only" ++
+            " ever called with this SCC's own sccModules, so every modName it can name must" ++
+            " be one of ready's own names."
+
+    Harvest.MissingAnnotation modName valueName ->
+      do  recordCycleProblem cycleMVar (Exit.BP_CycleMissingAnnotation modName valueName)
+          return $ Map.fromList [ (n, RBlocked) | (n,_,_,_,_) <- ready ]
+
+    Harvest.AliasCycle key0 keys ->
+      do  recordCycleProblem cycleMVar (Exit.BP_CycleAlias (NE.List key0 keys))
+          return $ Map.fromList [ (n, RBlocked) | (n,_,_,_,_) <- ready ]
+
+    Harvest.UnsupportedInCycle modName restriction ->
+      do  recordCycleProblem cycleMVar (Exit.BP_CycleRestricted modName (toExitRestriction restriction))
+          return $ Map.fromList [ (n, RBlocked) | (n,_,_,_,_) <- ready ]
+
+
+toExitRestriction :: Harvest.Restriction -> Exit.CycleRestriction
+toExitRestriction restriction =
+  case restriction of
+    Harvest.RestrictedPort           -> Exit.CR_Port
+    Harvest.RestrictedEffectManager  -> Exit.CR_EffectManager
+    Harvest.RestrictedCustomOperator -> Exit.CR_CustomOperator
+
+
+recordCycleProblem :: MVar (Maybe Exit.BuildProjectProblem) -> Exit.BuildProjectProblem -> IO ()
+recordCycleProblem cycleMVar problem =
+  modifyMVar_ cycleMVar $ \existing ->
+    return $ case existing of
+      Nothing -> Just problem
+      Just _  -> existing
+
+
+-- Pass B failures are independent per member (each Compile.compile call
+-- only consumes Harvest's already-finished stub interfaces, never a
+-- peer's own Pass-B result), so one member's genuine type error does not
+-- block an otherwise-successful peer's real result -- exactly like two
+-- unrelated ordinary modules failing independently in the same build
+-- today. The post-check only makes sense, and only runs, once every
+-- member succeeded.
+finishPassB
+  :: MVar (Maybe Exit.BuildProjectProblem)
+  -> [(ModuleName.Raw, Details.Local, B.ByteString, Src.Module, Map.Map ModuleName.Raw I.Interface)]
+  -> [(Result, Maybe Can.Module)]
+  -> IO (Map.Map ModuleName.Raw Result)
+finishPassB cycleMVar ready passBOutputs =
+  let
+    names = [ name | (name, _, _, _, _) <- ready ]
+    resultsOnly = map fst passBOutputs
+    canonicals = [ (name, c) | (name, (_, Just c)) <- zip names passBOutputs ]
+  in
+  if length canonicals /= length ready then
+    return (Map.fromList (zip names resultsOnly))
+
+  else
+    case CycleCheck.findCrossModuleValueCycle (Map.fromList canonicals) of
+      Just cyclicKeys ->
+        do  recordCycleProblem cycleMVar (Exit.BP_CycleValue cyclicKeys)
+            return (Map.fromList [ (name, RBlocked) | name <- names ])
+
+      Nothing ->
+        return (Map.fromList (zip names resultsOnly))
 
 
 
@@ -917,7 +1197,7 @@ fromRepl root details source =
               crawlDeps env mvar deps ()
 
               statuses <- traverse readMVar =<< readMVar mvar
-              midpoint <- checkMidpoint dmvar statuses
+              midpoint <- checkMidpoint dmvar
 
               case midpoint of
                 Left problem ->
@@ -925,11 +1205,18 @@ fromRepl root details source =
 
                 Right foreigns ->
                   do  rmvar <- newEmptyMVar
-                      resultMVars <- checkModules env foreigns rmvar statuses
+                      cycleMVar <- newMVar Nothing
+                      resultMVars <- checkModules env foreigns rmvar cycleMVar statuses
                       results <- traverse readMVar resultMVars
-                      writeDetails root details results
-                      depsStatus <- checkDeps root resultMVars deps 0
-                      finalizeReplArtifacts env source modul depsStatus resultMVars results
+                      cycleProblem <- readMVar cycleMVar
+                      case cycleProblem of
+                        Just problem ->
+                          return $ Left $ Exit.ReplProjectProblem problem
+
+                        Nothing ->
+                          do  writeDetails root details results
+                              depsStatus <- checkDeps root resultMVars deps 0
+                              finalizeReplArtifacts env source modul depsStatus resultMVars results
 
 
 finalizeReplArtifacts :: Env -> B.ByteString -> Src.Module -> DepsStatus -> ResultDict -> Map.Map ModuleName.Raw Result -> IO (Either Exit.Repl ReplArtifacts)
