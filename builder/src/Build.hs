@@ -791,9 +791,13 @@ projectTypeToPkg projectType =
 -- SChanged members are re-parsed from source and re-run through
 -- Harvest+Pass B on every build that touches this SCC (see this plan's
 -- Global Constraints for why this doesn't cascade into the SCC's
--- downstream dependents also always rebuilding: compileForCycle below
+-- downstream dependents also always rebuilding: computeCycleMember below
 -- reuses the same interface-diff logic `compile` already uses, so an
--- unchanged interface still reports RSame).
+-- unchanged interface still reports RSame). Disk writes and
+-- Reporting.report BDone calls are deferred past the post-check --
+-- see computeCycleMember/commitCycleMember/finishCycle below for the
+-- compute-vs-commit split that makes the whole SCC's outcome (both
+-- caches and progress reporting) atomic.
 
 
 data MemberInput
@@ -875,38 +879,76 @@ resolveMember root resultsDict sccNames local@(Details.Local _ _ deps _ _ lastCo
 -- Pass B for one SCC member: a real Compile.compile against the
 -- member's combined (outside + harvested-peer-stub) interfaces. This
 -- deliberately duplicates roughly the second half of `compile` above
--- (the RNew-vs-RSame-via-.elmi-diff / .elmo-write / Reporting.report
--- tail) rather than reusing `compile` directly, because Pass B also
--- needs the real Can.Module back for CycleCheck's post-check, and
--- `compile`'s Result type has no field for it -- threading one through
--- would touch every one of Result's several already-exhaustive
--- pattern-match sites elsewhere in this file for a value only this one
--- caller needs. DocsNeed is always False here: v1 does not support
--- generating docs for a module that's part of a cyclic SCC (see Global
--- Constraints).
-compileForCycle :: Reporting.BKey -> FilePath -> Details.BuildID -> Pkg.Name -> Details.Local -> B.ByteString -> Map.Map ModuleName.Raw I.Interface -> Src.Module -> IO (Result, Maybe Can.Module)
-compileForCycle key root buildID pkg (Details.Local path time deps main lastChange _) source ifaces modul =
+-- (the RNew-vs-RSame-via-.elmi-diff tail) rather than reusing `compile`
+-- directly, because Pass B also needs the real Can.Module back for
+-- CycleCheck's post-check, and `compile`'s Result type has no field
+-- for it -- threading one through would touch every one of Result's
+-- several already-exhaustive pattern-match sites elsewhere in this
+-- file for a value only this one caller needs. DocsNeed is always
+-- False here: v1 does not support generating docs for a module that's
+-- part of a cyclic SCC (see Global Constraints).
+--
+-- Deliberately compute-only: this determines RSame-vs-RNew (by reading
+-- the *old* .elmi, which is a read, not a write) but does not touch
+-- disk and does not Reporting.report BDone. The whole point of
+-- splitting this out from the old compileForCycle is that no member's
+-- .elmo/.elmi may be written, and no member may be reported as done,
+-- until every member of the SCC has reached this point successfully
+-- *and* the post-check (CycleCheck) has also passed -- see
+-- commitCycleMember and finishCycle below, which is where the actual
+-- writes and reports happen, strictly after both of those are known.
+data CycleMember
+  = CMProblem Error.Module
+  | CMReady CycleCommit
+
+
+data CycleCommit =
+  CycleCommit
+    { _ccName :: ModuleName.Raw
+    , _ccIface :: I.Interface
+    , _ccIfaceChanged :: Bool
+    , _ccObjects :: Opt.LocalGraph
+    , _ccLocal :: Details.Local
+    , _ccCanonical :: Can.Module
+    }
+
+
+computeCycleMember :: FilePath -> Details.BuildID -> Pkg.Name -> Details.Local -> B.ByteString -> Map.Map ModuleName.Raw I.Interface -> Src.Module -> IO CycleMember
+computeCycleMember root buildID pkg (Details.Local path time deps main lastChange _) source ifaces modul =
   case Compile.compile pkg ifaces modul of
     Right (Compile.Artifacts canonical annotations objects) ->
       do  let name = Src.getName modul
           let iface = I.fromModule pkg canonical annotations
-          let elmi = Stuff.elmi root name
-          File.writeBinary (Stuff.elmo root name) objects
-          maybeOldi <- File.readBinary elmi
+          maybeOldi <- File.readBinary (Stuff.elmi root name)
           case maybeOldi of
             Just oldi | oldi == iface ->
-              do  Reporting.report key Reporting.BDone
-                  let local = Details.Local path time deps main lastChange buildID
-                  return (RSame local iface objects Nothing, Just canonical)
+              do  let local = Details.Local path time deps main lastChange buildID
+                  return $ CMReady $ CycleCommit name iface False objects local canonical
 
             _ ->
-              do  File.writeBinary elmi iface
-                  Reporting.report key Reporting.BDone
-                  let local = Details.Local path time deps main buildID buildID
-                  return (RNew local iface objects Nothing, Just canonical)
+              do  let local = Details.Local path time deps main buildID buildID
+                  return $ CMReady $ CycleCommit name iface True objects local canonical
 
     Left err ->
-      return (RProblem (Error.Module (Src.getName modul) path time source err), Nothing)
+      return $ CMProblem (Error.Module (Src.getName modul) path time source err)
+
+
+-- The only place any SCC member's .elmo/.elmi actually gets written,
+-- and the only place Reporting.BDone gets reported for one -- called
+-- strictly after finishCycle has confirmed every member of the SCC
+-- compiled successfully *and* the post-check found no cross-module
+-- value cycle. _ccIfaceChanged (computed back in computeCycleMember
+-- against the *old* on-disk .elmi) decides RNew (write both files) vs
+-- RSame (write only .elmo, matching `compile`'s own diff logic above).
+commitCycleMember :: Reporting.BKey -> FilePath -> CycleCommit -> IO Result
+commitCycleMember key root (CycleCommit name iface ifaceChanged objects local _canonical) =
+  do  File.writeBinary (Stuff.elmo root name) objects
+      if ifaceChanged
+        then do  File.writeBinary (Stuff.elmi root name) iface
+                 Reporting.report key Reporting.BDone
+                 return (RNew local iface objects Nothing)
+        else do  Reporting.report key Reporting.BDone
+                 return (RSame local iface objects Nothing)
 
 
 checkCycle :: Env -> MVar ResultDict -> MVar (Maybe Exit.BuildProjectProblem) -> NE.List (ModuleName.Raw, Status) -> IO (Map.Map ModuleName.Raw Result)
@@ -936,10 +978,10 @@ checkCycle (Env key root projectType _ buildID _ _) rmvar cycleMVar members0 =
 
               Right stubIfaces ->
                 do  let memberIfaces = Map.union outsideIfaces stubIfaces
-                    passBOutputs <- traverse
-                      (\(_, local, source, modul, _) -> compileForCycle key root buildID pkg local source memberIfaces modul)
+                    computed <- traverse
+                      (\(_, local, source, modul, _) -> computeCycleMember root buildID pkg local source memberIfaces modul)
                       ready
-                    finishPassB cycleMVar ready passBOutputs
+                    finishCycle key root cycleMVar ready computed
 
 
 isMemberBlocked :: MemberInput -> Bool
@@ -1010,33 +1052,56 @@ recordCycleProblem cycleMVar problem =
 
 -- Pass B failures are independent per member (each Compile.compile call
 -- only consumes Harvest's already-finished stub interfaces, never a
--- peer's own Pass-B result), so one member's genuine type error does not
--- block an otherwise-successful peer's real result -- exactly like two
--- unrelated ordinary modules failing independently in the same build
--- today. The post-check only makes sense, and only runs, once every
--- member succeeded.
-finishPassB
-  :: MVar (Maybe Exit.BuildProjectProblem)
+-- peer's own Pass-B result) -- but unlike two unrelated ordinary modules
+-- failing independently, one cyclic-SCC member's genuine type error
+-- *does* block every other member this round: without that member's
+-- real Can.Module, CycleCheck's post-check has nothing sound to check
+-- (it would either miss a real cross-module value cycle running through
+-- the failed member, or falsely accuse a peer), so no member of the SCC
+-- may be committed until every member has a real body to check
+-- together. This is also why nothing gets written for *any* member
+-- here on a compute failure -- computeCycleMember never wrote anything,
+-- so there is nothing to undo, and the successful peers simply become
+-- RBlocked rather than committed.
+--
+-- Only once every member's computeCycleMember succeeded does the
+-- post-check (CycleCheck.findCrossModuleValueCycle) run over the real
+-- Can.Modules; only if that also finds no cycle does commitCycleMember
+-- get called for every member, writing each one's .elmo/.elmi and
+-- reporting it done. Both failure branches (a compute failure, or a
+-- post-check hit) leave every member's on-disk cache byte-for-byte
+-- untouched from before this round.
+finishCycle
+  :: Reporting.BKey
+  -> FilePath
+  -> MVar (Maybe Exit.BuildProjectProblem)
   -> [(ModuleName.Raw, Details.Local, B.ByteString, Src.Module, Map.Map ModuleName.Raw I.Interface)]
-  -> [(Result, Maybe Can.Module)]
+  -> [CycleMember]
   -> IO (Map.Map ModuleName.Raw Result)
-finishPassB cycleMVar ready passBOutputs =
+finishCycle key root cycleMVar ready members =
   let
     names = [ name | (name, _, _, _, _) <- ready ]
-    resultsOnly = map fst passBOutputs
-    canonicals = [ (name, c) | (name, (_, Just c)) <- zip names passBOutputs ]
+    problems = [ (name, err) | (name, CMProblem err) <- zip names members ]
+    problemNames = map fst problems
   in
-  if length canonicals /= length ready then
-    return (Map.fromList (zip names resultsOnly))
+  if not (null problems) then
+    return $ Map.fromList $
+      [ (name, RProblem err) | (name, err) <- problems ] ++
+      [ (name, RBlocked) | name <- names, name `notElem` problemNames ]
 
   else
-    case CycleCheck.findCrossModuleValueCycle (Map.fromList canonicals) of
+    let
+      commits = [ c | CMReady c <- members ]
+      canonicals = Map.fromList [ (_ccName c, _ccCanonical c) | c <- commits ]
+    in
+    case CycleCheck.findCrossModuleValueCycle canonicals of
       Just cyclicKeys ->
         do  recordCycleProblem cycleMVar (Exit.BP_CycleValue cyclicKeys)
             return (Map.fromList [ (name, RBlocked) | name <- names ])
 
       Nothing ->
-        return (Map.fromList (zip names resultsOnly))
+        do  results <- traverse (commitCycleMember key root) commits
+            return (Map.fromList (zip (map _ccName commits) results))
 
 
 
