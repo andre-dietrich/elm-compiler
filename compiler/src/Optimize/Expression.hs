@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternGuards #-}
 module Optimize.Expression
   ( optimize
   , Hints
@@ -499,6 +500,13 @@ findHoleIndex rootName argNames args =
     is -> Just (last is)
 
 
+-- Every argument except the one at holeIndex, paired with its original
+-- position -- these become a TailCallCons node's non-hole fields.
+otherIndexedArgs :: Index.ZeroBased -> [Can.Expr] -> [(Index.ZeroBased, Can.Expr)]
+otherIndexedArgs holeIndex args =
+  filter ((/= holeIndex) . fst) (Index.indexedMap (,) args)
+
+
 isDirectSelfCall :: Name.Name -> [Name.Name] -> Can.Expr -> Bool
 isDirectSelfCall rootName argNames (A.At _ expression) =
   case expression of
@@ -711,6 +719,25 @@ optimizePotentialTailCall hints cycle name args expr =
 optimizeTail :: Hints -> Cycle -> Maybe (Opt.ConsInfo, Index.ZeroBased) -> Name.Name -> [Name.Name] -> Can.Expr -> Names.Tracker Opt.Expr
 optimizeTail hints cycle consIdentity rootName argNames locExpr@(A.At _ expression) =
   case expression of
+    Can.Call (A.At _ (Can.VarCtor Can.Normal home name index _)) args
+      | Just (Opt.ConsCtor (Opt.Global cHome cName) cArity, holeIndex) <- consIdentity
+      , home == cHome && name == cName && cArity == length args
+      , findHoleIndex rootName argNames args == Just holeIndex
+      ->
+        do  _ <- Names.registerCtor home name index Can.Normal
+            maybeRebinds <- matchTailSelfCall hints cycle rootName argNames (args !! Index.toMachine holeIndex)
+            case maybeRebinds of
+              Just rebinds ->
+                do  otherFields <- traverse
+                                      (\(i, a) -> (,) i <$> optimize hints cycle a)
+                                      (otherIndexedArgs holeIndex args)
+                    pure $ Opt.TailCallCons
+                             (Opt.ConsCtor (Opt.Global home name) cArity) holeIndex rootName
+                             otherFields rebinds
+
+              Nothing ->
+                optimize hints cycle locExpr
+
     Can.Call func args ->
       do  oargs <- traverse (optimize hints cycle) args
 

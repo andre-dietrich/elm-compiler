@@ -905,6 +905,17 @@ generateConsCell consInfo holeIndex otherFields holeValue =
     Opt.ConsKernel ->
       JS.Call listCons ordered
 
+    -- User ctors of arity 2..9 are F2..F9-wrapped (see Generate.Mode's
+    -- restrictRange / Generate.JavaScript.Expression's funcHelpers): the
+    -- top-level binding is a curried unary function with `.f` holding the
+    -- real N-ary implementation, so calling it directly with N args would
+    -- silently drop all but the first. Route through `.f`, exactly like
+    -- generateDirectCall's Prod-mode A-arity bypass does for ordinary
+    -- calls -- this is correct (and required) in both Dev and Prod, since
+    -- TRMC codegen is Mode-independent.
+    Opt.ConsCtor (Opt.Global home name) arity | arity >= 2 && arity <= 9 ->
+      JS.Call (JS.Access (JS.Ref (JsName.fromGlobal home name)) rawFunctionField) ordered
+
     Opt.ConsCtor (Opt.Global home name) _arity ->
       JS.Call (JS.Ref (JsName.fromGlobal home name)) ordered
   where
