@@ -193,8 +193,8 @@ optimize hints cycle (A.At region expression) =
       Names.registerKernel Name.utils Opt.Unit
 
     Can.Tuple a b maybeC ->
-      Names.registerKernel Name.utils Opt.Tuple
-        <*> optimize hints cycle a
+      Opt.Tuple
+        <$> optimize hints cycle a
         <*> optimize hints cycle b
         <*> traverse (optimize hints cycle) maybeC
 

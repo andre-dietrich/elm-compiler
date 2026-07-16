@@ -144,20 +144,7 @@ generate mode expression =
         Mode.Prod _ _ -> JsExpr $ JS.Int 0
 
     Opt.Tuple a b maybeC ->
-      JsExpr $
-        case maybeC of
-          Nothing ->
-            JS.Call (JS.Ref (JsName.fromKernel Name.utils "Tuple2"))
-              [ generateJsExpr mode a
-              , generateJsExpr mode b
-              ]
-
-          Just c ->
-            JS.Call (JS.Ref (JsName.fromKernel Name.utils "Tuple3"))
-              [ generateJsExpr mode a
-              , generateJsExpr mode b
-              , generateJsExpr mode c
-              ]
+      JsExpr $ generateTuple mode a b maybeC
 
     Opt.Shader src attributes uniforms ->
       let
@@ -270,6 +257,33 @@ ctorToInt home name index =
     0 - Index.toHuman index
   else
     Index.toMachine index
+
+
+
+-- TUPLES
+
+
+generateTuple :: Mode.Mode -> Opt.Expr -> Opt.Expr -> Maybe Opt.Expr -> JS.Expr
+generateTuple mode a b maybeC =
+  let
+    tag n =
+      case mode of
+        Mode.Dev  _   -> [ (JsName.dollar, JS.String n) ]
+        Mode.Prod _ _ -> []
+  in
+  case maybeC of
+    Nothing ->
+      JS.Object $ tag "#2" ++
+        [ (JsName.fromIndex Index.first,  generateJsExpr mode a)
+        , (JsName.fromIndex Index.second, generateJsExpr mode b)
+        ]
+
+    Just c ->
+      JS.Object $ tag "#3" ++
+        [ (JsName.fromIndex Index.first,  generateJsExpr mode a)
+        , (JsName.fromIndex Index.second, generateJsExpr mode b)
+        , (JsName.fromIndex Index.third,  generateJsExpr mode c)
+        ]
 
 
 
