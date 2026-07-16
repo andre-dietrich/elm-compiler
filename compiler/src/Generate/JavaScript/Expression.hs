@@ -89,16 +89,8 @@ generate mode expression =
     Opt.VarKernel  h n   -> JsExpr $ JS.Ref (JsName.fromKernel h n)
 
     Opt.List entries ->
-      case entries of
-        [] ->
-          JsExpr $ JS.Ref (JsName.fromKernel Name.list "Nil")
-
-        _ ->
-          JsExpr $
-            JS.Call
-              (JS.Ref (JsName.fromKernel Name.list "fromArray"))
-              [ JS.Array $ map (generateJsExpr mode) entries
-              ]
+      JsExpr $
+        List.foldr (\entry acc -> JS.Call listCons [generateJsExpr mode entry, acc]) listNil entries
 
     Opt.Function args body ->
       generateFunction (map JsName.fromLocal args) (generate mode body)
