@@ -187,7 +187,21 @@ functionArity :: Opt.Expr -> Maybe Int
 functionArity expr =
   case expr of
     Opt.Function args _ -> Just (length args)
+    Opt.VarKernel h n    -> kernelArity h n
     _                    -> Nothing
+
+
+-- Top-level Elm defs that are a bare alias for a Kernel value (e.g.
+-- `cons = Elm.Kernel.List.cons`, elm/core List.elm) have no syntactically
+-- visible arity -- the real arity is encoded only in the kernel JS text
+-- (e.g. `F2(_List_Cons)`), invisible to this compiler. A small
+-- hand-verified table for the ones worth direct-call/A2-bypass treatment.
+kernelArity :: Name.Name -> Name.Name -> Maybe Int
+kernelArity home name =
+  if home == Name.list && name == Name.fromChars "cons" then
+    Just 2
+  else
+    Nothing
 
 
 -- A member of a recursive let-block is stored as `Global -> Link cycleName`,
