@@ -550,7 +550,17 @@ collectConsCandidates rootName argNames (A.At _ expression) =
         Just _  -> [(Opt.ConsKernel, Index.second)]
         Nothing -> []
 
-    Can.Call (A.At _ (Can.VarCtor Can.Normal home name _ _)) args ->
+    -- Constructors of arity 2..9 are F2..F9-wrapped in the generated JS
+    -- (Generate.Mode's restrictRange / Generate.JavaScript.Expression's
+    -- funcHelpers both cap at 9), so generateConsCell's `.f`-bypass call
+    -- is valid for them. Arity 10+ is never F-wrapped -- it's nested
+    -- curried unary functions with no direct N-ary entry point at all --
+    -- so disqualify those from TRMC entirely here, at the source, rather
+    -- than trying to make codegen handle the nested-unary shape: this
+    -- keeps consIdentity's detection guarantee ("every ConsCtor identity
+    -- this can ever produce is safe for generateConsCell to construct")
+    -- intact without touching codegen.
+    Can.Call (A.At _ (Can.VarCtor Can.Normal home name _ _)) args | length args <= 9 ->
       case findHoleIndex rootName argNames args of
         Just i  -> [(Opt.ConsCtor (Opt.Global home name) (length args), i)]
         Nothing -> []
