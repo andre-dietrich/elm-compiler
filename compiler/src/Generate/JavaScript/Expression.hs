@@ -97,8 +97,8 @@ generate mode expression =
 
     Opt.Call f xs     -> JsExpr $ generateCall mode f xs
     Opt.TailCall n xs -> JsBlock $ generateTailCall mode n xs
-    Opt.TailCallCons n headExpr xs -> JsBlock $ generateTailCallCons mode n headExpr xs
-    Opt.TailCallConsBase n valueExpr -> JsBlock $ generateTailCallConsBase mode n valueExpr
+    Opt.TailCallCons consInfo holeIndex n otherFields xs -> JsBlock $ generateTailCallCons mode consInfo holeIndex n otherFields xs
+    Opt.TailCallConsBase holeIndex n valueExpr -> JsBlock $ generateTailCallConsBase mode holeIndex n valueExpr
     Opt.If bs f       -> generateIf mode bs f
 
     Opt.Let def body ->
@@ -892,19 +892,68 @@ listNil =
   JS.Ref (JsName.fromKernel Name.list "Nil")
 
 
--- the accumulator's currently-open cell always has the head value at
--- field "a" (unused once filled) and the hole at field "b" (tail)
-mcHoleField :: JsName.Name
-mcHoleField =
-  JsName.fromIndex Index.second
+-- Builds one accumulator cell (either the sentinel, at loop entry, or a
+-- fresh cell during a recursive step): places `holeValue` at `holeIndex`
+-- and every `(index, value)` from `otherFields` at its own position, then
+-- calls whichever JS constructor `consInfo` describes -- Kernel List's
+-- `_List_Cons` (fixed 2-field), or a user ctor's own generated
+-- constructor function (arity-many args). The field ordering is fully
+-- determined by the indices, so this one function is correct for both.
+generateConsCell :: Opt.ConsInfo -> Index.ZeroBased -> [(Index.ZeroBased, JS.Expr)] -> JS.Expr -> JS.Expr
+generateConsCell consInfo holeIndex otherFields holeValue =
+  case consInfo of
+    Opt.ConsKernel ->
+      JS.Call listCons ordered
+
+    Opt.ConsCtor (Opt.Global home name) _arity ->
+      JS.Call (JS.Ref (JsName.fromGlobal home name)) ordered
+  where
+    ordered = map snd (List.sortOn (Index.toMachine . fst) ((holeIndex, holeValue) : otherFields))
 
 
-generateTailCallCons :: Mode.Mode -> Name.Name -> Opt.Expr -> [(Name.Name, Opt.Expr)] -> [JS.Stmt]
-generateTailCallCons mode name headExpr args =
+-- The sentinel cell allocated once at loop entry: every field is a
+-- discarded placeholder (only `start[holeField]` is ever read back, once
+-- fully mutated by the loop's recursive steps and base case). For
+-- ConsKernel this reproduces V1's exact `_List_Cons(null, _List_Nil)` --
+-- preserving that specific placeholder shape keeps List TRMC's emitted JS
+-- byte-identical to before this generalization.
+sentinelCell :: Opt.ConsInfo -> Index.ZeroBased -> Int -> JS.Expr
+sentinelCell consInfo holeIndex arity =
+  case consInfo of
+    Opt.ConsKernel ->
+      generateConsCell consInfo holeIndex [(Index.first, JS.Null)] listNil
+
+    Opt.ConsCtor _ _ ->
+      let otherFields = [ (i, JS.Null) | i <- Index.range arity, i /= holeIndex ] in
+      generateConsCell consInfo holeIndex otherFields JS.Null
+
+
+generateTailCallCons :: Mode.Mode -> Opt.ConsInfo -> Index.ZeroBased -> Name.Name -> [(Index.ZeroBased, Opt.Expr)] -> [(Name.Name, Opt.Expr)] -> [JS.Stmt]
+generateTailCallCons mode consInfo holeIndex name otherFields args =
   let
-    headTemp = JsName.makeMCHead name
     cellName = JsName.makeMCCell name
     endName = JsName.makeMCEnd name
+    holeField = JsName.fromIndex holeIndex
+
+    -- List always has exactly one other field (the head); keep using
+    -- makeMCHead for it so List's emitted JS stays byte-identical to
+    -- before this generalization. General ctors may have more than one
+    -- other field, so each gets its own index-keyed temp name.
+    fieldTempName i =
+      case consInfo of
+        Opt.ConsKernel   -> JsName.makeMCHead name
+        Opt.ConsCtor _ _ -> JsName.makeMCField name i
+
+    placeholder =
+      case consInfo of
+        Opt.ConsKernel   -> listNil
+        Opt.ConsCtor _ _ -> JS.Null
+
+    toFieldTempVar (i, expr) =
+      ( fieldTempName i, generateJsExpr mode expr )
+
+    toFieldRef (i, _) =
+      ( i, JS.Ref (fieldTempName i) )
 
     toTempVars (argName, arg) =
       ( JsName.makeTemp argName, generateJsExpr mode arg )
@@ -913,21 +962,22 @@ generateTailCallCons mode name headExpr args =
       JS.ExprStmt $
         JS.Assign (JS.LRef (JsName.fromLocal argName)) (JS.Ref (JsName.makeTemp argName))
   in
-  JS.Vars ((headTemp, generateJsExpr mode headExpr) : map toTempVars args)
+  JS.Vars (map toFieldTempVar otherFields ++ map toTempVars args)
   : map toRealVars args
   ++
-  [ JS.Var cellName (JS.Call listCons [JS.Ref headTemp, listNil])
-  , JS.ExprStmt $ JS.Assign (JS.LDot (JS.Ref endName) mcHoleField) (JS.Ref cellName)
+  [ JS.Var cellName (generateConsCell consInfo holeIndex (map toFieldRef otherFields) placeholder)
+  , JS.ExprStmt $ JS.Assign (JS.LDot (JS.Ref endName) holeField) (JS.Ref cellName)
   , JS.ExprStmt $ JS.Assign (JS.LRef endName) (JS.Ref cellName)
   , JS.Continue (Just (JsName.fromLocal name))
   ]
 
 
-generateTailCallConsBase :: Mode.Mode -> Name.Name -> Opt.Expr -> [JS.Stmt]
-generateTailCallConsBase mode name valueExpr =
+generateTailCallConsBase :: Mode.Mode -> Index.ZeroBased -> Name.Name -> Opt.Expr -> [JS.Stmt]
+generateTailCallConsBase mode holeIndex name valueExpr =
+  let holeField = JsName.fromIndex holeIndex in
   [ JS.ExprStmt $
-      JS.Assign (JS.LDot (JS.Ref (JsName.makeMCEnd name)) mcHoleField) (generateJsExpr mode valueExpr)
-  , JS.Return $ JS.Access (JS.Ref (JsName.makeMCStart name)) mcHoleField
+      JS.Assign (JS.LDot (JS.Ref (JsName.makeMCEnd name)) holeField) (generateJsExpr mode valueExpr)
+  , JS.Return $ JS.Access (JS.Ref (JsName.makeMCStart name)) holeField
   ]
 
 
@@ -949,7 +999,7 @@ extendWithLocalArity mode def =
     Opt.Def name (Opt.Function args _) -> Mode.addLocalArity name (length args) mode
     Opt.Def _ _                        -> mode
     Opt.TailDef name args _            -> Mode.addLocalArity name (length args) mode
-    Opt.TailDefCons name args _        -> Mode.addLocalArity name (length args) mode
+    Opt.TailDefCons _ _ _ name args _  -> Mode.addLocalArity name (length args) mode
 
 
 generateDef :: Mode.Mode -> Opt.Def -> JS.Stmt
@@ -961,8 +1011,8 @@ generateDef mode def =
     Opt.TailDef name argNames body ->
       JS.Var (JsName.fromLocal name) (codeToExpr (generateTailDef mode name argNames body))
 
-    Opt.TailDefCons name argNames body ->
-      JS.Var (JsName.fromLocal name) (codeToExpr (generateTailDefCons mode name argNames body))
+    Opt.TailDefCons consInfo holeIndex arity name argNames body ->
+      JS.Var (JsName.fromLocal name) (codeToExpr (generateTailDefCons mode consInfo holeIndex arity name argNames body))
 
 
 generateTailDef :: Mode.Mode -> Name.Name -> [Name.Name] -> Opt.Expr -> Code
@@ -974,10 +1024,10 @@ generateTailDef mode name argNames body =
     ]
 
 
-generateTailDefCons :: Mode.Mode -> Name.Name -> [Name.Name] -> Opt.Expr -> Code
-generateTailDefCons mode name argNames body =
+generateTailDefCons :: Mode.Mode -> Opt.ConsInfo -> Index.ZeroBased -> Int -> Name.Name -> [Name.Name] -> Opt.Expr -> Code
+generateTailDefCons mode consInfo holeIndex arity name argNames body =
   generateFunction (map JsName.fromLocal argNames) $ JsBlock $
-    [ JS.Var (JsName.makeMCStart name) (JS.Call listCons [JS.Null, listNil])
+    [ JS.Var (JsName.makeMCStart name) (sentinelCell consInfo holeIndex arity)
     , JS.Var (JsName.makeMCEnd name) (JS.Ref (JsName.makeMCStart name))
     , JS.Labelled (JsName.fromLocal name) $
         JS.While (JS.Bool True) $

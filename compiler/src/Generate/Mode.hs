@@ -226,7 +226,7 @@ findDefArity name defs =
     Opt.TailDef defName args _ : rest ->
       if defName == name then Just (length args) else findDefArity name rest
 
-    Opt.TailDefCons defName args _ : rest ->
+    Opt.TailDefCons _ _ _ defName args _ : rest ->
       if defName == name then Just (length args) else findDefArity name rest
 
 
@@ -302,7 +302,7 @@ addCycleFunc arities home candidates def =
       addParams arities (Opt.Global home name) params body candidates
 
     -- no `$unwrapped` sibling for TRMC defs yet (V1; see trmc-plan.md)
-    Opt.TailDefCons _ _ _ ->
+    Opt.TailDefCons _ _ _ _ _ _ ->
       candidates
 
 
@@ -385,10 +385,10 @@ scanParam arities self param body =
         Opt.TailCall fname pairs ->
           merges (map (scanPair fname) pairs)
 
-        Opt.TailCallCons fname headExpr pairs ->
-          merge (scan headExpr) (merges (map (scanPair fname) pairs))
+        Opt.TailCallCons _consInfo _holeIndex fname otherFields pairs ->
+          merge (merges (map (scan . snd) otherFields)) (merges (map (scanPair fname) pairs))
 
-        Opt.TailCallConsBase _fname finalExpr ->
+        Opt.TailCallConsBase _holeIndex _fname finalExpr ->
           scan finalExpr
 
         Opt.Function args funcBody ->
@@ -446,13 +446,13 @@ scanParam arities self param body =
       case def of
         Opt.Def name _ -> name == param
         Opt.TailDef name args _ -> name == param || elem param args
-        Opt.TailDefCons name args _ -> name == param || elem param args
+        Opt.TailDefCons _ _ _ name args _ -> name == param || elem param args
 
     scanDef def =
       case def of
         Opt.Def _ expr -> scan expr
         Opt.TailDef _ _ expr -> scan expr
-        Opt.TailDefCons _ _ expr -> scan expr
+        Opt.TailDefCons _ _ _ _ _ expr -> scan expr
 
     scanDecider decider =
       case decider of

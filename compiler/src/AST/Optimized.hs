@@ -3,6 +3,7 @@ module AST.Optimized
   , Expr(..)
   , PrimBinop(..)
   , Global(..)
+  , ConsInfo(..)
   , Path(..)
   , Destructor(..)
   , Decider(..)
@@ -61,13 +62,17 @@ data Expr
   | Function [Name] Expr
   | Call Expr [Expr]
   | TailCall Name [(Name, Expr)]
-  -- Tail Recursion Modulo Cons (Kernel `::` only, see Optimize.Expression):
-  -- build a new list cell whose head is the given Expr, link it onto the
-  -- accumulator built so far, then loop with the rebound args.
-  | TailCallCons Name Expr [(Name, Expr)]
-  -- terminates a TailCallCons loop: fill the currently open cell's tail
-  -- with the given Expr and return the accumulator from its head.
-  | TailCallConsBase Name Expr
+  -- Tail Recursion Modulo Cons: build a new accumulator cell for either
+  -- Kernel List `::` or a general user ADT constructor (see ConsInfo and
+  -- Optimize.Expression's "TAIL RECURSION MODULO CONS" section), whose
+  -- hole field (at the given Index.ZeroBased) is left open, linked onto
+  -- the accumulator built so far, then loop with the rebound args. The
+  -- non-hole fields are given in original field-position order.
+  | TailCallCons ConsInfo Index.ZeroBased Name [(Index.ZeroBased, Expr)] [(Name, Expr)]
+  -- terminates a TailCallCons loop: fill the currently open cell's hole
+  -- field (at the given Index.ZeroBased) with the given Expr and return
+  -- the accumulator read back from the same field on the start cell.
+  | TailCallConsBase Index.ZeroBased Name Expr
   | If [(Expr, Expr)] Expr
   | Let Def Expr
   | Destruct Destructor Expr
@@ -99,6 +104,18 @@ data PrimBinop
 data Global = Global ModuleName.Canonical Name
 
 
+-- Describes how to build one cell of a Tail-Call-Modulo-Cons loop: either
+-- the Kernel List `::` constructor (fixed 2-field, hole is always the
+-- tail field) or a user-defined Can.Normal ADT constructor identified by
+-- its global name and total field arity. See Optimize.Expression's "TAIL
+-- RECURSION MODULO CONS" section and Generate.JavaScript.Expression's
+-- `generateConsCell`.
+data ConsInfo
+  = ConsKernel
+  | ConsCtor Global Int
+  deriving (Eq)
+
+
 
 -- DEFINITIONS
 
@@ -106,7 +123,9 @@ data Global = Global ModuleName.Canonical Name
 data Def
   = Def Name Expr
   | TailDef Name [Name] Expr
-  | TailDefCons Name [Name] Expr
+  -- ConsInfo/hole index/arity describe the accumulator cell shape for
+  -- this def's TailCallCons/TailCallConsBase occurrences -- see ConsInfo.
+  | TailDefCons ConsInfo Index.ZeroBased Int Name [Name] Expr
 
 
 data Destructor =
@@ -270,6 +289,20 @@ instance Binary Global where
   put (Global a b) = put a >> put b
 
 
+instance Binary ConsInfo where
+  put info =
+    case info of
+      ConsKernel   -> putWord8 0
+      ConsCtor a b -> putWord8 1 >> put a >> put b
+
+  get =
+    do  word <- getWord8
+        case word of
+          0 -> pure ConsKernel
+          1 -> liftM2 ConsCtor get get
+          _ -> fail "problem getting Opt.ConsInfo binary"
+
+
 instance Binary Expr where
   put expr =
     case expr of
@@ -301,8 +334,8 @@ instance Binary Expr where
       Tuple a b c      -> putWord8 25 >> put a >> put b >> put c
       Shader a b c     -> putWord8 26 >> put a >> put b >> put c
       PrimOp a b c     -> putWord8 27 >> put a >> put b >> put c
-      TailCallCons a b c     -> putWord8 28 >> put a >> put b >> put c
-      TailCallConsBase a b   -> putWord8 29 >> put a >> put b
+      TailCallCons a b c d e   -> putWord8 28 >> put a >> put b >> put c >> put d >> put e
+      TailCallConsBase a b c   -> putWord8 29 >> put a >> put b >> put c
 
   get =
     do  word <- getWord8
@@ -335,8 +368,8 @@ instance Binary Expr where
           25 -> liftM3 Tuple get get get
           26 -> liftM3 Shader get get get
           27 -> liftM3 PrimOp get get get
-          28 -> liftM3 TailCallCons get get get
-          29 -> liftM2 TailCallConsBase get get
+          28 -> TailCallCons <$> get <*> get <*> get <*> get <*> get
+          29 -> liftM3 TailCallConsBase get get get
           _  -> fail "problem getting Opt.Expr binary"
 
 
@@ -370,14 +403,14 @@ instance Binary Def where
     case def of
       Def a b       -> putWord8 0 >> put a >> put b
       TailDef a b c -> putWord8 1 >> put a >> put b >> put c
-      TailDefCons a b c -> putWord8 2 >> put a >> put b >> put c
+      TailDefCons a b c d e f -> putWord8 2 >> put a >> put b >> put c >> put d >> put e >> put f
 
   get =
     do  word <- getWord8
         case word of
           0 -> liftM2 Def get get
           1 -> liftM3 TailDef get get get
-          2 -> liftM3 TailDefCons get get get
+          2 -> TailDefCons <$> get <*> get <*> get <*> get <*> get <*> get
           _ -> fail "problem getting Opt.Def binary"
 
 

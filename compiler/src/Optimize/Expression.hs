@@ -518,7 +518,7 @@ matchTailSelfCall hints cycle rootName argNames (A.At _ expression) =
 hasTailCallCons :: Opt.Expr -> Bool
 hasTailCallCons expression =
   case expression of
-    Opt.TailCallCons _ _ _ ->
+    Opt.TailCallCons _ _ _ _ _ ->
       True
 
     Opt.If branches finally ->
@@ -557,45 +557,45 @@ deciderHasTailCallCons decider =
 -- not already a recursive step (TailCall/TailCallCons) is a base case:
 -- wrap it so codegen fills the open hole and returns, instead of just
 -- returning the value directly.
-wrapConsBase :: Name.Name -> Opt.Expr -> Opt.Expr
-wrapConsBase rootName expression =
+wrapConsBase :: Index.ZeroBased -> Name.Name -> Opt.Expr -> Opt.Expr
+wrapConsBase holeIndex rootName expression =
   case expression of
     Opt.TailCall _ _ ->
       expression
 
-    Opt.TailCallCons _ _ _ ->
+    Opt.TailCallCons _ _ _ _ _ ->
       expression
 
     Opt.If branches finally ->
-      Opt.If (map (\(c,b) -> (c, wrapConsBase rootName b)) branches) (wrapConsBase rootName finally)
+      Opt.If (map (\(c,b) -> (c, wrapConsBase holeIndex rootName b)) branches) (wrapConsBase holeIndex rootName finally)
 
     Opt.Let def body ->
-      Opt.Let def (wrapConsBase rootName body)
+      Opt.Let def (wrapConsBase holeIndex rootName body)
 
     Opt.Destruct destructor body ->
-      Opt.Destruct destructor (wrapConsBase rootName body)
+      Opt.Destruct destructor (wrapConsBase holeIndex rootName body)
 
     Opt.Case label root decider jumps ->
-      Opt.Case label root (wrapConsBaseDecider rootName decider) (map (\(i,e) -> (i, wrapConsBase rootName e)) jumps)
+      Opt.Case label root (wrapConsBaseDecider holeIndex rootName decider) (map (\(i,e) -> (i, wrapConsBase holeIndex rootName e)) jumps)
 
     _ ->
-      Opt.TailCallConsBase rootName expression
+      Opt.TailCallConsBase holeIndex rootName expression
 
 
-wrapConsBaseDecider :: Name.Name -> Opt.Decider Opt.Choice -> Opt.Decider Opt.Choice
-wrapConsBaseDecider rootName decider =
+wrapConsBaseDecider :: Index.ZeroBased -> Name.Name -> Opt.Decider Opt.Choice -> Opt.Decider Opt.Choice
+wrapConsBaseDecider holeIndex rootName decider =
   case decider of
     Opt.Leaf (Opt.Inline expr) ->
-      Opt.Leaf (Opt.Inline (wrapConsBase rootName expr))
+      Opt.Leaf (Opt.Inline (wrapConsBase holeIndex rootName expr))
 
     Opt.Leaf (Opt.Jump index) ->
       Opt.Leaf (Opt.Jump index)
 
     Opt.Chain testChain success failure ->
-      Opt.Chain testChain (wrapConsBaseDecider rootName success) (wrapConsBaseDecider rootName failure)
+      Opt.Chain testChain (wrapConsBaseDecider holeIndex rootName success) (wrapConsBaseDecider holeIndex rootName failure)
 
     Opt.FanOut path tests fallback ->
-      Opt.FanOut path (map (\(t,d) -> (t, wrapConsBaseDecider rootName d)) tests) (wrapConsBaseDecider rootName fallback)
+      Opt.FanOut path (map (\(t,d) -> (t, wrapConsBaseDecider holeIndex rootName d)) tests) (wrapConsBaseDecider holeIndex rootName fallback)
 
 
 
@@ -649,7 +649,8 @@ optimizeTail hints cycle rootName argNames locExpr@(A.At _ expression) =
           case maybeRebinds of
             Just rebinds ->
               do  optHead <- optimize hints cycle left
-                  Names.registerKernel Name.list (Opt.TailCallCons rootName optHead rebinds)
+                  Names.registerKernel Name.list
+                    (Opt.TailCallCons Opt.ConsKernel Index.second rootName [(Index.first, optHead)] rebinds)
 
             Nothing ->
               optimize hints cycle locExpr
@@ -714,7 +715,13 @@ optimizeTail hints cycle rootName argNames locExpr@(A.At _ expression) =
 toTailDef :: Name.Name -> [Name.Name] -> [Opt.Destructor] -> Opt.Expr -> Opt.Def
 toTailDef name argNames destructors body =
   if hasTailCallCons body then
-    Opt.TailDefCons name argNames (wrapConsBase name (foldr Opt.Destruct body destructors))
+    -- Only Kernel List `::` can produce a TailCallCons node at this point
+    -- in the codebase -- general ADT ctor detection is a follow-up task
+    -- (see docs/superpowers/specs/2026-07-03-trmc-general-adt-ctors-design.md).
+    -- Hardcoding ConsKernel/Index.second/arity 2 here is temporary and
+    -- will be replaced by threading a detected identity through.
+    Opt.TailDefCons Opt.ConsKernel Index.second 2 name argNames
+      (wrapConsBase Index.second name (foldr Opt.Destruct body destructors))
   else if hasTailCall body then
     Opt.TailDef name argNames (foldr Opt.Destruct body destructors)
   else
@@ -727,7 +734,7 @@ hasTailCall expression =
     Opt.TailCall _ _ ->
       True
 
-    Opt.TailCallCons _ _ _ ->
+    Opt.TailCallCons _ _ _ _ _ ->
       True
 
     Opt.If branches finally ->

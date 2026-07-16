@@ -4,6 +4,7 @@ module Data.Index
   , second
   , third
   , next
+  , range
   , toMachine
   , toHuman
   , indexedMap
@@ -41,6 +42,14 @@ second =
 third :: ZeroBased
 third =
   ZeroBased 2
+
+
+-- All indices from 0 up to (but not including) n, in order. Used to build
+-- a full field list for a general ADT constructor's sentinel cell -- see
+-- Generate.JavaScript.Expression's `sentinelCell`.
+range :: Int -> [ZeroBased]
+range n =
+  map ZeroBased [0 .. n - 1]
 
 
 {-# INLINE next #-}

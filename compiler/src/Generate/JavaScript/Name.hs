@@ -17,6 +17,7 @@ module Generate.JavaScript.Name
   , makeMCEnd
   , makeMCCell
   , makeMCHead
+  , makeMCField
   , dollar
   )
   where
@@ -142,6 +143,18 @@ makeMCCell name =
 makeMCHead :: Name.Name -> Name
 makeMCHead name =
   Name ("$head$" <> Name.toBuilder name)
+
+
+-- Temp variable for one non-hole field's expression during a general-ADT
+-- TRMC recursive step (see Generate.JavaScript.Expression's
+-- generateTailCallCons). Keyed on both the function's own name and the
+-- field's index, since a user constructor can have more than one such
+-- field (unlike List, which always has exactly one -- List keeps using
+-- makeMCHead for that field, to keep its emitted JS byte-identical to
+-- before this generalization).
+makeMCField :: Name.Name -> Index.ZeroBased -> Name
+makeMCField name index =
+  Name ("$field$" <> Name.toBuilder name <> usd <> B.intDec (Index.toMachine index))
 
 
 dollar :: Name

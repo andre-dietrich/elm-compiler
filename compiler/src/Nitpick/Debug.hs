@@ -53,8 +53,9 @@ hasDebug expression =
     Opt.Function _ expr  -> hasDebug expr
     Opt.Call e es        -> hasDebug e || any hasDebug es
     Opt.TailCall _ args  -> any (hasDebug . snd) args
-    Opt.TailCallCons _ headExpr args -> hasDebug headExpr || any (hasDebug . snd) args
-    Opt.TailCallConsBase _ expr -> hasDebug expr
+    Opt.TailCallCons _consInfo _holeIndex _fname otherFields args ->
+      any (hasDebug . snd) otherFields || any (hasDebug . snd) args
+    Opt.TailCallConsBase _holeIndex _fname expr -> hasDebug expr
     Opt.If conds finally -> any (\(c,e) -> hasDebug c || hasDebug e) conds || hasDebug finally
     Opt.Let def body     -> defHasDebug def || hasDebug body
     Opt.Destruct _ expr  -> hasDebug expr
@@ -74,7 +75,7 @@ defHasDebug def =
   case def of
     Opt.Def _ expr       -> hasDebug expr
     Opt.TailDef _ _ expr -> hasDebug expr
-    Opt.TailDefCons _ _ expr -> hasDebug expr
+    Opt.TailDefCons _ _ _ _ _ expr -> hasDebug expr
 
 
 deciderHasDebug :: Opt.Decider Opt.Choice -> Bool
