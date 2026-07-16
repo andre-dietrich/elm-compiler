@@ -486,6 +486,94 @@ isListCons home name =
   home == ModuleName.list && name == "cons"
 
 
+-- Does this list of arguments contain exactly one direct self-call (a
+-- saturated Can.Call to rootName, no further nesting through If/Case)?
+-- If so, at which (rightmost) position? A pure syntactic check -- no
+-- optimization, no Names.Tracker effects -- shared between the
+-- detectConsIdentity pre-scan and optimizeTail's real construction of
+-- the hole argument's rebind pairs.
+findHoleIndex :: Name.Name -> [Name.Name] -> [Can.Expr] -> Maybe Index.ZeroBased
+findHoleIndex rootName argNames args =
+  case [ i | (i, arg) <- Index.indexedMap (,) args, isDirectSelfCall rootName argNames arg ] of
+    [] -> Nothing
+    is -> Just (last is)
+
+
+isDirectSelfCall :: Name.Name -> [Name.Name] -> Can.Expr -> Bool
+isDirectSelfCall rootName argNames (A.At _ expression) =
+  case expression of
+    Can.Call func args ->
+      let
+        isMatchingName =
+          case A.toValue func of
+            Can.VarLocal      name -> rootName == name
+            Can.VarTopLevel _ name -> rootName == name
+            _                      -> False
+      in
+      isMatchingName && length args == length argNames
+
+    _ ->
+      False
+
+
+allSame :: Eq a => [a] -> Maybe a
+allSame list =
+  case list of
+    []     -> Nothing
+    x : xs -> if all (== x) xs then Just x else Nothing
+
+
+-- Pure pre-pass over the *unoptimized* Can.Expr, mirroring optimizeTail's
+-- own tail-position structural traversal but building nothing. Collects
+-- every candidate (ConsInfo, hole field index) reachable in tail
+-- position; returns Just identity only if exactly one distinct candidate
+-- exists (Nothing if none are found, or if more than one disagree -- see
+-- docs/superpowers/specs/2026-07-03-trmc-general-adt-ctors-design.md).
+detectConsIdentity :: Name.Name -> [Name.Name] -> Can.Expr -> Maybe (Opt.ConsInfo, Index.ZeroBased)
+detectConsIdentity rootName argNames expr =
+  allSame (collectConsCandidates rootName argNames expr)
+
+
+collectConsCandidates :: Name.Name -> [Name.Name] -> Can.Expr -> [(Opt.ConsInfo, Index.ZeroBased)]
+collectConsCandidates rootName argNames (A.At _ expression) =
+  case expression of
+    Can.Binop _ home name _ _ right | isListCons home name ->
+      case findHoleIndex rootName argNames [right] of
+        Just _  -> [(Opt.ConsKernel, Index.second)]
+        Nothing -> []
+
+    Can.Call (A.At _ (Can.VarCtor Can.Normal home name _ _)) args ->
+      case findHoleIndex rootName argNames args of
+        Just i  -> [(Opt.ConsCtor (Opt.Global home name) (length args), i)]
+        Nothing -> []
+
+    Can.If branches finally ->
+      concatMap (collectConsCandidates rootName argNames . snd) branches
+        ++ collectConsCandidates rootName argNames finally
+
+    Can.Let _ body ->
+      collectConsCandidates rootName argNames body
+
+    Can.LetRec _ body ->
+      collectConsCandidates rootName argNames body
+
+    Can.LetDestruct _ _ body ->
+      collectConsCandidates rootName argNames body
+
+    Can.Case _ branches ->
+      concatMap (\(Can.CaseBranch _ branch) -> collectConsCandidates rootName argNames branch) branches
+
+    _ ->
+      []
+
+
+consArity :: Opt.ConsInfo -> Int
+consArity consInfo =
+  case consInfo of
+    Opt.ConsKernel   -> 2
+    Opt.ConsCtor _ n -> n
+
+
 -- Does a Can.Expr, if it is exactly a saturated self-call, match the
 -- function being defined? Used for both the ordinary Opt.TailCall case
 -- and (here) the recursive operand of a `::` modulo-cons step.
@@ -615,12 +703,13 @@ optimizePotentialTailCallDef hints cycle def =
 optimizePotentialTailCall :: Hints -> Cycle -> Name.Name -> [Can.Pattern] -> Can.Expr -> Names.Tracker Opt.Def
 optimizePotentialTailCall hints cycle name args expr =
   do  (argNames, destructors) <- destructArgs args
-      toTailDef name argNames destructors <$>
-        optimizeTail hints cycle name argNames expr
+      let consIdentity = detectConsIdentity name argNames expr
+      toTailDef consIdentity name argNames destructors <$>
+        optimizeTail hints cycle consIdentity name argNames expr
 
 
-optimizeTail :: Hints -> Cycle -> Name.Name -> [Name.Name] -> Can.Expr -> Names.Tracker Opt.Expr
-optimizeTail hints cycle rootName argNames locExpr@(A.At _ expression) =
+optimizeTail :: Hints -> Cycle -> Maybe (Opt.ConsInfo, Index.ZeroBased) -> Name.Name -> [Name.Name] -> Can.Expr -> Names.Tracker Opt.Expr
+optimizeTail hints cycle consIdentity rootName argNames locExpr@(A.At _ expression) =
   case expression of
     Can.Call func args ->
       do  oargs <- traverse (optimize hints cycle) args
@@ -645,45 +734,48 @@ optimizeTail hints cycle rootName argNames locExpr@(A.At _ expression) =
                   pure $ Opt.Call ofunc oargs
 
     Can.Binop _ home name _ left right | isListCons home name ->
-      do  maybeRebinds <- matchTailSelfCall hints cycle rootName argNames right
-          case maybeRebinds of
-            Just rebinds ->
-              do  optHead <- optimize hints cycle left
-                  Names.registerKernel Name.list
-                    (Opt.TailCallCons Opt.ConsKernel Index.second rootName [(Index.first, optHead)] rebinds)
+      if consIdentity == Just (Opt.ConsKernel, Index.second) then
+        do  maybeRebinds <- matchTailSelfCall hints cycle rootName argNames right
+            case maybeRebinds of
+              Just rebinds ->
+                do  optHead <- optimize hints cycle left
+                    Names.registerKernel Name.list
+                      (Opt.TailCallCons Opt.ConsKernel Index.second rootName [(Index.first, optHead)] rebinds)
 
-            Nothing ->
-              optimize hints cycle locExpr
+              Nothing ->
+                optimize hints cycle locExpr
+      else
+        optimize hints cycle locExpr
 
     Can.If branches finally ->
       let
         optimizeBranch (condition, branch) =
           (,)
             <$> optimize hints cycle condition
-            <*> optimizeTail hints cycle rootName argNames branch
+            <*> optimizeTail hints cycle consIdentity rootName argNames branch
       in
       Opt.If
         <$> traverse optimizeBranch branches
-        <*> optimizeTail hints cycle rootName argNames finally
+        <*> optimizeTail hints cycle consIdentity rootName argNames finally
 
     Can.Let def body ->
-      optimizeDef hints cycle def =<< optimizeTail hints cycle rootName argNames body
+      optimizeDef hints cycle def =<< optimizeTail hints cycle consIdentity rootName argNames body
 
     Can.LetRec defs body ->
       case defs of
         [def] ->
           Opt.Let
             <$> optimizePotentialTailCallDef hints cycle def
-            <*> optimizeTail hints cycle rootName argNames body
+            <*> optimizeTail hints cycle consIdentity rootName argNames body
 
         _ ->
-          do  obody <- optimizeTail hints cycle rootName argNames body
+          do  obody <- optimizeTail hints cycle consIdentity rootName argNames body
               foldM (\bod def -> optimizeDef hints cycle def bod) obody defs
 
     Can.LetDestruct pattern expr body ->
       do  (dname, destructors) <- destruct pattern
           oexpr <- optimize hints cycle expr
-          obody <- optimizeTail hints cycle rootName argNames body
+          obody <- optimizeTail hints cycle consIdentity rootName argNames body
           pure $
             Opt.Let (Opt.Def dname oexpr) (foldr Opt.Destruct obody destructors)
 
@@ -691,7 +783,7 @@ optimizeTail hints cycle rootName argNames locExpr@(A.At _ expression) =
       let
         optimizeBranch root (Can.CaseBranch pattern branch) =
           do  destructors <- destructCase root pattern
-              obranch <- optimizeTail hints cycle rootName argNames branch
+              obranch <- optimizeTail hints cycle consIdentity rootName argNames branch
               pure (pattern, foldr Opt.Destruct obranch destructors)
       in
       do  temp <- Names.generate
@@ -712,20 +804,18 @@ optimizeTail hints cycle rootName argNames locExpr@(A.At _ expression) =
 -- DETECT TAIL CALLS
 
 
-toTailDef :: Name.Name -> [Name.Name] -> [Opt.Destructor] -> Opt.Expr -> Opt.Def
-toTailDef name argNames destructors body =
-  if hasTailCallCons body then
-    -- Only Kernel List `::` can produce a TailCallCons node at this point
-    -- in the codebase -- general ADT ctor detection is a follow-up task
-    -- (see docs/superpowers/specs/2026-07-03-trmc-general-adt-ctors-design.md).
-    -- Hardcoding ConsKernel/Index.second/arity 2 here is temporary and
-    -- will be replaced by threading a detected identity through.
-    Opt.TailDefCons Opt.ConsKernel Index.second 2 name argNames
-      (wrapConsBase Index.second name (foldr Opt.Destruct body destructors))
-  else if hasTailCall body then
-    Opt.TailDef name argNames (foldr Opt.Destruct body destructors)
-  else
-    Opt.Def name (Opt.Function argNames (foldr Opt.Destruct body destructors))
+toTailDef :: Maybe (Opt.ConsInfo, Index.ZeroBased) -> Name.Name -> [Name.Name] -> [Opt.Destructor] -> Opt.Expr -> Opt.Def
+toTailDef consIdentity name argNames destructors body =
+  case consIdentity of
+    Just (consInfo, holeIndex) | hasTailCallCons body ->
+      Opt.TailDefCons consInfo holeIndex (consArity consInfo) name argNames
+        (wrapConsBase holeIndex name (foldr Opt.Destruct body destructors))
+
+    _ ->
+      if hasTailCall body then
+        Opt.TailDef name argNames (foldr Opt.Destruct body destructors)
+      else
+        Opt.Def name (Opt.Function argNames (foldr Opt.Destruct body destructors))
 
 
 hasTailCall :: Opt.Expr -> Bool
