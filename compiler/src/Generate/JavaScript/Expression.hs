@@ -305,7 +305,7 @@ generateField mode name =
 generateUpdate :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> Code
 generateUpdate mode record fields =
   case mode of
-    Mode.Prod _ _ | hasNestedUpdate fields ->
+    Mode.Prod _ _ ->
       JsExpr $ generateInlineUpdate mode record fields
 
     _ ->
@@ -318,18 +318,6 @@ generateUpdateCall mode record fields =
     [ generateJsExpr mode record
     , generateRecord mode fields
     ]
-
-
-hasNestedUpdate :: Map.Map Name.Name Opt.Expr -> Bool
-hasNestedUpdate =
-  any isUpdate
-
-
-isUpdate :: Opt.Expr -> Bool
-isUpdate expr =
-  case expr of
-    Opt.Update _ _ -> True
-    _              -> False
 
 
 generateInlineUpdate :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> JS.Expr
