@@ -301,9 +301,15 @@ addCycleFunc arities home candidates def =
     Opt.TailDef name params body ->
       addParams arities (Opt.Global home name) params body candidates
 
-    -- no `$unwrapped` sibling for TRMC defs yet (V1; see trmc-plan.md)
-    Opt.TailDefCons _ _ _ _ _ _ ->
-      candidates
+    -- TRMC defs are self-recursive by construction (the modulo-cons
+    -- pattern requires a self-call), so they always reach this branch,
+    -- never Opt.Define/Opt.DefineTailFunc -- see AST.Optimized's Node
+    -- type. They qualify exactly like TailDef: scanParam's `scan`
+    -- already has full TailCallCons/TailCallConsBase coverage (added
+    -- during the general-ADT-ctor generalization, 8233fcb3, purely for
+    -- -Wall exhaustiveness -- nothing consumed it until now).
+    Opt.TailDefCons _ _ _ name params body ->
+      addParams arities (Opt.Global home name) params body candidates
 
 
 addParams

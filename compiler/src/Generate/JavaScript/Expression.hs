@@ -10,6 +10,7 @@ module Generate.JavaScript.Expression
   , generateMain
   , generateUnwrapped
   , generateUnwrappedTail
+  , generateUnwrappedTailCons
   , Code
   , codeToExpr
   , codeToStmtList
@@ -609,6 +610,39 @@ generateUnwrappedHelp isTailFunc mode global@(Opt.Global home name) params body 
               ]
           else
             generate rawMode body
+      in
+      Just $ JS.Var (JsName.fromGlobalUnwrapped home name) $
+        JS.Function Nothing (map JsName.fromLocal params) $
+          codeToStmtList bodyCode
+
+
+-- The `$unwrapped` sibling of a TRMC def (AST.Optimized's TailDefCons,
+-- Generate.JavaScript.Expression's generateTailDefCons): same
+-- sentinel-cell + `$end$` setup as the normal definition, but as a plain
+-- JS function (no F2..F9 wrapper) whose callback parameter is a raw JS
+-- function. Cannot reuse generateUnwrappedHelp: its isTailFunc=True path
+-- only wraps a bare label+while (TailDef's shape) -- TRMC's shape
+-- additionally needs the sentinel cell and `$end$` variable ahead of the
+-- loop, exactly like generateTailDefCons does for the normal variant.
+generateUnwrappedTailCons :: Mode.Mode -> Opt.ConsInfo -> Index.ZeroBased -> Int -> Opt.Global -> [Name.Name] -> Opt.Expr -> Maybe JS.Stmt
+generateUnwrappedTailCons mode consInfo holeIndex arity global@(Opt.Global home name) params body =
+  case Mode.lookupUnwrapped mode global of
+    Nothing ->
+      Nothing
+
+    Just (index, cbArity) ->
+      let
+        rawMode =
+          Mode.setRawLocal (params !! index) cbArity mode
+
+        bodyCode =
+          JsBlock
+            [ JS.Var (JsName.makeMCStart name) (sentinelCell consInfo holeIndex arity)
+            , JS.Var (JsName.makeMCEnd name) (JS.Ref (JsName.makeMCStart name))
+            , JS.Labelled (JsName.fromLocal name) $
+                JS.While (JS.Bool True) $
+                  codeToStmt $ generate rawMode body
+            ]
       in
       Just $ JS.Var (JsName.fromGlobalUnwrapped home name) $
         JS.Function Nothing (map JsName.fromLocal params) $
