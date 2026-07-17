@@ -879,7 +879,8 @@ generateTailCall mode name args =
 
 
 
--- TAIL RECURSION MODULO CONS (Kernel List `::` only, see Optimize.Expression)
+-- TAIL RECURSION MODULO CONS (Kernel List `::` and general single-hole
+-- Can.Normal ADT constructors of arity 1..9, see Optimize.Expression)
 
 
 listCons :: JS.Expr
@@ -916,8 +917,27 @@ generateConsCell consInfo holeIndex otherFields holeValue =
     Opt.ConsCtor (Opt.Global home name) arity | arity >= 2 && arity <= 9 ->
       JS.Call (JS.Access (JS.Ref (JsName.fromGlobal home name)) rawFunctionField) ordered
 
-    Opt.ConsCtor (Opt.Global home name) _arity ->
+    -- Arity-1 ctors are plain unary JS functions (never F-wrapped), so a
+    -- direct call is correct. This is the ONLY other arity that can reach
+    -- here: Optimize.Expression's collectConsCandidates caps ConsCtor
+    -- candidates at `length args <= 9` (so arity >= 10, which would be
+    -- nested curried unary functions with no direct N-ary entry point,
+    -- is disqualified before this module ever sees it), and arity 0 can
+    -- never produce a candidate either, since findHoleIndex requires at
+    -- least one argument to find a self-call hole in. If either of those
+    -- invariants ever changes, this must change too -- crash loudly
+    -- instead of silently dropping arguments like the two bugs this
+    -- safety net exists to prevent.
+    Opt.ConsCtor (Opt.Global home name) 1 ->
       JS.Call (JS.Ref (JsName.fromGlobal home name)) ordered
+
+    Opt.ConsCtor (Opt.Global _ _) arity ->
+      error $
+        "compiler bug: generateConsCell reached with ConsCtor arity "
+        ++ show arity
+        ++ ", expected exactly 1 (arities 2..9 are handled above; 0 and \
+           \10+ should be unreachable per Optimize.Expression's \
+           \collectConsCandidates)"
   where
     ordered = map snd (List.sortOn (Index.toMachine . fst) ((holeIndex, holeValue) : otherFields))
 
