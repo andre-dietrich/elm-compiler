@@ -276,6 +276,12 @@ isDebugger (Opt.Global (ModuleName.Canonical _ home) _) =
   home == Name.debugger
 
 
+-- Reassigns elm/core's List.js "var _List_Nil = { $: 0 };" to Cons's
+-- { $, a, b } shape so V8 sees one hidden class across Cons/Nil (see
+-- docs/superpowers/specs/2026-07-18-kernel-list-shape-padding-design.md).
+-- Relies on _List_Nil being declared with `var` earlier in the same
+-- concatenated kernel text; a rename in elm/core would surface as a
+-- ReferenceError at module load, not a silent no-op.
 padListNil :: Mode.Mode -> Opt.Global -> B.Builder
 padListNil mode global =
   case mode of
