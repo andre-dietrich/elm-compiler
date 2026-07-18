@@ -97,29 +97,37 @@ git commit -m "perf: pad kernel List's _List_Nil to Cons's {\$,a,b} shape in Pro
 
 Elm's compiled output supports `require()` directly: `generate` in `Generate/JavaScript.hs` wraps everything as `(function(scope){...}(this));`, and under Node's CommonJS wrapper `this === module.exports` at a required module's top level, so `const { Elm } = require("./bench.js")` works without any DOM/vm stubbing — no need to touch `document` or `vm.createContext`.
 
+**Binary portability note:** the `elm` binary `cabal build` produces is dynamically linked against the `haskell:9.8.4` image's libraries (Debian 11/glibc 2.31) — do not copy it out and run it directly on the host. Every invocation of the compiler binary below runs inside a `haskell:9.8.4` container (the binary bind-mounted in read-only), exactly like the `elm`/`elm-before` build steps. Only the *compiled JS output* (`node run.js ...`) runs directly on the host — that's plain JS with no GHC runtime dependency, and this host has `node` available (confirmed at plan-execution time).
+
+**No persisted shell state across steps:** each step below is a self-contained bash block using absolute `/tmp` paths throughout — do not rely on a variable or `cd` from one step surviving into the next; assume each step may run as its own tool invocation.
+
 - [ ] **Step 1: Build the "before" reference binary from the pre-change commit**
 
 ```bash
 git worktree add /tmp/elm-kernel-list-padding-before 1fb7b7a6
+mkdir -p /tmp/elm-kernel-list-padding-bin
 docker run --rm -v /tmp/elm-kernel-list-padding-before:/work -w /work \
   -v elm-cabal-home:/root/.cabal -v elm-dist-before:/work/dist-newstyle \
   haskell:9.8.4 bash -c 'export PATH=/opt/ghc/9.8.4/bin:$PATH; cabal build elm --ghc-options=-O0 2>&1 | tail -n 40; exit ${PIPESTATUS[0]}'
 docker run --rm -v /tmp/elm-kernel-list-padding-before:/work -w /work \
   -v elm-cabal-home:/root/.cabal -v elm-dist-before:/work/dist-newstyle \
-  haskell:9.8.4 bash -c 'export PATH=/opt/ghc/9.8.4/bin:$PATH; cp $(cabal list-bin elm) /work/elm-before'
+  -v /tmp/elm-kernel-list-padding-bin:/bin-out \
+  haskell:9.8.4 bash -c 'export PATH=/opt/ghc/9.8.4/bin:$PATH; cp $(cabal list-bin elm) /bin-out/elm-before'
 ```
 
-Expected: `/tmp/elm-kernel-list-padding-before/elm-before` exists (a statically-linked-enough binary usable via the same Docker image as the "after" build).
+Expected: `/tmp/elm-kernel-list-padding-bin/elm-before` exists.
 
-- [ ] **Step 2: Copy the "after" binary out to a stable path the same way**
+- [ ] **Step 2: Copy the "after" binary out to the same stable path**
 
 ```bash
-docker run --rm -v "$PWD":/work -w /work \
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+docker run --rm -v "$REPO_ROOT":/work -w /work \
   -v elm-cabal-home:/root/.cabal -v elm-dist:/work/dist-newstyle \
-  haskell:9.8.4 bash -c 'export PATH=/opt/ghc/9.8.4/bin:$PATH; cp $(cabal list-bin elm) /work/elm-after'
+  -v /tmp/elm-kernel-list-padding-bin:/bin-out \
+  haskell:9.8.4 bash -c 'export PATH=/opt/ghc/9.8.4/bin:$PATH; cp $(cabal list-bin elm) /bin-out/elm-after'
 ```
 
-Expected: `elm-after` appears at the repo root (untracked — do not `git add` it; delete it in Step 8).
+Expected: `/tmp/elm-kernel-list-padding-bin/elm-after` exists. Nothing is written inside the repo checkout itself.
 
 - [ ] **Step 3: Create the scratch project and shared `Worker.elm`**
 
@@ -211,12 +219,25 @@ app.ports.output.subscribe((value) => {
 EOF
 ```
 
+All compiler invocations below share this shape — the binary is bind-mounted read-only into the same base image it was built in, the scratch project is bind-mounted at `/test`, and a persistent named volume backs `ELM_HOME` so `elm/core` is fetched once instead of on every invocation:
+
+```bash
+docker run --rm \
+  -v /tmp/elm-kernel-list-padding-bench:/test \
+  -v /tmp/elm-kernel-list-padding-bin/<BINARY>:/usr/local/bin/elm:ro \
+  -v elm-kernel-list-padding-home:/root/.elm \
+  haskell:9.8.4 bash -c 'cd /test && elm make src/Worker.elm <FLAGS> --output=<OUTPUT>.js'
+```
+
 - [ ] **Step 4: Compile with the "after" binary in `--optimize` and confirm exactly one padding statement**
 
 ```bash
-cd /tmp/elm-kernel-list-padding-bench
-"$OLDPWD/elm-after" make src/Worker.elm --optimize --output=after-prod.js
-grep -c '_List_Nil = { \$: 0, a: null, b: null };' after-prod.js
+docker run --rm \
+  -v /tmp/elm-kernel-list-padding-bench:/test \
+  -v /tmp/elm-kernel-list-padding-bin/elm-after:/usr/local/bin/elm:ro \
+  -v elm-kernel-list-padding-home:/root/.elm \
+  haskell:9.8.4 bash -c 'cd /test && elm make src/Worker.elm --optimize --output=after-prod.js'
+grep -c '_List_Nil = { \$: 0, a: null, b: null };' /tmp/elm-kernel-list-padding-bench/after-prod.js
 ```
 
 Expected: prints `1`.
@@ -224,8 +245,12 @@ Expected: prints `1`.
 - [ ] **Step 5: Compile the same module in Dev mode and confirm the padding statement is absent**
 
 ```bash
-"$OLDPWD/elm-after" make src/Worker.elm --output=after-dev.js
-grep -c '_List_Nil = { \$: 0, a: null, b: null };' after-dev.js || true
+docker run --rm \
+  -v /tmp/elm-kernel-list-padding-bench:/test \
+  -v /tmp/elm-kernel-list-padding-bin/elm-after:/usr/local/bin/elm:ro \
+  -v elm-kernel-list-padding-home:/root/.elm \
+  haskell:9.8.4 bash -c 'cd /test && elm make src/Worker.elm --output=after-dev.js'
+grep -c '_List_Nil = { \$: 0, a: null, b: null };' /tmp/elm-kernel-list-padding-bench/after-dev.js || true
 ```
 
 Expected: prints `0` (`grep -c` reports zero matches; it may exit non-zero, hence `|| true`).
@@ -233,7 +258,13 @@ Expected: prints `0` (`grep -c` reports zero matches; it may exit non-zero, henc
 - [ ] **Step 6: Runtime correctness — Dict/Array/Set sanity and checksum match against the "before" build**
 
 ```bash
-"$OLDPWD/elm-before" make src/Worker.elm --optimize --output=before-prod.js
+docker run --rm \
+  -v /tmp/elm-kernel-list-padding-bench:/test \
+  -v /tmp/elm-kernel-list-padding-bin/elm-before:/usr/local/bin/elm:ro \
+  -v elm-kernel-list-padding-home:/root/.elm \
+  haskell:9.8.4 bash -c 'cd /test && elm make src/Worker.elm --optimize --output=before-prod.js'
+
+cd /tmp/elm-kernel-list-padding-bench
 node run.js ./after-prod.js sanity 0
 node run.js ./before-prod.js sanity 0
 node run.js ./after-prod.js short 1000
@@ -249,6 +280,7 @@ Expected: each pair of `after`/`before` invocations for the same mode prints the
 First, confirm checksums still match at the actual benchmarked size (5,000,000), not just the quick `n=1000` check from Step 6:
 
 ```bash
+cd /tmp/elm-kernel-list-padding-bench
 node run.js ./after-prod.js short 5000000
 node run.js ./before-prod.js short 5000000
 node run.js ./after-prod.js long 5000000
@@ -264,20 +296,20 @@ cat > /tmp/elm-kernel-list-padding-bench/timeit.sh <<'EOF'
 #!/usr/bin/env bash
 # $1 = js file, $2 = mode, $3 = n
 t0=$(date +%s%N)
-node run.js "$1" "$2" "$3" > /dev/null
+node /tmp/elm-kernel-list-padding-bench/run.js "$1" "$2" "$3" > /dev/null
 t1=$(date +%s%N)
 echo $(( (t1 - t0) / 1000000 ))
 EOF
-chmod +x timeit.sh
+chmod +x /tmp/elm-kernel-list-padding-bench/timeit.sh
 
 for i in $(seq 1 15); do
-  echo -n "short after=" ; ./timeit.sh ./after-prod.js short 5000000
-  echo -n "short before="; ./timeit.sh ./before-prod.js short 5000000
+  echo -n "short after=" ; /tmp/elm-kernel-list-padding-bench/timeit.sh /tmp/elm-kernel-list-padding-bench/after-prod.js short 5000000
+  echo -n "short before="; /tmp/elm-kernel-list-padding-bench/timeit.sh /tmp/elm-kernel-list-padding-bench/before-prod.js short 5000000
 done
 
 for i in $(seq 1 15); do
-  echo -n "long after=" ; ./timeit.sh ./after-prod.js long 5000000
-  echo -n "long before="; ./timeit.sh ./before-prod.js long 5000000
+  echo -n "long after=" ; /tmp/elm-kernel-list-padding-bench/timeit.sh /tmp/elm-kernel-list-padding-bench/after-prod.js long 5000000
+  echo -n "long before="; /tmp/elm-kernel-list-padding-bench/timeit.sh /tmp/elm-kernel-list-padding-bench/before-prod.js long 5000000
 done
 ```
 
@@ -286,10 +318,10 @@ Expected, matching the hand-patch spike (memory `kernel-list-padding-spike`): av
 - [ ] **Step 8: Clean up scratch artifacts**
 
 ```bash
-rm -f "$OLDPWD/elm-after"
 git worktree remove /tmp/elm-kernel-list-padding-before --force
 docker volume rm elm-dist-before
-rm -rf /tmp/elm-kernel-list-padding-bench
+docker volume rm elm-kernel-list-padding-home
+rm -rf /tmp/elm-kernel-list-padding-bench /tmp/elm-kernel-list-padding-bin
 ```
 
 No commit for this task — it's verification only, produces no repo changes.
