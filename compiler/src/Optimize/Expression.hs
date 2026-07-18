@@ -108,6 +108,26 @@ optimize hints cycle (A.At region expression) =
           obody <- optimize hints cycle body
           pure $ Opt.Function argNames (foldr Opt.Destruct obody destructors)
 
+    Can.Call func args
+      | Can.VarForeign home name _ <- A.toValue func
+      , home == ModuleName.list, name == "foldl"
+      , [stepArg, accArg, listArg] <- args
+      , (stages@(_:_), source) <- peelChain listArg
+      ->
+          do  optStep    <- optimize hints cycle stepArg
+              optAcc     <- optimize hints cycle accArg
+              optSource  <- optimize hints cycle source
+              composed   <- foldM (wrapStage hints cycle) (baseStepK optStep) stages
+              xName      <- Names.generate
+              accName    <- Names.generate
+              body       <- composed (Opt.VarLocal xName) (Opt.VarLocal accName)
+              optFoldl   <- Names.registerGlobal ModuleName.list "foldl"
+              pure $ Opt.Call optFoldl
+                [ Opt.Function [xName, accName] body
+                , optAcc
+                , optSource
+                ]
+
     Can.Call func args ->
       case toPrimCall hints region func args of
         Just spec ->
@@ -485,6 +505,84 @@ destructCtorArg path revDs (Can.PatternCtorArg index _ arg) =
 isListCons :: ModuleName.Canonical -> Name.Name -> Bool
 isListCons home name =
   home == ModuleName.list && name == "cons"
+
+
+-- LIST PIPELINE FUSION (map/filter -> foldl)
+--
+-- See docs/superpowers/specs/2026-07-18-list-foldl-map-filter-fusion-design.md
+-- for the full derivation and correctness argument. Summary: `List.foldl
+-- step acc (List.map f (List.filter p xs))`-shaped pipelines currently
+-- compile to one full traversal+allocation per producer stage. This peels
+-- map/filter layers off a List.foldl's list argument and, when at least
+-- one layer is found, synthesizes a single composed step function so the
+-- whole pipeline becomes one List.foldl call with zero intermediate lists.
+
+
+-- One layer of a producer chain. Carries the *unoptimized* Can.Expr for
+-- the function/predicate so it gets `optimize`'d in the right place
+-- (inside the synthesized step, not hoisted out of its original scope).
+data ListStage
+  = StageMap Can.Expr Can.Expr     -- f, inner list expr
+  | StageFilter Can.Expr Can.Expr  -- p, inner list expr
+
+
+-- Nothing => not a recognized producer shape (the true source list, or a
+-- fusion barrier this pass doesn't understand, e.g. sortBy/filterMap) =>
+-- stop peeling here. Only elm/core's own List.map/List.filter match;
+-- everything else (including a local `myMap = List.map` alias) falls
+-- through untouched.
+peelListStage :: Can.Expr -> Maybe ListStage
+peelListStage (A.At _ expression) =
+  case expression of
+    Can.Call (A.At _ (Can.VarForeign home name _)) [f, inner]
+      | home == ModuleName.list, name == "map" ->
+          Just (StageMap f inner)
+      | home == ModuleName.list, name == "filter" ->
+          Just (StageFilter f inner)
+    _ ->
+      Nothing
+
+
+stageInner :: ListStage -> Can.Expr
+stageInner (StageMap _ inner)    = inner
+stageInner (StageFilter _ inner) = inner
+
+
+-- Peels as many layers as match, outermost (closest to the foldl) first.
+-- Returns the peeled stages plus whatever expression peeling stopped at.
+peelChain :: Can.Expr -> ([ListStage], Can.Expr)
+peelChain expr =
+  case peelListStage expr of
+    Nothing    -> ([], expr)
+    Just stage -> let (rest, source) = peelChain (stageInner stage) in (stage : rest, source)
+
+
+-- A step continuation: given the current raw element and the current
+-- accumulator (already-`optimize`'d Opt.Expr), produces the new
+-- accumulator. `foldM` over `stages` left-to-right (outermost stage
+-- wrapped first) reconstructs the original evaluation order: a filter's
+-- predicate is checked on the *original* element before any outer map's
+-- transform is applied, exactly as `filter p xs |> map f` implies.
+type StepK = Opt.Expr -> Opt.Expr -> Names.Tracker Opt.Expr
+
+
+baseStepK :: Opt.Expr -> StepK
+baseStepK optStep elemExpr accExpr =
+  pure (Opt.Call optStep [elemExpr, accExpr])
+
+
+wrapStage :: Hints -> Cycle -> StepK -> ListStage -> Names.Tracker StepK
+wrapStage hints cycle inner stage =
+  case stage of
+    StageMap f _ ->
+      do  optF <- optimize hints cycle f
+          pure $ \elemExpr accExpr -> inner (Opt.Call optF [elemExpr]) accExpr
+
+    StageFilter p _ ->
+      do  optP <- optimize hints cycle p
+          pure $ \elemExpr accExpr ->
+            do  thenBranch <- inner elemExpr accExpr
+                pure (Opt.If [(Opt.Call optP [elemExpr], thenBranch)] accExpr)
 
 
 -- Does this list of arguments contain exactly one direct self-call (a
