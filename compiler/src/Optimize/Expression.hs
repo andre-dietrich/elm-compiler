@@ -45,6 +45,39 @@ type Hints =
 optimize :: Hints -> Cycle -> Can.Expr -> Names.Tracker Opt.Expr
 optimize hints cycle (A.At region expression) =
   case expression of
+    -- LIST PIPELINE FUSION trigger. Must be a wildcard-guarded alternative
+    -- (not `Can.Call func args | ...`) because the shape this recognizes
+    -- -- a saturated call to `List.foldl` -- can now arrive either as an
+    -- ordinary Can.Call *or* as a Can.Binop chain of `|>`/`<|` (Basics
+    -- apR/apL), which `collectApplication` normalizes to the same
+    -- (callee, args) shape. A single case alternative can only pattern-match
+    -- one constructor, so this has to sit on `_` and fall through via guard
+    -- failure -- exactly like the narrower `Can.Call func args | ...`
+    -- alternative it replaces -- to every other expression shape, including
+    -- plain `Can.Call` (handled by the next alternative below) and ordinary
+    -- `Can.Binop` (handled further down). See
+    -- docs/superpowers/specs/2026-07-18-list-foldl-map-filter-fusion-design.md,
+    -- "Correction (post-Task-1-review)", for why this moved here.
+    _
+      | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
+      , home == ModuleName.list, name == "foldl"
+      , [stepArg, accArg, listArg] <- args
+      , (stages@(_:_), source) <- peelChain listArg
+      ->
+          do  optStep    <- optimize hints cycle stepArg
+              optAcc     <- optimize hints cycle accArg
+              optSource  <- optimize hints cycle source
+              composed   <- foldM (wrapStage hints cycle) (baseStepK optStep) stages
+              xName      <- Names.generate
+              accName    <- Names.generate
+              body       <- composed (Opt.VarLocal xName) (Opt.VarLocal accName)
+              optFoldl   <- Names.registerGlobal ModuleName.list "foldl"
+              pure $ Opt.Call optFoldl
+                [ Opt.Function [xName, accName] body
+                , optAcc
+                , optSource
+                ]
+
     Can.VarLocal name ->
       pure (Opt.VarLocal name)
 
@@ -107,26 +140,6 @@ optimize hints cycle (A.At region expression) =
       do  (argNames, destructors) <- destructArgs args
           obody <- optimize hints cycle body
           pure $ Opt.Function argNames (foldr Opt.Destruct obody destructors)
-
-    Can.Call func args
-      | Can.VarForeign home name _ <- A.toValue func
-      , home == ModuleName.list, name == "foldl"
-      , [stepArg, accArg, listArg] <- args
-      , (stages@(_:_), source) <- peelChain listArg
-      ->
-          do  optStep    <- optimize hints cycle stepArg
-              optAcc     <- optimize hints cycle accArg
-              optSource  <- optimize hints cycle source
-              composed   <- foldM (wrapStage hints cycle) (baseStepK optStep) stages
-              xName      <- Names.generate
-              accName    <- Names.generate
-              body       <- composed (Opt.VarLocal xName) (Opt.VarLocal accName)
-              optFoldl   <- Names.registerGlobal ModuleName.list "foldl"
-              pure $ Opt.Call optFoldl
-                [ Opt.Function [xName, accName] body
-                , optAcc
-                , optSource
-                ]
 
     Can.Call func args ->
       case toPrimCall hints region func args of
@@ -526,15 +539,44 @@ data ListStage
   | StageFilter Can.Expr Can.Expr  -- p, inner list expr
 
 
+-- Normalizes an application shape into (callee, fully-gathered args),
+-- treating ordinary Can.Call *and* `|>`/`<|` (Basics.apR/apL) uniformly.
+-- Idiomatic Elm pipelines desugar to Can.Binop, not Can.Call -- only
+-- Generate.JavaScript.Expression's `apply` flattens that into a single
+-- call, and that runs in the Generate phase, strictly after
+-- Optimize.Expression (where this fusion pass lives) has already finished.
+-- This mirrors that same flattening one phase earlier, on Can.Expr, so
+-- peelListStage/the foldl trigger below can recognize a List.foldl/map/
+-- filter call site regardless of whether the source wrote it as ordinary
+-- application (`List.foldl step acc xs`) or a pipe
+-- (`xs |> List.foldl step acc`). Recursing into the callee side keeps
+-- chained pipes (`xs |> List.filter p |> List.map f`) flattening all the
+-- way down.
+collectApplication :: Can.Expr -> (Can.Expr, [Can.Expr])
+collectApplication expr@(A.At _ expression) =
+  case expression of
+    Can.Call func args ->
+      (func, args)
+
+    Can.Binop _ home name _ left right
+      | home == ModuleName.basics, name == "apR" ->
+          let (callee, args) = collectApplication right in (callee, args ++ [left])
+      | home == ModuleName.basics, name == "apL" ->
+          let (callee, args) = collectApplication left in (callee, args ++ [right])
+
+    _ ->
+      (expr, [])
+
+
 -- Nothing => not a recognized producer shape (the true source list, or a
 -- fusion barrier this pass doesn't understand, e.g. sortBy/filterMap) =>
 -- stop peeling here. Only elm/core's own List.map/List.filter match;
 -- everything else (including a local `myMap = List.map` alias) falls
 -- through untouched.
 peelListStage :: Can.Expr -> Maybe ListStage
-peelListStage (A.At _ expression) =
-  case expression of
-    Can.Call (A.At _ (Can.VarForeign home name _)) [f, inner]
+peelListStage expr =
+  case collectApplication expr of
+    (A.At _ (Can.VarForeign home name _), [f, inner])
       | home == ModuleName.list, name == "map" ->
           Just (StageMap f inner)
       | home == ModuleName.list, name == "filter" ->
