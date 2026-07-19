@@ -64,19 +64,33 @@ optimize hints cycle (A.At region expression) =
       , [stepArg, accArg, listArg] <- args
       , (stages@(_:_), source) <- peelChain listArg
       ->
-          do  optStep    <- optimize hints cycle stepArg
-              optAcc     <- optimize hints cycle accArg
-              optSource  <- optimize hints cycle source
-              composed   <- foldM (wrapStage hints cycle) (baseStepK optStep) stages
-              xName      <- Names.generate
-              accName    <- Names.generate
-              body       <- composed (Opt.VarLocal xName) (Opt.VarLocal accName)
-              optFoldl   <- Names.registerGlobal ModuleName.list "foldl"
-              pure $ Opt.Call optFoldl
-                [ Opt.Function [xName, accName] body
-                , optAcc
-                , optSource
-                ]
+          do  optStep <- optimize hints cycle stepArg
+              optAcc  <- optimize hints cycle accArg
+              buildFusedFold hints cycle (baseStepK optStep) optAcc stages source
+
+      | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
+      , home == ModuleName.list, name == "sum"
+      , [listArg] <- args
+      , (stages@(_:_), source) <- peelChain listArg
+      ->
+          do  optAdd <- Names.registerGlobal ModuleName.basics "add"
+              buildFusedFold hints cycle (baseStepK optAdd) (Opt.Int 0) stages source
+
+      | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
+      , home == ModuleName.list, name == "product"
+      , [listArg] <- args
+      , (stages@(_:_), source) <- peelChain listArg
+      ->
+          do  optMul <- Names.registerGlobal ModuleName.basics "mul"
+              buildFusedFold hints cycle (baseStepK optMul) (Opt.Int 1) stages source
+
+      | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
+      , home == ModuleName.list, name == "length"
+      , [listArg] <- args
+      , (stages@(_:_), source) <- peelChain listArg
+      ->
+          do  optAdd <- Names.registerGlobal ModuleName.basics "add"
+              buildFusedFold hints cycle (baseStepKLength optAdd) (Opt.Int 0) stages source
 
     Can.VarLocal name ->
       pure (Opt.VarLocal name)
@@ -625,6 +639,36 @@ wrapStage hints cycle inner stage =
           pure $ \elemExpr accExpr ->
             do  thenBranch <- inner elemExpr accExpr
                 pure (Opt.If [(Opt.Call optP [elemExpr], thenBranch)] accExpr)
+
+
+-- Shared tail of every fusion trigger below (foldl/sum/product/length):
+-- given a base step continuation and an initial accumulator value already
+-- as Opt.Expr, peels/composes `stages` over `source` and emits one
+-- ordinary List.foldl call. `initExpr` is Opt.Int 0/1 for sum/length/
+-- product's implicit init, or the user's own already-`optimize`'d acc
+-- argument for foldl.
+buildFusedFold :: Hints -> Cycle -> StepK -> Opt.Expr -> [ListStage] -> Can.Expr -> Names.Tracker Opt.Expr
+buildFusedFold hints cycle base initExpr stages source =
+  do  optSource <- optimize hints cycle source
+      composed  <- foldM (wrapStage hints cycle) base stages
+      xName     <- Names.generate
+      accName   <- Names.generate
+      body      <- composed (Opt.VarLocal xName) (Opt.VarLocal accName)
+      optFoldl  <- Names.registerGlobal ModuleName.list "foldl"
+      pure $ Opt.Call optFoldl
+        [ Opt.Function [xName, accName] body
+        , initExpr
+        , optSource
+        ]
+
+
+-- length's implicit step ignores the element entirely (`\_ i -> i + 1`),
+-- unlike baseStepK which calls a real user-supplied 2-arg step function —
+-- needs its own base continuation rather than reusing baseStepK with a
+-- synthesized lambda.
+baseStepKLength :: Opt.Expr -> StepK
+baseStepKLength optAdd _ accExpr =
+  pure (Opt.Call optAdd [accExpr, Opt.Int 1])
 
 
 -- Does this list of arguments contain exactly one direct self-call (a
