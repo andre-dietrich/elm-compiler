@@ -549,8 +549,9 @@ isListCons home name =
 -- the function/predicate so it gets `optimize`'d in the right place
 -- (inside the synthesized step, not hoisted out of its original scope).
 data ListStage
-  = StageMap Can.Expr Can.Expr     -- f, inner list expr
-  | StageFilter Can.Expr Can.Expr  -- p, inner list expr
+  = StageMap Can.Expr Can.Expr        -- f, inner list expr
+  | StageFilter Can.Expr Can.Expr     -- p, inner list expr
+  | StageFilterMap Can.Expr Can.Expr  -- f, inner list expr
 
 
 -- Normalizes an application shape into (callee, fully-gathered args),
@@ -595,13 +596,16 @@ peelListStage expr =
           Just (StageMap f inner)
       | home == ModuleName.list, name == "filter" ->
           Just (StageFilter f inner)
+      | home == ModuleName.list, name == "filterMap" ->
+          Just (StageFilterMap f inner)
     _ ->
       Nothing
 
 
 stageInner :: ListStage -> Can.Expr
-stageInner (StageMap _ inner)    = inner
-stageInner (StageFilter _ inner) = inner
+stageInner (StageMap _ inner)       = inner
+stageInner (StageFilter _ inner)    = inner
+stageInner (StageFilterMap _ inner) = inner
 
 
 -- Peels as many layers as match, outermost (closest to the foldl) first.
@@ -627,6 +631,46 @@ baseStepK optStep elemExpr accExpr =
   pure (Opt.Call optStep [elemExpr, accExpr])
 
 
+-- Synthesized Maybe union info + Just/Nothing patterns, used to fuse
+-- filterMap's Maybe-producing function via the existing pattern-match
+-- compiler (Optimize.Case/Optimize.DecisionTree) instead of hand-rolling a
+-- ctor-tag test whose Dev/Prod representation this pass would otherwise
+-- have to track itself. The Can.TVar "a" type placeholders are inert:
+-- destructCtorArg discards PatternCtorArg's type field with `_`, and
+-- DecisionTree.testAtPath discards Can.Union's _u_vars with `_` — nothing
+-- past canonicalization reads either, confirmed by reading both call sites.
+maybeUnion :: Can.Union
+maybeUnion =
+  Can.Union ["a"]
+    [ Can.Ctor "Just" Index.first 1 [Can.TVar "a"]
+    , Can.Ctor "Nothing" Index.second 0 []
+    ]
+    2
+    Can.Normal
+
+
+pJust :: Name.Name -> Can.Pattern
+pJust argName =
+  A.At A.zero $ Can.PCtor
+    ModuleName.maybe
+    Name.maybe
+    maybeUnion
+    "Just"
+    Index.first
+    [Can.PatternCtorArg Index.first (Can.TVar "a") (A.At A.zero (Can.PVar argName))]
+
+
+pNothing :: Can.Pattern
+pNothing =
+  A.At A.zero $ Can.PCtor
+    ModuleName.maybe
+    Name.maybe
+    maybeUnion
+    "Nothing"
+    Index.second
+    []
+
+
 wrapStage :: Hints -> Cycle -> StepK -> ListStage -> Names.Tracker StepK
 wrapStage hints cycle inner stage =
   case stage of
@@ -639,6 +683,20 @@ wrapStage hints cycle inner stage =
           pure $ \elemExpr accExpr ->
             do  thenBranch <- inner elemExpr accExpr
                 pure (Opt.If [(Opt.Call optP [elemExpr], thenBranch)] accExpr)
+
+    StageFilterMap f _ ->
+      do  optF <- optimize hints cycle f
+          pure $ \elemExpr accExpr ->
+            do  temp        <- Names.generate
+                yName       <- Names.generate
+                justDs      <- destructCase temp (pJust yName)
+                thenBranch0 <- inner (Opt.VarLocal yName) accExpr
+                let thenBranch = foldr Opt.Destruct thenBranch0 justDs
+                pure $ Opt.Let (Opt.Def temp (Opt.Call optF [elemExpr]))
+                  (Case.optimize temp temp
+                    [ (pJust yName, thenBranch)
+                    , (pNothing, accExpr)
+                    ])
 
 
 -- Shared tail of every fusion trigger below (foldl/sum/product/length):
