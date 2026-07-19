@@ -636,9 +636,11 @@ baseStepK optStep elemExpr accExpr =
 -- compiler (Optimize.Case/Optimize.DecisionTree) instead of hand-rolling a
 -- ctor-tag test whose Dev/Prod representation this pass would otherwise
 -- have to track itself. The Can.TVar "a" type placeholders are inert:
--- destructCtorArg discards PatternCtorArg's type field with `_`, and
--- DecisionTree.testAtPath discards Can.Union's _u_vars with `_` — nothing
--- past canonicalization reads either, confirmed by reading both call sites.
+-- destructHelp's single-arg PCtor case (Just, here) and destructCtorArg's
+-- multi-arg case (unreached by Just/Nothing, but the same discard) both
+-- throw away PatternCtorArg's type field with `_`, and DecisionTree.
+-- testAtPath discards Can.Union's _u_vars with `_` — nothing past
+-- canonicalization reads either, confirmed by reading all three sites.
 maybeUnion :: Can.Union
 maybeUnion =
   Can.Union ["a"]
@@ -702,9 +704,26 @@ wrapStage hints cycle inner stage =
 -- Shared tail of every fusion trigger below (foldl/sum/product/length):
 -- given a base step continuation and an initial accumulator value already
 -- as Opt.Expr, peels/composes `stages` over `source` and emits one
--- ordinary List.foldl call. `initExpr` is Opt.Int 0/1 for sum/length/
--- product's implicit init, or the user's own already-`optimize`'d acc
--- argument for foldl.
+-- ordinary List.foldl call. `initExpr` is the terminator's implicit init
+-- as a literal Opt.Int -- 0 for sum/length, 1 for product -- or the
+-- user's own already-`optimize`'d acc argument for foldl.
+--
+-- Caveat for `length` specifically: baseStepKLength (below) ignores its
+-- element-expression argument via `_`, so when a StageMap sits directly
+-- in front of a `length` terminator, the `Opt.Call optF [elemExpr]`
+-- wrapStage's StageMap case builds for that map is never referenced by
+-- the composed step and is dropped before any Opt.Expr tree is even
+-- returned -- unlike V1's foldl fusion, where a StepK's element argument
+-- always ends up threaded into the emitted step call, this makes the
+-- generated code for `xs |> List.map f |> List.length` never call `f` at
+-- all. Unobservable for a total, effect-free `f` (all this pass's other
+-- correctness claims assume that class of function too), but a real
+-- behavioral difference from the unfused baseline if `f` diverges,
+-- crashes, or (Dev builds) calls Debug.log -- those would fire on every
+-- unfused element and fire zero times fused. Deliberately accepted
+-- (see docs/superpowers/specs/2026-07-19-list-fusion-v2-design.md's
+-- "Why this is semantics-preserving" section), not a bug: `List.length`
+-- is defined not to depend on the mapped values at all.
 buildFusedFold :: Hints -> Cycle -> StepK -> Opt.Expr -> [ListStage] -> Can.Expr -> Names.Tracker Opt.Expr
 buildFusedFold hints cycle base initExpr stages source =
   do  optSource <- optimize hints cycle source
