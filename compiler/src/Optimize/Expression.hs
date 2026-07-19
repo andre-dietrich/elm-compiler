@@ -584,8 +584,8 @@ collectApplication expr@(A.At _ expression) =
 
 
 -- Nothing => not a recognized producer shape (the true source list, or a
--- fusion barrier this pass doesn't understand, e.g. sortBy/filterMap) =>
--- stop peeling here. Only elm/core's own List.map/List.filter match;
+-- fusion barrier this pass doesn't understand, e.g. sortBy/take) =>
+-- stop peeling here. Only elm/core's own List.map/List.filter/List.filterMap match;
 -- everything else (including a local `myMap = List.map` alias) falls
 -- through untouched.
 peelListStage :: Can.Expr -> Maybe ListStage
