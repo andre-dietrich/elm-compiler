@@ -92,6 +92,19 @@ optimize hints cycle (A.At region expression) =
           do  optAdd <- Names.registerGlobal ModuleName.basics "add"
               buildFusedFold hints cycle (baseStepKLength optAdd) (Opt.Int 0) stages source
 
+      -- BARE PRODUCER-CHAIN FUSION trigger (no terminator). Must come
+      -- after all four terminator guards above: if this expression is
+      -- itself a call to foldl/sum/product/length, one of those guards
+      -- already matched and this line is never reached (Haskell tries
+      -- guards top-to-bottom, first match wins). Does NOT call
+      -- collectApplication/match on Can.VarForeign at all -- unlike the
+      -- terminator guards, it doesn't need to identify what function
+      -- this expression is a call to, because there isn't one to check:
+      -- it directly peelChains the whole expression being optimized.
+      | (stages@(_:_:_), source) <- peelChain (A.At region expression)
+      ->
+          buildFusedHelper hints cycle stages source
+
     Can.VarLocal name ->
       pure (Opt.VarLocal name)
 
@@ -746,6 +759,141 @@ buildFusedFold hints cycle base initExpr stages source =
 baseStepKLength :: Opt.Expr -> StepK
 baseStepKLength optAdd _ accExpr =
   pure (Opt.Call optAdd [accExpr, Opt.Int 1])
+
+
+-- BARE PRODUCER-CHAIN FUSION (map/filter/filterMap, no terminator)
+--
+-- See docs/superpowers/specs/2026-07-19-bare-producer-chain-fusion-design.md
+-- for the full derivation and correctness argument. Summary: a producer
+-- chain with no recognized terminator (foldl/sum/product/length) --
+-- e.g. `Html.ul [] (List.map viewItem items)` -- is untouched by V1/V2,
+-- since those only rewrite a *terminator's* list argument. This
+-- synthesizes the Can.Expr a hand-written local recursive helper
+-- (`let helper xs = case xs of [] -> []; x :: rest -> ... in helper
+-- source`) would produce, and feeds it through optimizePotentialTailCall
+-- -- the same entry point a real user-written local recursive `let`
+-- already goes through -- so TRMC's existing sentinel/mutation codegen
+-- compiles it to a single-pass, stack-safe loop for free.
+
+
+-- `Can.Annotation`'s type-inference cache is dead weight past
+-- canonicalization for every use in this pass (mirrors the Can.TVar "a"
+-- placeholders already used for Maybe's synthesized patterns above).
+inertAnnotation :: Can.Annotation
+inertAnnotation =
+  Can.Forall Map.empty (Can.TVar "a")
+
+
+-- `::` as an *expression* is sugar for a Can.Binop on elm/core's
+-- `List.cons`, not Can.Call+VarCtor (see isListCons's comment above) --
+-- this is the exact shape optimizeTail's `Can.Binop _ home name _ left
+-- right | isListCons home name` branch recognizes as a TRMC candidate.
+-- The opSymbol/Annotation fields are pattern-matched as `_` at every
+-- existing call site in this file, confirming they're dead for this
+-- phase.
+consExpr :: Can.Expr -> Can.Expr -> Can.Expr
+consExpr headExpr tailExpr =
+  A.At A.zero (Can.Binop "::" ModuleName.list "cons" inertAnnotation headExpr tailExpr)
+
+
+-- List's `[]`/`::` patterns are dedicated Can.Pattern_ constructors
+-- (PList/PCons), not PCtor-based like Maybe -- no synthesized
+-- Union/Ctor info needed at all.
+pNil :: Can.Pattern
+pNil =
+  A.At A.zero (Can.PList [])
+
+
+pConsHead :: Name.Name -> Name.Name -> Can.Pattern
+pConsHead headName tailName =
+  A.At A.zero $
+    Can.PCons
+      (A.At A.zero (Can.PVar headName))
+      (A.At A.zero (Can.PVar tailName))
+
+
+-- Can-level analogue of StepK: given the Can.Expr for "the current
+-- element at this point in the composed pipeline" (initially the raw
+-- Can.VarLocal bound by the outer PCons pattern; after a
+-- StageMap/StageFilterMap, a fresh reference to that stage's result),
+-- produces the Can.Expr for what happens to it. Threads Names.Tracker
+-- throughout (unlike StepK, which only needs it at its own two call
+-- sites) because StageFilterMap must Names.generate a fresh Just-binder
+-- name once per stage *occurrence* -- a compile-time AST-construction
+-- step, not something that happens once per element at runtime.
+type StepC = Can.Expr -> Names.Tracker Can.Expr
+
+
+-- The fixed recursive step every chain bottoms out at: `elemExpr ::
+-- helper rest`.
+baseStepC :: Can.Expr -> StepC
+baseStepC recurseExpr elemExpr =
+  pure (consExpr elemExpr recurseExpr)
+
+
+-- The fixed "skip this element" action every Filter/FilterMap failure
+-- bottoms out at: bare `helper rest`, no new cell.
+skipExpr :: Can.Expr -> Can.Expr
+skipExpr recurseExpr =
+  recurseExpr
+
+
+-- No Hints/Cycle parameters (unlike wrapStage): those exist there only
+-- to recursively `optimize` a stage's f/p *now*, producing Opt.Expr.
+-- Here f/p stay as unoptimized Can.Expr splices, only reaching
+-- `optimize` later, inside optimizePotentialTailCall's own traversal.
+wrapStageC :: Can.Expr -> StepC -> ListStage -> Names.Tracker StepC
+wrapStageC recurseExpr inner stage =
+  case stage of
+    StageMap f _ ->
+      -- No memoization: `f elemExpr` is textually re-embedded at each
+      -- use `inner` makes of its argument, matching wrapStage's own
+      -- StageFilter precedent (a following StageFilter/StageFilterMap
+      -- checks it once and forwards it once) -- inherited, not a new
+      -- limitation; see the design spec's "Still out of scope".
+      pure $ \elemExpr -> inner (A.At A.zero (Can.Call f [elemExpr]))
+
+    StageFilter p _ ->
+      pure $ \elemExpr ->
+        do  thenBranch <- inner elemExpr
+            pure $ A.At A.zero (Can.If [(A.At A.zero (Can.Call p [elemExpr]), thenBranch)] (skipExpr recurseExpr))
+
+    StageFilterMap f _ ->
+      -- Case-bound, so naturally memoized -- reuses pJust/pNothing/
+      -- maybeUnion verbatim, since they're already Can-level pattern
+      -- builders (defined above by V2), not Opt-level.
+      pure $ \elemExpr ->
+        do  yName      <- Names.generate
+            thenBranch <- inner (A.At A.zero (Can.VarLocal yName))
+            pure $ A.At A.zero $
+              Can.Case (A.At A.zero (Can.Call f [elemExpr]))
+                [ Can.CaseBranch (pJust yName) thenBranch
+                , Can.CaseBranch pNothing (skipExpr recurseExpr)
+                ]
+
+
+-- Top-level assembly: synthesizes `let helper xs = case xs of [] -> [];
+-- x :: rest -> <composed stages> in helper source` and hands the
+-- def-shaped body to optimizePotentialTailCall, which detects the TRMC
+-- shape and returns an Opt.TailDefCons (mixed with plain Opt.TailCall
+-- for the "skip" branches) -- the identical Opt.Def a real user-written
+-- local recursive helper of this exact shape would already produce.
+buildFusedHelper :: Hints -> Cycle -> [ListStage] -> Can.Expr -> Names.Tracker Opt.Expr
+buildFusedHelper hints cycle stages source =
+  do  helperName <- Names.generate
+      paramName  <- Names.generate
+      xName      <- Names.generate
+      restName   <- Names.generate
+      let recurseExpr = A.At A.zero (Can.Call (A.At A.zero (Can.VarLocal helperName)) [A.At A.zero (Can.VarLocal restName)])
+      composed  <- foldM (wrapStageC recurseExpr) (baseStepC recurseExpr) stages
+      consBody  <- composed (A.At A.zero (Can.VarLocal xName))
+      let body = A.At A.zero $ Can.Case (A.At A.zero (Can.VarLocal paramName))
+                   [ Can.CaseBranch pNil (A.At A.zero (Can.List []))
+                   , Can.CaseBranch (pConsHead xName restName) consBody
+                   ]
+      helperDef <- optimizePotentialTailCall hints cycle helperName [A.At A.zero (Can.PVar paramName)] body
+      optSource <- optimize hints cycle source
+      pure $ Opt.Let helperDef (Opt.Call (Opt.VarLocal helperName) [optSource])
 
 
 -- Does this list of arguments contain exactly one direct self-call (a
