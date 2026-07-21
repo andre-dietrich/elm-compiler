@@ -330,14 +330,12 @@ generateInlineUpdate mode record fields =
 
 generateInlineUpdateBody :: Mode.Mode -> Map.Map Name.Name Opt.Expr -> [JS.Stmt]
 generateInlineUpdateBody mode fields =
-  [ JS.Var updateResult (JS.Object [])
-  , JS.ForIn updateKey (JS.Ref updateRecord) $
-      JS.ExprStmt $
-        JS.Assign
-          (JS.LBracket (JS.Ref updateResult) (JS.Ref updateKey))
-          (JS.Index (JS.Ref updateRecord) (JS.Ref updateKey))
-  ]
-  ++ map (generateInlineUpdateField mode) (Map.toList fields)
+  JS.Var updateResult
+    (JS.Call
+      (JS.Access (JS.Ref jsObject) jsAssign)
+      [ JS.Object [], JS.Ref updateRecord ]
+    )
+  : map (generateInlineUpdateField mode) (Map.toList fields)
   ++ [ JS.Return (JS.Ref updateResult) ]
 
 
@@ -369,9 +367,17 @@ updateResult =
   JsName.fromLocal "$updated"
 
 
-updateKey :: JsName.Name
-updateKey =
-  JsName.fromLocal "$key"
+-- Bare references to the JS global `Object.assign`, not Elm/kernel
+-- identifiers. Safe from collision with any real Elm-sourced local: Elm
+-- value identifiers must start lowercase, so `Object` can never be shadowed.
+jsObject :: JsName.Name
+jsObject =
+  JsName.fromLocal "Object"
+
+
+jsAssign :: JsName.Name
+jsAssign =
+  JsName.fromLocal "assign"
 
 
 
