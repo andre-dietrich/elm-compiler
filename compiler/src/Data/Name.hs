@@ -32,6 +32,7 @@ module Data.Name
   , utils, negate, true, false, value
   , node, program, _main, _Main, dollar, identity
   , replModule, replValueToPrint
+  , worker
   )
   where
 
@@ -541,6 +542,11 @@ basics = fromChars "Basics"
 {-# NOINLINE utils #-}
 utils :: Name
 utils = fromChars "Utils"
+
+
+{-# NOINLINE worker #-}
+worker :: Name
+worker = fromChars "Worker"
 
 
 {-# NOINLINE negate #-}

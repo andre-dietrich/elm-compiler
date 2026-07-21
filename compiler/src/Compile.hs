@@ -17,6 +17,7 @@ import qualified Elm.Interface as I
 import qualified Elm.ModuleName as ModuleName
 import qualified Elm.Package as Pkg
 import qualified Nitpick.PatternMatches as PatternMatches
+import qualified Nitpick.Worker as Worker
 import qualified Optimize.Module as Optimize
 import qualified Reporting.Error as E
 import qualified Reporting.Result as R
@@ -45,7 +46,7 @@ compile :: Pkg.Name -> Map.Map ModuleName.Raw I.Interface -> Src.Module -> Eithe
 compile pkg ifaces modul =
   do  canonical            <- canonicalize pkg ifaces modul
       (annotations, hints) <- typeCheck modul canonical
-      ()                   <- nitpick canonical
+      ()                   <- nitpick annotations canonical
       objects              <- optimize modul annotations hints canonical
       return (Artifacts canonical annotations objects)
 
@@ -74,14 +75,19 @@ typeCheck modul canonical =
       Left (E.BadTypes (Localizer.fromModule modul) errors)
 
 
-nitpick :: Can.Module -> Either E.Error ()
-nitpick canonical =
+nitpick :: Map.Map Name.Name Can.Annotation -> Can.Module -> Either E.Error ()
+nitpick annotations canonical =
   case PatternMatches.check canonical of
-    Right () ->
-      Right ()
-
     Left errors ->
       Left (E.BadPatterns errors)
+
+    Right () ->
+      case Worker.check annotations canonical of
+        Right () ->
+          Right ()
+
+        Left errors ->
+          Left (E.BadWorker errors)
 
 
 optimize :: Src.Module -> Map.Map Name.Name Can.Annotation -> Map.Map A.Region Type.PrimType -> Can.Module -> Either E.Error Opt.LocalGraph

@@ -26,6 +26,7 @@ import qualified Reporting.Error.Main as Main
 import qualified Reporting.Error.Pattern as Pattern
 import qualified Reporting.Error.Syntax as Syntax
 import qualified Reporting.Error.Type as Type
+import qualified Reporting.Error.Worker as Worker
 import qualified Reporting.Render.Code as Code
 import qualified Reporting.Render.Type.Localizer as L
 import qualified Reporting.Report as Report
@@ -56,6 +57,7 @@ data Error
   | BadTypes L.Localizer (NE.List Type.Error)
   | BadMains L.Localizer (OneOrMore.OneOrMore Main.Error)
   | BadPatterns (NE.List Pattern.Error)
+  | BadWorker (NE.List Worker.Error)
   | BadDocs Docs.Error
 
 
@@ -83,6 +85,9 @@ toReports source err =
 
     BadPatterns errs ->
       fmap (Pattern.toReport source) errs
+
+    BadWorker errs ->
+      fmap (Worker.toReport source) errs
 
     BadDocs docsErr ->
       Docs.toReports source docsErr

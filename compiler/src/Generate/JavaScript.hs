@@ -27,6 +27,7 @@ import qualified Generate.JavaScript.Expression as Expr
 import qualified Generate.JavaScript.Functions as Functions
 import qualified Generate.JavaScript.Name as JsName
 import qualified Generate.Mode as Mode
+import qualified Nitpick.WorkerRegistry as WorkerRegistry
 import qualified Reporting.Doc as D
 import qualified Reporting.Render.Type as RT
 import qualified Reporting.Render.Type.Localizer as L
@@ -41,16 +42,53 @@ type Mains = Map.Map ModuleName.Canonical Opt.Main
 
 
 generate :: Mode.Mode -> Opt.GlobalGraph -> Mains -> B.Builder
-generate mode (Opt.GlobalGraph graph _) mains =
+generate mode globalGraph@(Opt.GlobalGraph graph _) mains =
   let
     state = Map.foldrWithKey (addMain mode graph) emptyState mains
+    -- Only registers globals that actually made it into this bundle
+    -- (_seenGlobals) -- WorkerRegistry.collect itself scans the whole
+    -- merged program graph, which may include Worker.run call sites from
+    -- modules unreachable from this build's own `mains`.
+    workerTargets = Map.restrictKeys (WorkerRegistry.collect globalGraph) (_seenGlobals state)
   in
   "(function(scope){\n'use strict';"
   <> Functions.functions
   <> perfNote mode
   <> stateToBuilder state
+  <> generateWorkerRegistrations mode workerTargets
   <> toMainExports mode mains
   <> "}(this));"
+
+
+-- WORKER REGISTRY
+--
+-- Emits one `_Worker_register(tag, decodeArg, encodeResult, fn)` call per
+-- top-level function ever passed as a Worker.run target (see
+-- Optimize.Expression's buildWorkerRun), so a Worker-side bootstrap running
+-- this same compiled bundle can dispatch an incoming message to the right
+-- function by name, decode the payload, and encode the reply. The tag is
+-- recomputed here from the Global via JsName.workerTag, the same pure
+-- function buildWorkerRun itself used to embed the matching Opt.Str literal
+-- at the call site -- both sides derive it from nothing but (home, name),
+-- so they can never drift apart. decodeArg/encodeResult come straight from
+-- WorkerRegistry.collect, which pulled them out of that same call node.
+generateWorkerRegistrations :: Mode.Mode -> Map.Map Opt.Global (Opt.Expr, Opt.Expr) -> B.Builder
+generateWorkerRegistrations mode targets =
+  Map.foldrWithKey (\global codecs acc -> registerStmt mode global codecs <> acc) mempty targets
+
+
+registerStmt :: Mode.Mode -> Opt.Global -> (Opt.Expr, Opt.Expr) -> B.Builder
+registerStmt mode global@(Opt.Global home name) (decodeArg, encodeResult) =
+  let
+    registration =
+      Opt.Call (Opt.VarKernel Name.worker "register")
+        [ Opt.Str (JsName.workerTag home name)
+        , decodeArg
+        , encodeResult
+        , Opt.VarGlobal global
+        ]
+  in
+  JS.stmtToBuilder (JS.ExprStmt (Expr.codeToExpr (Expr.generate mode registration)))
 
 
 addMain :: Mode.Mode -> Graph -> ModuleName.Canonical -> Opt.Main -> State -> State

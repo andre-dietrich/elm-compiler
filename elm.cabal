@@ -160,6 +160,8 @@ executable elm
         Generate.Mode
         Nitpick.Debug
         Nitpick.PatternMatches
+        Nitpick.Worker
+        Nitpick.WorkerRegistry
         Optimize.Case
         Optimize.DecisionTree
         Optimize.Expression
@@ -191,6 +193,7 @@ executable elm
         Reporting.Error.Pattern
         Reporting.Error.Syntax
         Reporting.Error.Type
+        Reporting.Error.Worker
         Reporting.Render.Code
         Reporting.Render.Type
         Reporting.Render.Type.Localizer

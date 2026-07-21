@@ -16,6 +16,7 @@ module Elm.Package
   , browser, virtualDom, html
   , json, http, url
   , webgl, linearAlgebra
+  , worker
   --
   , suggestions
   , nearbyNames
@@ -35,6 +36,7 @@ import qualified Data.Coerce as Coerce
 import qualified Data.List as List
 import qualified Data.Map as Map
 import qualified Data.Name as Name
+import qualified Data.Set as Set
 import qualified Data.Utf8 as Utf8
 import GHC.Exts (isTrue#)
 import GHC.Prim
@@ -81,9 +83,21 @@ data Canonical =
 -- HELPERS
 
 
+-- Upstream trusts *authors* (elm, elm-explorations) with kernel/effect-module
+-- syntax. This fork instead trusts individual *packages* by full name for its
+-- own first-party additions (currently just andre-dietrich/worker, see
+-- firstPartyKernelPackages) -- deliberately narrower than an author-level
+-- whitelist, so this doesn't accidentally kernel-enable every future
+-- andre-dietrich/* package. Don't "fix" this into an author check.
 isKernel :: Name -> Bool
-isKernel (Name author _) =
-  author == elm || author == elm_explorations
+isKernel pkg@(Name author _) =
+  author == elm || author == elm_explorations || Set.member pkg firstPartyKernelPackages
+
+
+{-# NOINLINE firstPartyKernelPackages #-}
+firstPartyKernelPackages :: Set.Set Name
+firstPartyKernelPackages =
+  Set.fromList [ worker ]
 
 
 toChars :: Name -> String
@@ -191,6 +205,18 @@ elm =
 elm_explorations :: Author
 elm_explorations =
   Utf8.fromChars "elm-explorations"
+
+
+{-# NOINLINE andreDietrich #-}
+andreDietrich :: Author
+andreDietrich =
+  Utf8.fromChars "andre-dietrich"
+
+
+{-# NOINLINE worker #-}
+worker :: Name
+worker =
+  toName andreDietrich "worker"
 
 
 

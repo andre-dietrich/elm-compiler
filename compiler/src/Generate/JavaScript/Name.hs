@@ -9,6 +9,7 @@ module Generate.JavaScript.Name
   , fromGlobalUnwrapped
   , fromCycle
   , fromKernel
+  , workerTag
   , makeF
   , makeA
   , makeLabel
@@ -24,6 +25,7 @@ module Generate.JavaScript.Name
 
 
 import qualified Data.ByteString.Builder as B
+import qualified Data.ByteString.Lazy.Char8 as BLC
 import qualified Data.Map as Map
 import qualified Data.Name as Name
 import qualified Data.Set as Set
@@ -33,6 +35,7 @@ import Data.Word (Word8)
 import qualified Data.Index as Index
 import qualified Elm.ModuleName as ModuleName
 import qualified Elm.Package as Pkg
+import qualified Elm.String as ES
 
 
 
@@ -85,6 +88,21 @@ fromCycle home name =
 fromKernel :: Name.Name -> Name.Name -> Name
 fromKernel home name =
   Name ("_" <> Name.toBuilder home <> "_" <> Name.toBuilder name)
+
+
+-- The dispatch key a Worker-eligible top-level function is registered and
+-- looked up under at runtime (see Optimize.Expression's Worker.run rewrite
+-- and the whole-program registry scan in builder/Generate.hs). Deliberately
+-- reuses fromGlobal's exact scheme -- Mode.Prod never renames top-level
+-- globals (only record fields/arities), so this is already a stable,
+-- collision-free, Dev/Prod-identical string per global, and it's the same
+-- string the registry-emission pass already has in hand while emitting
+-- each global's own `var $author$project$Module$name = ...` binding.
+workerTag :: ModuleName.Canonical -> Name.Name -> ES.String
+workerTag home name =
+  Name.toElmString $
+    Name.fromChars $
+      BLC.unpack $ B.toLazyByteString $ toBuilder (fromGlobal home name)
 
 
 {-# INLINE homeToBuilder #-}

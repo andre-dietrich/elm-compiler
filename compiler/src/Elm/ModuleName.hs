@@ -14,6 +14,7 @@ module Elm.ModuleName
   , maybe, result, list, array, dict, tuple
   , platform, cmd, sub
   , debug
+  , worker
   , virtualDom
   , jsonDecode, jsonEncode
   , webgl, texture, vector2, vector3, vector4, matrix4
@@ -228,6 +229,11 @@ sub = Canonical Pkg.core "Platform.Sub"
 {-# NOINLINE debug #-}
 debug :: Canonical
 debug = Canonical Pkg.core Name.debug
+
+
+{-# NOINLINE worker #-}
+worker :: Canonical
+worker = Canonical Pkg.worker "Worker"
 
 
 

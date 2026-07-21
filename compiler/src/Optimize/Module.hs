@@ -25,6 +25,7 @@ import qualified Reporting.Annotation as A
 import qualified Reporting.Error.Main as E
 import qualified Reporting.Result as Result
 import qualified Reporting.Warning as W
+import qualified Type.Type as Type
 
 
 
@@ -39,8 +40,9 @@ type Annotations =
   Map.Map Name.Name Can.Annotation
 
 
-optimize :: Annotations -> Expr.Hints -> Can.Module -> Result i [W.Warning] Opt.LocalGraph
-optimize annotations hints (Can.Module home _ _ decls unions aliases _ effects) =
+optimize :: Annotations -> Map.Map A.Region Type.PrimType -> Can.Module -> Result i [W.Warning] Opt.LocalGraph
+optimize annotations primHints (Can.Module home _ _ decls unions aliases _ effects) =
+  let hints = Expr.Hints primHints annotations in
   addDecls home annotations hints decls $
     addEffects home effects $
       addUnions home unions $
