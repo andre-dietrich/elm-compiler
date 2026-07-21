@@ -292,12 +292,17 @@ prior spike's finding):
 6. **Checksum printed and compared on every single run**, not just once at setup — a regression
    introduced partway through a long benchmarking session (e.g. by editing the fixture between
    sizes) is otherwise silently invisible until someone happens to look at the output values.
-7. Watch for **GC-noise outliers at very large live-set sizes**: kernel-list-padding-spike saw
-   15-40% inconsistent outliers at very large N (large heap, major-GC pauses) that vanished when
-   scaled down to a smaller live set. If a size shows wildly inconsistent per-run timings (much
-   larger spread than the smaller sizes), suspect GC pause interference before concluding
-   anything about the candidate — either shrink that size or note the instability explicitly in
-   the memory doc rather than silently discarding it.
+7. Watch for **GC-noise outliers at very large live-set sizes**: html-tag-arity-spike's first
+   attempt (depth=18, ~524287 nodes/call, 10 reps) saw 15-40% inconsistent outliers between runs
+   (GC noise from a large per-process allocation volume) that went away once scaled down to
+   depth=12 (4095 nodes/call, 200 reps/process). kernel-list-padding-spike hit the same failure
+   mode independently, at very large N rather than tree depth: a single long list at
+   N=30,000,000 produced extreme, inconsistent outliers (~990ms vs ~1900ms, sometimes favoring
+   one variant and sometimes the other) that stabilized into clean, consistent measurements once
+   scaled down to N=5,000,000. If a size shows wildly inconsistent per-run timings (much larger
+   spread than the smaller sizes), suspect GC pause interference before concluding anything about
+   the candidate — either shrink that size or note the instability explicitly in the memory doc
+   rather than silently discarding it.
 
 ## 5. Verdict rule
 
