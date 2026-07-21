@@ -13,7 +13,7 @@ design+implementation-plan cycle next.
 |---|------|---------|---------------------|
 | 1 | `mutual-tailcall-cycle-fusion` | **POSITIVE** (two axes, different confidence) | Robustness: unfused mutually-tail-recursive 2-function cycle crashes (`RangeError: Maximum call stack size exceeded`) between N=5,000 and N=8,000 bounces; fused version runs crash-free flat to N=10,000,000 (38.7ms) — categorical, unaffected by the correction below. Speed (corrected after rigor review removed an incidental `modBy`→`%` inlining confound): ~6-8% at N=100 (near noise floor but reproduced over 3 runs), ~23-27% at N=1,000 (robust), ~9-11% at N=5,000 (clear but smaller than originally reported) — size-dependent, no losing regime. |
 | 2 | `decision-tree-dag-sharing` | **Two sub-verdicts**: (A) DAG-sharing **POSITIVE**; (B) cold-branch outlining **POSITIVE BUT CONDITIONAL** | (A) 1.40x-1.46x, flat across 4 orders of magnitude (1e3-1e6), confirmed not a dead-code artifact via control variant. (B) 1.05x-1.12x under skewed call traffic (95% of calls hit 3 of 36 constructor tags) — but 0.92x-1.00x (a **regression**) under uniform traffic across the same 36 tags, reproduced over 2 independent runs at 3 of 4 sizes (4th size at the noise floor in run 2). |
-| 3 | `static-shape-record-clone` | **POSITIVE** | `Object.assign` replacing the `for...in` copy-loop: 2.7x-5.4x, scaling with field count (2.74x-2.92x at 4 fields, 4.99x-5.42x at 12 fields). Fully static object literal (closed field set known): 8.76x-14.0x, independent of whether an IIFE wrapper is kept. Flat across all four tested sizes (1e3-1e6) for both variants. |
+| 3 | `static-shape-record-clone` | **POSITIVE** | `Object.assign` replacing the `for...in` copy-loop: 2.7x-5.4x, scaling with field count (2.74x-2.92x at 4 fields, 4.99x-5.42x at 12 fields). Fully static object literal (closed field set known): 8.76x-13.75x, independent of whether an IIFE wrapper is kept. Flat across all four tested sizes (1e3-1e6) for both variants. |
 | 4 | `closed-type-structural-equality` | **POSITIVE** | 2.0x-3.3x replacing generic `_Utils_eq` walk with flat `===` chains (record) / tag-switch + flat field `===` (union), consistent across sizes 1e3-1e6 and both record and closed-union shapes (record: 2.03x-2.44x; union: 2.23x-3.27x). |
 | 5 | `array-index-adt-tuple-repr` | **NEGATIVE** | Array/index representation (`[tag, a, b]`) is *slower* than the already-shipped padded object representation in every tested size and both sub-cases: combined 0.75x-0.81x, ADT-only 0.74x-0.88x, pure-tuple-only (best case for the hypothesis, no null padding) 0.67x-0.99x — never a win, up to -33% in the worst case. |
 
@@ -39,7 +39,7 @@ scope) — not by magnitude alone:
    `AST.Optimized`/wire-format change** — it is a localized swap inside `generateInlineUpdateBody`.
    Lowest implementation risk, immediately actionable, no new infrastructure required.
 2. **`static-shape-record-clone`, static-literal tier — natural phase 2 of the same initiative.**
-   Substantially bigger win (8.8x-14x, ~3-5x better than the `Object.assign` tier) but requires real
+   Substantially bigger win (8.8x-13.8x, ~3-5x better than the `Object.assign` tier) but requires real
    feature design: the record type's full closed field set must be threaded from type-checking
    through to `Optimize.Expression`/`Opt.Update`, which today only carries the *changed* fields.
    The memory file notes the data already exists for exhaustiveness checks in `Nitpick` but isn't
