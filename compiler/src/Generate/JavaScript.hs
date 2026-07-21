@@ -49,7 +49,7 @@ generate mode globalGraph@(Opt.GlobalGraph graph _) mains =
     -- (_seenGlobals) -- WorkerRegistry.collect itself scans the whole
     -- merged program graph, which may include Worker.run call sites from
     -- modules unreachable from this build's own `mains`.
-    workerTargets = Map.restrictKeys (WorkerRegistry.collect globalGraph) (_seenGlobals state)
+    workerTargets = Set.intersection (WorkerRegistry.collect globalGraph) (_seenGlobals state)
   in
   "(function(scope){\n'use strict';"
   <> Functions.functions
@@ -62,29 +62,27 @@ generate mode globalGraph@(Opt.GlobalGraph graph _) mains =
 
 -- WORKER REGISTRY
 --
--- Emits one `_Worker_register(tag, decodeArg, encodeResult, fn)` call per
--- top-level function ever passed as a Worker.run target (see
--- Optimize.Expression's buildWorkerRun), so a Worker-side bootstrap running
--- this same compiled bundle can dispatch an incoming message to the right
--- function by name, decode the payload, and encode the reply. The tag is
--- recomputed here from the Global via JsName.workerTag, the same pure
--- function buildWorkerRun itself used to embed the matching Opt.Str literal
--- at the call site -- both sides derive it from nothing but (home, name),
--- so they can never drift apart. decodeArg/encodeResult come straight from
--- WorkerRegistry.collect, which pulled them out of that same call node.
-generateWorkerRegistrations :: Mode.Mode -> Map.Map Opt.Global (Opt.Expr, Opt.Expr) -> B.Builder
+-- Emits one `_Worker_register(tag, fn)` call per top-level function ever
+-- passed as a Worker.run target (see Optimize.Expression's buildWorkerRun),
+-- so a Worker-side bootstrap running this same compiled bundle can dispatch
+-- an incoming message to the right function by tag. No codecs to pass
+-- anymore -- Worker.run hands the raw compiled value straight through
+-- postMessage (see Nitpick.Worker's module comment). The tag is recomputed
+-- here from the Global via JsName.workerTag, the same pure function
+-- buildWorkerRun itself used to embed the matching Opt.Str literal at the
+-- call site -- both sides derive it from nothing but (home, name), so they
+-- can never drift apart.
+generateWorkerRegistrations :: Mode.Mode -> Set.Set Opt.Global -> B.Builder
 generateWorkerRegistrations mode targets =
-  Map.foldrWithKey (\global codecs acc -> registerStmt mode global codecs <> acc) mempty targets
+  Set.foldr (\global acc -> registerStmt mode global <> acc) mempty targets
 
 
-registerStmt :: Mode.Mode -> Opt.Global -> (Opt.Expr, Opt.Expr) -> B.Builder
-registerStmt mode global@(Opt.Global home name) (decodeArg, encodeResult) =
+registerStmt :: Mode.Mode -> Opt.Global -> B.Builder
+registerStmt mode global@(Opt.Global home name) =
   let
     registration =
       Opt.Call (Opt.VarKernel Name.worker "register")
         [ Opt.Str (JsName.workerTag home name)
-        , decodeArg
-        , encodeResult
         , Opt.VarGlobal global
         ]
   in

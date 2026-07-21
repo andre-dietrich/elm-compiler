@@ -19,13 +19,11 @@ import qualified Data.Set as Set
 import qualified AST.Canonical as Can
 import qualified AST.Optimized as Opt
 import qualified AST.Utils.Shader as Shader
-import qualified AST.Utils.Type as CanType
 import qualified Data.Index as Index
 import qualified Elm.ModuleName as ModuleName
 import qualified Generate.JavaScript.Name as JsName
 import qualified Optimize.Case as Case
 import qualified Optimize.Names as Names
-import qualified Optimize.Port as Port
 import qualified Reporting.Annotation as A
 import qualified Type.Type as Type
 
@@ -38,25 +36,14 @@ type Cycle =
   Set.Set Name.Name
 
 
--- Bundles two whole-module-derived lookup tables threaded down through
--- every optimize call:
---
--- _primHints: resolved primitive type of comparison/append Binop call
--- sites, keyed by the Binop's region. Populated by Type.Solve from CProbe
+-- A whole-module-derived lookup table threaded down through every optimize
+-- call: resolved primitive type of comparison/append Binop call sites,
+-- keyed by the Binop's region. Populated by Type.Solve from CProbe
 -- constraints; see Type.Type's PrimType. Absent entries mean "not proven
 -- monomorphic", keeping the generic Basics.eq/append call.
---
--- _annotations: every top-level def's inferred type in this module, keyed
--- by name. Needed by the Worker.run call-site rewrite (buildWorkerRun,
--- below) to resolve a `Can.VarTopLevel` fn argument's encoder/decoder
--- types -- unlike Can.VarForeign, VarTopLevel carries no Annotation of its
--- own (see AST.Canonical's Expr_). Bundled into Hints instead of threaded
--- as a separate parameter to avoid touching every optimize/addRecDef*
--- signature in Optimize.Module.
 data Hints =
   Hints
     { _primHints :: Map.Map A.Region Type.PrimType
-    , _annotations :: Map.Map Name.Name Can.Annotation
     }
 
 
@@ -418,21 +405,19 @@ makePrimCall spec left right =
 -- Names.Tracker records every registerGlobal/registerCtor call made while
 -- building this expression, regardless of which arguments the kernel
 -- function actually reads.
+-- No Json.Encode/Decode codecs anymore -- Nitpick.Worker's checkClonable
+-- already proved fnArg's argument/result types are safe to structured-clone,
+-- so this just needs the target's (home, name) to build the dispatch tag and
+-- a global reference to it. See Nitpick/Worker.hs's module comment for why:
+-- the same compiled bundle runs on both sides of the worker boundary, so the
+-- raw compiled JS value can go straight through postMessage.
 buildWorkerRun :: Hints -> Cycle -> Can.Expr -> [Can.Expr] -> Names.Tracker Opt.Expr
 buildWorkerRun hints cycle fnArg dataArgs =
-  do  let (fnHome, fnName, fnType) = resolveFnRef hints fnArg
-      let (argType, resultType) =
-            case CanType.delambda (CanType.deepDealias fnType) of
-              [a, b] -> (a, b)
-              _      -> error "buildWorkerRun: fn must be a plain unary function; Nitpick.Worker should have rejected this"
-      encodeArg    <- Port.toEncoder argType
-      decodeResult <- Port.toDecoder resultType
-      decodeArg    <- Port.toDecoder argType
-      encodeResult <- Port.toEncoder resultType
-      fnGlobal     <- Names.registerGlobal fnHome fnName
-      workerRun    <- Names.registerKernel Name.worker (Opt.VarKernel Name.worker "run")
+  do  let (fnHome, fnName) = resolveFnRef fnArg
+      fnGlobal  <- Names.registerGlobal fnHome fnName
+      workerRun <- Names.registerKernel Name.worker (Opt.VarKernel Name.worker "run")
       let tag = Opt.Str (JsName.workerTag fnHome fnName)
-      let run1 = Opt.Call workerRun [tag, encodeArg, decodeResult, decodeArg, encodeResult, fnGlobal]
+      let run1 = Opt.Call workerRun [tag, fnGlobal]
       case dataArgs of
         [] ->
           pure run1
@@ -443,19 +428,15 @@ buildWorkerRun hints cycle fnArg dataArgs =
 
 
 -- fn is guaranteed to be a bare Can.VarTopLevel/Can.VarForeign reference by
--- Nitpick.Worker; VarForeign carries its own Annotation, VarTopLevel needs
--- the same-module `_annotations` lookup Hints carries for exactly this
--- purpose (see Hints's own comment above).
-resolveFnRef :: Hints -> Can.Expr -> (ModuleName.Canonical, Name.Name, Can.Type)
-resolveFnRef hints (A.At _ expr) =
+-- Nitpick.Worker.
+resolveFnRef :: Can.Expr -> (ModuleName.Canonical, Name.Name)
+resolveFnRef (A.At _ expr) =
   case expr of
     Can.VarTopLevel home name ->
-      case Map.lookup name (_annotations hints) of
-        Just (Can.Forall _ tipe) -> (home, name, tipe)
-        Nothing -> error "buildWorkerRun: missing annotation for a validated Worker.run target"
+      (home, name)
 
-    Can.VarForeign home name (Can.Forall _ tipe) ->
-      (home, name, tipe)
+    Can.VarForeign home name _ ->
+      (home, name)
 
     _ ->
       error "buildWorkerRun: fn is not a bare top-level reference; Nitpick.Worker should have rejected this"

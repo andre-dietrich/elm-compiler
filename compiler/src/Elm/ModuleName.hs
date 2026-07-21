@@ -11,7 +11,7 @@ module Elm.ModuleName
   --
   , Canonical(..)
   , basics, char, string
-  , maybe, result, list, array, dict, tuple
+  , maybe, result, list, array, dict, set, tuple
   , platform, cmd, sub
   , debug
   , worker
@@ -204,6 +204,11 @@ array = Canonical Pkg.core Name.array
 {-# NOINLINE dict #-}
 dict :: Canonical
 dict = Canonical Pkg.core Name.dict
+
+
+{-# NOINLINE set #-}
+set :: Canonical
+set = Canonical Pkg.core Name.set
 
 
 {-# NOINLINE tuple #-}

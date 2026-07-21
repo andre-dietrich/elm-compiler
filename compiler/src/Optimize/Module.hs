@@ -42,7 +42,7 @@ type Annotations =
 
 optimize :: Annotations -> Map.Map A.Region Type.PrimType -> Can.Module -> Result i [W.Warning] Opt.LocalGraph
 optimize annotations primHints (Can.Module home _ _ decls unions aliases _ effects) =
-  let hints = Expr.Hints primHints annotations in
+  let hints = Expr.Hints primHints in
   addDecls home annotations hints decls $
     addEffects home effects $
       addUnions home unions $

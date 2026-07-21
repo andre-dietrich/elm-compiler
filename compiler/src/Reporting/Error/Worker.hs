@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Reporting.Error.Worker
   ( Error(..)
+  , InvalidPayload(..)
   , toReport
   )
   where
@@ -11,7 +12,6 @@ import qualified Data.Name as Name
 import qualified AST.Canonical as Can
 import qualified Reporting.Annotation as A
 import qualified Reporting.Doc as D
-import qualified Reporting.Error.Canonicalize as Canonicalize (InvalidPayload(..))
 import qualified Reporting.Render.Code as Code
 import qualified Reporting.Report as Report
 
@@ -24,7 +24,25 @@ data Error
   = NotATopLevelFunction A.Region
   | UnappliedRun A.Region
   | InCyclicGroup A.Region Name.Name
-  | BadPayload A.Region Can.Type Canonicalize.InvalidPayload
+  | BadPayload A.Region Can.Type InvalidPayload
+
+
+-- Deliberately its own type, not a reuse of Reporting.Error.Canonicalize's
+-- InvalidPayload -- Worker.run's safe-type whitelist is now much larger than
+-- ports' (see Nitpick.Worker's checkClonable), so sharing the type would
+-- either force ports to grow the same cases or force this module to pretend
+-- cases it never produces (UnsupportedType) still apply. OpaqueType covers
+-- both "this type's constructors are genuinely hidden" (a ClosedUnion/
+-- PrivateUnion, e.g. Html.Html) and "this type's constructors aren't visible
+-- from here" (defined in a module reachable only transitively, not directly
+-- imported by the module calling Worker.run -- see Nitpick.Worker's
+-- resolveUnion) -- both boil down to the same fact for the caller: I cannot
+-- prove this type is safe to clone across a worker boundary.
+data InvalidPayload
+  = ExtendedRecord
+  | Function
+  | TypeVariable Name.Name
+  | OpaqueType Name.Name
 
 
 
@@ -89,7 +107,7 @@ toReport source err =
       in
       formatDetails $
         case invalidPayload of
-          Canonicalize.ExtendedRecord ->
+          ExtendedRecord ->
             (
               "an extended record"
             ,
@@ -98,7 +116,7 @@ toReport source err =
                 \ No type variables!"
             )
 
-          Canonicalize.Function ->
+          Function ->
             (
               "a function"
             ,
@@ -107,7 +125,7 @@ toReport source err =
                 \ separate JS context, so only plain data can cross that boundary."
             )
 
-          Canonicalize.TypeVariable name ->
+          TypeVariable name ->
             (
               "an unspecified type"
             ,
@@ -117,15 +135,20 @@ toReport source err =
                 \ crossing that boundary."
             )
 
-          Canonicalize.UnsupportedType name ->
+          OpaqueType name ->
             (
               "a `" <> Name.toChars name <> "` value"
             ,
               D.stack
-                [ D.reflow $ "I cannot handle that. The types that CAN cross a worker boundary include:"
-                , D.indent 4 $
-                    D.reflow $
-                      "Ints, Floats, Bools, Strings, Maybes, Lists, Arrays,\
-                      \ tuples, records, and JSON values."
+                [ D.reflow $
+                    "I cannot verify that `" <> Name.toChars name <> "` is safe to send\
+                    \ to a worker: its constructors are not visible here, either because\
+                    \ the type deliberately hides them (like `Html.Html`) or because it is\
+                    \ defined in a module this one does not import directly."
+                , D.reflow $
+                    "Almost any other type CAN cross a worker boundary: Ints, Floats, Bools,\
+                    \ Chars, Strings, Maybes, Results, Lists, Arrays, Dicts, Sets, tuples,\
+                    \ records, JSON values, and your own custom types (including recursive\
+                    \ ones) -- as long as none of them contain a function."
                 ]
             )

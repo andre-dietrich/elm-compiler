@@ -26,7 +26,7 @@ module Data.Name
   , sepBy
   --
   , int, float, bool, char, string
-  , maybe, result, list, array, dict, tuple, jsArray
+  , maybe, result, list, array, dict, set, tuple, jsArray
   , task, router, cmd, sub, platform, virtualDom
   , shader, debug, debugger, bitwise, basics
   , utils, negate, true, false, value
@@ -472,6 +472,11 @@ array = fromChars "Array"
 {-# NOINLINE dict #-}
 dict :: Name
 dict = fromChars "Dict"
+
+
+{-# NOINLINE set #-}
+set :: Name
+set = fromChars "Set"
 
 
 {-# NOINLINE tuple #-}
