@@ -189,11 +189,23 @@ its inputs) — pick values that crash reliably within a few seconds, not ones t
 
 Single `benchmark/index.html`. One `<section id="...">` per example plus one for the Worker demos (with
 its own two subsections), in the order listed above, each with an anchor-linkable heading, a short
-description quoting the expected numbers as a teaser, a `<pre><code>` block with the representative Elm
-snippet (plain text, no syntax-highlighting dependency), and two columns ("Alt (Elm 0.19.1)" /
-"Neu (dieser Fork)") each with its own "▶ Start" button and lazily-sourced iframe. No cross-frame
-`postMessage` aggregation in v1 — the user visually compares the two panels; each `Benchmark.Runner` /
-custom result view reports its own number independently.
+**explanatory paragraph naming and describing the actual optimization** (not just a number teaser — e.g.
+for List Pipeline Fusion: what fusion/deforestation means, that the naive pipeline builds and discards
+one intermediate list per stage while the fused version emits a single synthesized loop; for TRMC: what
+tail-recursion-modulo-cons rewrites and why naive recursion blows the JS call stack; for Record-Update
+Inlining: that Prod codegen now always compiles a record update to a direct field write instead of a
+runtime helper call, plus what the new dotted-path syntax lets you write instead), followed by the
+measured-number teaser, a `<pre><code>` block with the representative Elm snippet (plain text, no
+syntax-highlighting dependency), and two columns ("Old (Elm 0.19.1)" / "New (this fork)") each with its
+own "▶ Start" button and lazily-sourced iframe. No cross-frame `postMessage` aggregation in v1 — the user
+visually compares the two panels; each `Benchmark.Runner` / custom result view reports its own number
+independently.
+
+**Language: the entire page is in English** — headings, explanatory text, button labels ("Start" /
+"Running…" / "Done"), the Worker section's UI copy, and any inline comments in the example `.elm` sources
+that end up visible to a reader following along. (This repo's own `CLAUDE.md` and internal docs are
+German/mixed, but the showcase is a standalone artifact meant to be shared more broadly, so it stays
+English throughout — including the per-example descriptive paragraphs above.)
 
 ## Testing / verification plan
 
