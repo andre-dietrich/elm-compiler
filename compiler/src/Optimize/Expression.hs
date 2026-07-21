@@ -41,9 +41,17 @@ type Cycle =
 -- keyed by the Binop's region. Populated by Type.Solve from CProbe
 -- constraints; see Type.Type's PrimType. Absent entries mean "not proven
 -- monomorphic", keeping the generic Basics.eq/append call.
+--
+-- _recordShapeHints is the analogous table for record update sites: the
+-- full closed field set of the record being updated, keyed by the update
+-- expression's region, populated by Type.Solve from CRecordProbe
+-- constraints. An absent entry means the record's type wasn't provably
+-- closed at that site (e.g. still row-polymorphic), which keeps the
+-- generic Object.assign-based codegen path.
 data Hints =
   Hints
     { _primHints :: Map.Map A.Region Type.PrimType
+    , _recordShapeHints :: Map.Map A.Region (Set.Set Name.Name)
     }
 
 
@@ -259,9 +267,16 @@ optimize hints cycle (A.At region expression) =
           Names.registerField field (Opt.Access optRecord field)
 
     Can.Update _ record updates ->
-      Names.registerFieldDict updates Opt.Update
-        <*> optimize hints cycle record
-        <*> traverse (optimizeUpdate hints cycle) updates
+      case Map.lookup region (_recordShapeHints hints) of
+        Just closedFields ->
+          Names.registerFieldList (Set.toList closedFields) (\r fs -> Opt.Update r fs (Just closedFields))
+            <*> optimize hints cycle record
+            <*> traverse (optimizeUpdate hints cycle) updates
+
+        Nothing ->
+          Names.registerFieldDict updates (\r fs -> Opt.Update r fs Nothing)
+            <*> optimize hints cycle record
+            <*> traverse (optimizeUpdate hints cycle) updates
 
     Can.Record fields ->
       Names.registerFieldDict fields Opt.Record

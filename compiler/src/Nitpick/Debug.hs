@@ -62,7 +62,7 @@ hasDebug expression =
     Opt.Case _ _ d jumps -> deciderHasDebug d || any (hasDebug . snd) jumps
     Opt.Accessor _       -> False
     Opt.Access r _       -> hasDebug r
-    Opt.Update r fs      -> hasDebug r || any hasDebug fs
+    Opt.Update r fs _    -> hasDebug r || any hasDebug fs
     Opt.Record fs        -> any hasDebug fs
     Opt.Unit             -> False
     Opt.Tuple a b c      -> hasDebug a || hasDebug b || maybe False hasDebug c

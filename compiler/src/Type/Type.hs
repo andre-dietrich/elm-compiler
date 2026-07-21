@@ -10,6 +10,7 @@ module Type.Type
   , SuperType(..)
   , PrimType(..)
   , toPrimType
+  , toClosedFields
   , noRank
   , outermostRank
   , Mark
@@ -35,6 +36,7 @@ import qualified Control.Monad.State.Strict as State
 import Data.Foldable (foldrM)
 import qualified Data.Map.Strict as Map
 import qualified Data.Name as Name
+import qualified Data.Set as Set
 import Data.Word (Word32)
 
 import qualified AST.Canonical as Can
@@ -58,6 +60,7 @@ data Constraint
   | CForeign A.Region Name.Name Can.Annotation (E.Expected Type)
   | CPattern A.Region E.PCategory Type (E.PExpected Type)
   | CProbe A.Region Variable Variable
+  | CRecordProbe A.Region Variable
   | CAnd [Constraint]
   | CLet
       { _rigidVars :: [Variable]
@@ -255,6 +258,38 @@ toPrimType variable =
 
         Alias _ _ _ realVariable ->
           toPrimType realVariable
+
+        _ ->
+          return Nothing
+
+
+
+-- CLOSED RECORD FIELD PROBES
+--
+-- Used to record, for a `CRecordProbe` constraint, the full field set of a
+-- record-typed Variable -- but only if it is genuinely closed (its
+-- extension bottoms out at EmptyRecord1). A record type that is still
+-- polymorphic over an extension variable (e.g. a function argument typed
+-- `{ r | x : Int }`) can only be resolved to a concrete field set at each
+-- of the function's call sites, never at the function's own definition, so
+-- this deliberately returns Nothing in that case -- see
+-- Generate.JavaScript.Expression's fallback to the Object.assign path for
+-- record updates whose shape can't be proven closed here.
+
+
+toClosedFields :: Variable -> IO (Maybe (Set.Set Name.Name))
+toClosedFields variable =
+  do  (Descriptor content _ _ _) <- UF.get variable
+      case content of
+        Structure EmptyRecord1 ->
+          return (Just Set.empty)
+
+        Structure (Record1 fields extVar) ->
+          do  maybeExtFields <- toClosedFields extVar
+              return (Set.union (Map.keysSet fields) <$> maybeExtFields)
+
+        Alias _ _ _ realVariable ->
+          toClosedFields realVariable
 
         _ ->
           return Nothing

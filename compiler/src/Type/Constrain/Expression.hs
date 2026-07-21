@@ -447,7 +447,7 @@ constrainUpdate rtv region name expr fields expected =
 
       con <- constrain rtv expr (FromContext region (RecordUpdateKeys name fields) recordType)
 
-      return $ exists vars $ CAnd (fieldsCon:con:cons)
+      return $ exists vars $ CAnd (fieldsCon : con : CRecordProbe region recordVar : cons)
 
 
 constrainUpdateField :: RTV -> A.Region -> Name.Name -> Can.FieldUpdate -> IO (Variable, Type, Constraint)

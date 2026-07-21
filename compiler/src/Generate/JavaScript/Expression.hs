@@ -125,8 +125,8 @@ generate mode expression =
     Opt.Access record field ->
       JsExpr $ JS.Access (generateJsExpr mode record) (generateField mode field)
 
-    Opt.Update record fields ->
-      generateUpdate mode record fields
+    Opt.Update record fields maybeClosedFields ->
+      generateUpdate mode record fields maybeClosedFields
 
     Opt.Record fields ->
       JsExpr $ generateRecord mode fields
@@ -303,11 +303,11 @@ generateField mode name =
 -- RECORD UPDATES
 
 
-generateUpdate :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> Code
-generateUpdate mode record fields =
+generateUpdate :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> Maybe (Set.Set Name.Name) -> Code
+generateUpdate mode record fields maybeClosedFields =
   case mode of
     Mode.Prod _ _ ->
-      JsExpr $ generateInlineUpdate mode record fields
+      JsExpr $ generateInlineUpdate mode record fields maybeClosedFields
 
     _ ->
       JsExpr $ generateUpdateCall mode record fields
@@ -321,22 +321,46 @@ generateUpdateCall mode record fields =
     ]
 
 
-generateInlineUpdate :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> JS.Expr
-generateInlineUpdate mode record fields =
+generateInlineUpdate :: Mode.Mode -> Opt.Expr -> Map.Map Name.Name Opt.Expr -> Maybe (Set.Set Name.Name) -> JS.Expr
+generateInlineUpdate mode record fields maybeClosedFields =
   JS.Call
-    (JS.Function Nothing [updateRecord] (generateInlineUpdateBody mode fields))
+    (JS.Function Nothing [updateRecord] (generateInlineUpdateBody mode fields maybeClosedFields))
     [ generateJsExpr mode record ]
 
 
-generateInlineUpdateBody :: Mode.Mode -> Map.Map Name.Name Opt.Expr -> [JS.Stmt]
-generateInlineUpdateBody mode fields =
-  JS.Var updateResult
-    (JS.Call
-      (JS.Access (JS.Ref jsObject) jsAssign)
-      [ JS.Object [], JS.Ref updateRecord ]
-    )
-  : map (generateInlineUpdateField mode) (Map.toList fields)
-  ++ [ JS.Return (JS.Ref updateResult) ]
+generateInlineUpdateBody :: Mode.Mode -> Map.Map Name.Name Opt.Expr -> Maybe (Set.Set Name.Name) -> [JS.Stmt]
+generateInlineUpdateBody mode fields maybeClosedFields =
+  case maybeClosedFields of
+    -- Full closed field set known: emit a static object literal directly,
+    -- every field either the new value or a read-through of $record, so
+    -- every update site for the same record type produces the identical
+    -- key order (Set.toAscList's Name.Name Ord instance) and V8 can share
+    -- one hidden class across them.
+    Just closedFields ->
+      [ JS.Return $ JS.Object $
+          map (generateStaticUpdateEntry mode fields) (Set.toAscList closedFields)
+      ]
+
+    -- Not provably closed (still row-polymorphic at this update site):
+    -- fall back to copying the whole record with Object.assign, then
+    -- overwriting just the changed fields.
+    Nothing ->
+      JS.Var updateResult
+        (JS.Call
+          (JS.Access (JS.Ref jsObject) jsAssign)
+          [ JS.Object [], JS.Ref updateRecord ]
+        )
+      : map (generateInlineUpdateField mode) (Map.toList fields)
+      ++ [ JS.Return (JS.Ref updateResult) ]
+
+
+generateStaticUpdateEntry :: Mode.Mode -> Map.Map Name.Name Opt.Expr -> Name.Name -> (JsName.Name, JS.Expr)
+generateStaticUpdateEntry mode fields field =
+  ( generateField mode field
+  , case Map.lookup field fields of
+      Just value -> generateInlineUpdateValue mode value
+      Nothing    -> JS.Access (JS.Ref updateRecord) (generateField mode field)
+  )
 
 
 generateInlineUpdateField :: Mode.Mode -> (Name.Name, Opt.Expr) -> JS.Stmt
@@ -350,8 +374,8 @@ generateInlineUpdateField mode (field, value) =
 generateInlineUpdateValue :: Mode.Mode -> Opt.Expr -> JS.Expr
 generateInlineUpdateValue mode value =
   case value of
-    Opt.Update record fields ->
-      generateInlineUpdate mode record fields
+    Opt.Update record fields maybeClosedFields ->
+      generateInlineUpdate mode record fields maybeClosedFields
 
     _ ->
       generateJsExpr mode value

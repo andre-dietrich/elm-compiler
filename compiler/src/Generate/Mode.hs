@@ -417,7 +417,7 @@ scanParam arities self param body =
           merges (scan final : concatMap (\(c, b) -> [scan c, scan b]) branches)
 
         Opt.Access record _  -> scan record
-        Opt.Update record fields -> merges (scan record : map scan (Map.elems fields))
+        Opt.Update record fields _ -> merges (scan record : map scan (Map.elems fields))
         Opt.Record fields    -> merges (map scan (Map.elems fields))
         Opt.Tuple a b maybeC -> merges [scan a, scan b, maybe none scan maybeC]
         Opt.List entries     -> merges (map scan entries)

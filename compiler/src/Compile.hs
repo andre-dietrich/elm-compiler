@@ -8,6 +8,7 @@ module Compile
 
 import qualified Data.Map as Map
 import qualified Data.Name as Name
+import qualified Data.Set as Set
 
 import qualified AST.Source as Src
 import qualified AST.Canonical as Can
@@ -44,10 +45,10 @@ data Artifacts =
 
 compile :: Pkg.Name -> Map.Map ModuleName.Raw I.Interface -> Src.Module -> Either E.Error Artifacts
 compile pkg ifaces modul =
-  do  canonical            <- canonicalize pkg ifaces modul
-      (annotations, hints) <- typeCheck modul canonical
-      ()                   <- nitpick ifaces annotations canonical
-      objects              <- optimize modul annotations hints canonical
+  do  canonical                         <- canonicalize pkg ifaces modul
+      (annotations, hints, shapeHints)  <- typeCheck modul canonical
+      ()                                <- nitpick ifaces annotations canonical
+      objects                           <- optimize modul annotations hints shapeHints canonical
       return (Artifacts canonical annotations objects)
 
 
@@ -65,7 +66,7 @@ canonicalize pkg ifaces modul =
       Left $ E.BadNames errors
 
 
-typeCheck :: Src.Module -> Can.Module -> Either E.Error (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType)
+typeCheck :: Src.Module -> Can.Module -> Either E.Error (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType, Map.Map A.Region (Set.Set Name.Name))
 typeCheck modul canonical =
   case unsafePerformIO (Type.run =<< Type.constrain canonical) of
     Right result ->
@@ -90,9 +91,9 @@ nitpick ifaces annotations canonical =
           Left (E.BadWorker errors)
 
 
-optimize :: Src.Module -> Map.Map Name.Name Can.Annotation -> Map.Map A.Region Type.PrimType -> Can.Module -> Either E.Error Opt.LocalGraph
-optimize modul annotations hints canonical =
-  case snd $ R.run $ Optimize.optimize annotations hints canonical of
+optimize :: Src.Module -> Map.Map Name.Name Can.Annotation -> Map.Map A.Region Type.PrimType -> Map.Map A.Region (Set.Set Name.Name) -> Can.Module -> Either E.Error Opt.LocalGraph
+optimize modul annotations hints shapeHints canonical =
+  case snd $ R.run $ Optimize.optimize annotations hints shapeHints canonical of
     Right localGraph ->
       Right localGraph
 

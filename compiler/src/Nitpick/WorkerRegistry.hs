@@ -89,7 +89,7 @@ exprTargets expression =
     Opt.Case _ _ decider jumps -> deciderTargets decider <> foldMap (exprTargets . snd) jumps
     Opt.Accessor _       -> Set.empty
     Opt.Access r _       -> exprTargets r
-    Opt.Update r fs      -> exprTargets r <> foldMap exprTargets fs
+    Opt.Update r fs _    -> exprTargets r <> foldMap exprTargets fs
     Opt.Record fs        -> foldMap exprTargets fs
     Opt.Unit             -> Set.empty
     Opt.Tuple a b c      -> exprTargets a <> exprTargets b <> maybe Set.empty exprTargets c

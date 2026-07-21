@@ -10,6 +10,7 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict ((!))
 import qualified Data.Name as Name
 import qualified Data.NonEmptyList as NE
+import qualified Data.Set as Set
 import qualified Data.Vector as Vector
 import qualified Data.Vector.Mutable as MVector
 
@@ -29,18 +30,19 @@ import qualified Type.UnionFind as UF
 -- RUN SOLVER
 
 
-run :: Constraint -> IO (Either (NE.List Error.Error) (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType))
+run :: Constraint -> IO (Either (NE.List Error.Error) (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType, Map.Map A.Region (Set.Set Name.Name)))
 run constraint =
   do  pools <- MVector.replicate 8 []
 
-      (State env _ errors probes) <-
+      (State env _ errors probes recordProbes) <-
         solve Map.empty outermostRank pools emptyState constraint
 
       case errors of
         [] ->
           do  annotations <- traverse Type.toAnnotation env
               hints <- resolveProbes probes
-              return $ Right (annotations, hints)
+              shapeHints <- resolveRecordProbes recordProbes
+              return $ Right (annotations, hints, shapeHints)
 
         e:es ->
           return $ Left (NE.List e es)
@@ -50,7 +52,7 @@ run constraint =
 {-# NOINLINE emptyState #-}
 emptyState :: State
 emptyState =
-  State Map.empty (nextMark noMark) [] []
+  State Map.empty (nextMark noMark) [] [] []
 
 
 
@@ -72,6 +74,23 @@ addProbe hints (region, leftVar, rightVar) =
 
 
 
+-- RECORD SHAPE HINTS
+
+
+resolveRecordProbes :: [(A.Region, Variable)] -> IO (Map.Map A.Region (Set.Set Name.Name))
+resolveRecordProbes probes =
+  foldM addRecordProbe Map.empty probes
+
+
+addRecordProbe :: Map.Map A.Region (Set.Set Name.Name) -> (A.Region, Variable) -> IO (Map.Map A.Region (Set.Set Name.Name))
+addRecordProbe hints (region, var) =
+  do  maybeFields <- Type.toClosedFields var
+      return $ case maybeFields of
+        Just fields -> Map.insert region fields hints
+        Nothing     -> hints
+
+
+
 -- SOLVER
 
 
@@ -89,6 +108,7 @@ data State =
     , _mark :: Mark
     , _errors :: [Error.Error]
     , _probes :: [(A.Region, Variable, Variable)]
+    , _recordProbes :: [(A.Region, Variable)]
     }
 
 
@@ -164,6 +184,9 @@ solve env rank pools state constraint =
     CProbe region leftVar rightVar ->
       return $ state { _probes = (region, leftVar, rightVar) : _probes state }
 
+    CRecordProbe region var ->
+      return $ state { _recordProbes = (region, var) : _recordProbes state }
+
     CAnd constraints ->
       foldM (solve env rank pools) state constraints
 
@@ -197,7 +220,7 @@ solve env rank pools state constraint =
 
           -- run solver in next pool
           locals <- traverse (A.traverse (typeToVariable nextRank nextPools)) header
-          (State savedEnv mark errors probes) <-
+          (State savedEnv mark errors probes recordProbes) <-
             solve env nextRank nextPools state headerCon
 
           let youngMark = mark
@@ -212,7 +235,7 @@ solve env rank pools state constraint =
           mapM_ isGeneric rigids
 
           let newEnv = Map.union env (Map.map A.toValue locals)
-          let tempState = State savedEnv finalMark errors probes
+          let tempState = State savedEnv finalMark errors probes recordProbes
           newState <- solve newEnv rank nextPools tempState subCon
 
           foldM occurs newState (Map.toList locals)
@@ -268,8 +291,8 @@ patternExpectationToVariable rank pools expectation =
 
 
 addError :: State -> Error.Error -> State
-addError (State savedEnv rank errors probes) err =
-  State savedEnv rank (err:errors) probes
+addError (State savedEnv rank errors probes recordProbes) err =
+  State savedEnv rank (err:errors) probes recordProbes
 
 
 

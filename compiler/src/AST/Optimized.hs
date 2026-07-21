@@ -79,7 +79,12 @@ data Expr
   | Case Name Name (Decider Choice) [(Int, Expr)]
   | Accessor Name
   | Access Expr Name
-  | Update Expr (Map.Map Name Expr)
+  -- The Maybe (Set.Set Name) is the record's full closed field set, when
+  -- the type checker proved it closed (see Type.Type's toClosedFields) --
+  -- lets Generate.JavaScript emit a static object literal instead of an
+  -- Object.assign-based copy. Nothing means "not provably closed" (e.g.
+  -- still row-polymorphic), which keeps the Object.assign fallback.
+  | Update Expr (Map.Map Name Expr) (Maybe (Set.Set Name))
   | Record (Map.Map Name Expr)
   | Unit
   | Tuple Expr Expr (Maybe Expr)
@@ -328,7 +333,7 @@ instance Binary Expr where
       Case a b c d     -> putWord8 19 >> put a >> put b >> put c >> put d
       Accessor a       -> putWord8 20 >> put a
       Access a b       -> putWord8 21 >> put a >> put b
-      Update a b       -> putWord8 22 >> put a >> put b
+      Update a b c     -> putWord8 22 >> put a >> put b >> put c
       Record a         -> putWord8 23 >> put a
       Unit             -> putWord8 24
       Tuple a b c      -> putWord8 25 >> put a >> put b >> put c
@@ -362,7 +367,7 @@ instance Binary Expr where
           19 -> liftM4 Case get get get get
           20 -> liftM  Accessor get
           21 -> liftM2 Access get get
-          22 -> liftM2 Update get get
+          22 -> liftM3 Update get get get
           23 -> liftM  Record get
           24 -> pure   Unit
           25 -> liftM3 Tuple get get get
