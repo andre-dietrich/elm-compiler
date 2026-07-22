@@ -123,6 +123,15 @@ optimize hints cycle (A.At region expression) =
               optAcc  <- optimize hints cycle accArg
               buildFusedDictFold hints cycle (baseDictStepK optStep) optAcc stages source
 
+      | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
+      , home == ModuleName.set, name == "foldl"
+      , [stepArg, accArg, setArg] <- args
+      , (stages@(_:_), source) <- peelSetChain setArg
+      ->
+          do  optStep <- optimize hints cycle stepArg
+              optAcc  <- optimize hints cycle accArg
+              buildFusedSetFold hints cycle (baseSetStepK optStep) optAcc stages source
+
       -- WORKER.RUN call-site rewrite. Requires at least one argument
       -- (fnArg : dataArgs) so a bare, unapplied `Worker.run` falls through
       -- to the plain Can.VarForeign case further below instead (compiled
@@ -1041,6 +1050,97 @@ buildFusedDictFold hints cycle base initExpr stages source =
         , initExpr
         , optSource
         ]
+
+
+-- SET PIPELINE FUSION (filter -> foldl)
+--
+-- See docs/superpowers/specs/2026-07-22-set-filter-foldl-fusion-design.md for
+-- the full derivation. `Set` is a `Can.Unbox` type (`type Set a =
+-- Set_elm_builtin (Dict a ())`) that erases to a bare `Dict` value at
+-- runtime, so `Set.filter`/`Set.foldl` are thin wrappers straight into
+-- `Dict.filter$unwrapped`/`Dict.foldl$unwrapped` -- but DICT PIPELINE FUSION
+-- above only recognizes calls whose home is `ModuleName.dict`, so a
+-- `Set.filter -> Set.foldl` chain fell through unfused even after that
+-- change shipped. Only `filter` is fused here, not `map`: `elm/core`'s
+-- `Set.map` is `fromList (foldl (\x xs -> func x :: xs) [] set)`, which can
+-- reorder keys and therefore needs a real rebuild regardless -- no
+-- DStageMap-style analogue is safe here.
+
+
+-- One layer of a Set producer chain. Only filter is a fusable producer (see
+-- above), so this has a single constructor -- kept as its own type rather
+-- than reusing DictStage since a Set chain can never contain a map stage.
+data SetStage
+  = SStageFilter Can.Expr Can.Expr  -- p, inner set expr
+
+
+setStageInner :: SetStage -> Can.Expr
+setStageInner (SStageFilter _ inner) = inner
+
+
+-- Nothing => not a recognized Set producer shape => stop peeling here. Only
+-- elm/core's own Set.filter matches (via either Can.Call or |>/<| syntax,
+-- thanks to collectApplication); everything else (including Set.map and
+-- Set.foldr, neither fused by this plan) falls through untouched.
+peelSetStage :: Can.Expr -> Maybe SetStage
+peelSetStage expr =
+  case collectApplication expr of
+    (A.At _ (Can.VarForeign home name _), [p, inner])
+      | home == ModuleName.set, name == "filter" ->
+          Just (SStageFilter p inner)
+    _ ->
+      Nothing
+
+
+-- Peels as many layers as match, outermost (closest to the foldl) first.
+-- Mirrors peelDictChain's recursion exactly, built on peelSetStage instead.
+peelSetChain :: Can.Expr -> ([SetStage], Can.Expr)
+peelSetChain expr =
+  case peelSetStage expr of
+    Nothing    -> ([], expr)
+    Just stage -> let (rest, source) = peelSetChain (setStageInner stage) in (stage : rest, source)
+
+
+-- A step continuation carrying the element and accumulator -- the Set
+-- analogue of DictStepK, narrowed to two arguments since Set.foldl's step
+-- has no separate key/value split (the element doubles as the key).
+type SetStepK = Opt.Expr -> Opt.Expr -> Names.Tracker Opt.Expr
+
+
+baseSetStepK :: Opt.Expr -> SetStepK
+baseSetStepK optStep elemExpr accExpr =
+  pure (Opt.Call optStep [elemExpr, accExpr])
+
+
+wrapSetStage :: Hints -> Cycle -> SetStepK -> SetStage -> Names.Tracker SetStepK
+wrapSetStage hints cycle inner stage =
+  case stage of
+    SStageFilter p _ ->
+      do  optP <- optimize hints cycle p
+          pure $ \elemExpr accExpr ->
+            do  thenBranch <- inner elemExpr accExpr
+                pure (Opt.If [(Opt.Call optP [elemExpr], thenBranch)] accExpr)
+
+
+-- Mirrors buildFusedDictFold, except the synthesized step function takes two
+-- parameters (elem, acc) instead of three, matching Set.foldl's real
+-- (comparable -> b -> b) shape. Registers Set.foldl itself as the
+-- terminator (not Dict.foldl directly), keeping the change local to what a
+-- user's Set.foldl call already resolves to.
+buildFusedSetFold :: Hints -> Cycle -> SetStepK -> Opt.Expr -> [SetStage] -> Can.Expr -> Names.Tracker Opt.Expr
+buildFusedSetFold hints cycle base initExpr stages source =
+  do  optSource <- optimize hints cycle source
+      composed  <- foldM (wrapSetStage hints cycle) base stages
+      elemName  <- Names.generate
+      accName   <- Names.generate
+      body      <- composed (Opt.VarLocal elemName) (Opt.VarLocal accName)
+      optFoldl  <- Names.registerGlobal ModuleName.set "foldl"
+      pure $ Opt.Call optFoldl
+        [ Opt.Function [elemName, accName] body
+        , initExpr
+        , optSource
+        ]
+
 
 -- BARE PRODUCER-CHAIN FUSION (map/filter/filterMap, no terminator)
 --
