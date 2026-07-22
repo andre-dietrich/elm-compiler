@@ -74,12 +74,49 @@ found):
   peeling function in this file) to `Dict.toList`/`Dict.keys`/`Dict.values`/`Set.toList`/
   `Array.toList`. Nothing for anything else (including a local alias, or `Dict.foldr`-based
   hand-written conversions this pass doesn't special-case).
-- `buildFusedCrossFold :: Hints -> Cycle -> StepK -> Opt.Expr -> [ListStage] -> CrossBase ->
-  Names.Tracker Opt.Expr` — composes `stages` via the existing `wrapStage` exactly like
-  `buildFusedFold` does, then dispatches on `CrossBase` to emit either a 3-argument `Dict.foldl`
-  call (project the fresh `keyName`/`valName` into a tuple, just the key, or just the value,
-  depending on which of `CBDictToList`/`CBDictKeys`/`CBDictValues` matched) or a 2-argument
-  `Set.foldl`/`Array.foldl` call (no projection needed).
+- `buildFusedCrossFold :: Hints -> Cycle -> Opt.Expr -> Opt.Expr -> [ListStage] -> CrossBase ->
+  Names.Tracker Opt.Expr` — takes the user's already-`optimize`d step function (`optStep`) as a raw
+  `Opt.Expr`, generates a fresh name for it, and composes `stages` via the existing `wrapStage`
+  against `baseStepK (Opt.VarLocal stepName)` (not `baseStepK optStep` directly — see "Post-ship fix"
+  below for why), then dispatches on `CrossBase` to emit either a 3-argument `Dict.foldl` call
+  (project the fresh `keyName`/`valName` into a tuple, just the key, or just the value, depending on
+  which of `CBDictToList`/`CBDictKeys`/`CBDictValues` matched) or a 2-argument `Set.foldl`/
+  `Array.foldl` call (no projection needed). The whole result is wrapped in `Opt.Let (Opt.Def
+  stepName optStep) result`, binding the user's step function exactly once, outside the per-element
+  callback.
+
+### Post-ship fix: hoisting `optStep` via `Opt.Let` (regression found and fixed same day)
+
+The first version of `buildFusedCrossFold` took a pre-built `StepK` (`baseStepK optStep`) and spliced
+`Opt.Call optStep [elemExpr, accExpr]` directly into the per-element callback's body. Real-compiler
+verification (two-binary build, structural JS check, order-sensitive correctness check, interleaved
+timing) found this was **1.3x-1.4x slower** than the unfused baseline for 4 of the 5 base conversions
+(`Dict.keys`/`Dict.values`/`Set.toList`/`Array.toList` — only `Dict.toList`'s pair case and a
+`map`/`filter`-chained case still won). Root cause: when `optStep` is a literal `Opt.Function` (the
+common case — the user wrote an inline lambda), a nested `Opt.Call optStep [...]` sitting inside
+another synthesized function's body is a callee shape `Generate/JavaScript/Expression.hs`'s call-site
+dispatch does not recognize (it only special-cases `Opt.VarGlobal`/`Opt.VarLocal` callees with a
+statically known arity, via `Generate/Mode.hs`'s arity table); it falls back to the generic dispatch,
+which wraps the literal `Opt.Function` in a fresh `F2(...)` closure and calls it via `A2` — **on every
+element**, since the wrapping sits inside the per-element callback's JS body. This is strictly worse
+than the *unfused* baseline, where the same lambda sits as `List.foldl`'s literal argument and gets
+the existing `$unwrapped`/no-wrap treatment for free.
+
+Fix: bind `optStep` once via `Opt.Let (Opt.Def stepName optStep) result`, outside the per-element
+callback, and have the callback call `Opt.VarLocal stepName` instead of `optStep` directly (via
+`baseStepK (Opt.VarLocal stepName)`). This reuses already-shipped, already-tested machinery
+unchanged: `Generate/JavaScript/Expression.hs`'s `extendWithLocalArity` recognizes `Opt.Def name
+(Opt.Function args _)` and records the local's arity, so `generateDirectLocalCall` compiles calls to
+`stepName` as a direct `.f(...)` call with no `A2` at all when `optStep` is a literal lambda; when
+it isn't (e.g. a named top-level function reference), the hoist still avoids re-evaluating `optStep`
+once per element, which is no worse than before. Scoped entirely to `buildFusedCrossFold` and its
+call site — `baseStepK`/`wrapStage`/`StepK` and the other four `buildFused*` functions (shared with
+the already-shipped List/Array/Dict/Set fusions) were not touched, since those fusions never trigger
+with zero stages and are not implicated by this regression. Real-compiler re-verification after the
+fix confirmed all 6 benchmarked patterns now show genuine speedups: 1.5x-2.55x, with
+`dictKeysFoldl`/`dictValuesFoldl`/`setToListFoldl`/`arrayToListFoldl` flipping from ~0.7-0.9x
+(slower) to 1.5x-1.8x, and the two already-winning patterns (`dictToListFoldl`,
+`chainedDictToListFoldl`) improving or holding steady at 2.1x-2.55x.
 - New guard clause in `optimize`, added **immediately before** the existing `home ==
   ModuleName.list, name == "foldl"` guard (so it takes priority when applicable — Haskell tries
   guards top-to-bottom, first match wins): matches `List.foldl stepArg accArg listArg`, peels
@@ -112,7 +149,7 @@ identically in Dev and Prod, like every fusion pass before it).
   already handles bare `List.map`/`filter` chains with no fold at the end, but does not know about
   these five conversions as a base either; extending it is also left for a future plan.
 
-## Verification plan
+## Verification plan (executed; results below)
 
 1. Build the fork compiler with this change (Docker recipe, `CLAUDE.md`).
 2. Compile a `Bench.elm` fixture covering all five conversions, plus a chain with `List.map`/
@@ -122,5 +159,13 @@ identically in Dev and Prod, like every fusion pass before it).
 3. Order-sensitive correctness check (not a plain sum — see Motivation) between old and new binaries
    across sizes including `n = 0, 1, 2` edge cases.
 4. Interleaved timing, two separate scratch directories (per the `elm-stuff` cache-contamination
-   finding — never reuse one project dir across a binary swap), confirm the real compiler
-   reproduces roughly the spike's 1.16x-3.4x range.
+   finding — never reuse one project dir across a binary swap).
+
+**Results:** structural check passed on the first pass (steps 1-3), confirming the fusion fires and
+produces correct output. Step 4's timing check, run against the *first* version of the fix (before
+the `Opt.Let` hoist above), found 4 of 6 patterns 1.3x-1.4x **slower**, not faster — the spike's
+1.16x-3.4x estimate never accounted for the `F2`/`A2` codegen overhead the "Post-ship fix" section
+describes, since the spike measured a hand-patched simulation, not real compiler-generated call
+sites. After the fix, re-running the identical steps 1-4 against a fresh binary confirmed all 6
+patterns now show genuine speedups: 1.5x-2.55x (see "Post-ship fix" above for the exact per-pattern
+numbers).
