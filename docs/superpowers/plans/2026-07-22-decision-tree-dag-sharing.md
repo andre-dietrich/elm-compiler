@@ -25,9 +25,9 @@ several separate `Opt.Case` AST nodes, one per outer arm — explicitly out of s
 spec's Non-goals). The [[decision-tree-dag-sharing-spike]]'s hand-patch description ("5-fold
 duplicated Inner switch merged into one sharedInner function") reads like it may have been
 simulating exactly that separate-AST-node scenario, not the single-flattened-tree scenario this plan
-targets — meaning this plan's real-compiler speedup (measured in Task 5) may come in well under the
+targets — meaning this plan's real-compiler speedup (measured in Task 6) may come in well under the
 spike's 1.40x-1.46x, since here only the constant leaf value is shared, not the repeated comparison
-work. Treat Task 5's measurement as the actual verdict, not a formality — if it comes back near 1.0x,
+work. Treat Task 6's measurement as the actual verdict, not a formality — if it comes back near 1.0x,
 that is a legitimate, useful (if disappointing) result, and the nested-case-of-case scenario would be
 a distinct, larger follow-up design, not a bug in this implementation.
 
@@ -57,7 +57,9 @@ a distinct, larger follow-up design, not a bug in this implementation.
 - Every scratch fixture's `elm.json` must declare `"elm-version": "0.19.2"`.
 - Never mount a real project directory from this repo as `/test` — `elm make` writes root-owned
   `elm-stuff/` artifacts into whatever is mounted there.
-- Only `compiler/src/Optimize/Case.hs` is modified by this plan. No other file in the repo changes.
+- `compiler/src/Optimize/Case.hs` (Task 1) and `compiler/src/Optimize/Expression.hs`'s `destructHelp`
+  (Task 2, added after Task 1's own fixture testing found the gap described there) are the only
+  files modified by this plan. No other file in the repo changes.
 
 ---
 
@@ -492,7 +494,129 @@ git commit -m "perf(codegen): merge identical variable-free case-arm bodies to a
 
 ---
 
-### Task 2: Motivating-case fixture — confirm sharing actually happens
+### Task 2: Fix dead destructor allocation for nullary constructor patterns
+
+**Why this task exists:** Task 1's own fixture testing (originally numbered Task 2, now Task 3)
+found that the merge never fires for the plan's own motivating example —
+`case (status, priority) of (Pending, Low) -> "wait"; (Active, Low) -> "wait"; ...` — even though
+both arms qualify (variable-free patterns, identical bodies). Root cause, confirmed via temporary
+instrumentation during that testing: `Optimize.Expression.destructHelp`'s `Can.PCtor` case
+allocates a fresh-named `Opt.Destructor` for *any* nullary constructor pattern (`args = []`, e.g.
+`Pending`) whose path is not `Opt.Root` (i.e. nested inside a tuple/list/other compound pattern),
+even though there's nothing to destructure — the constructor has no sub-values, so the fold that
+would use this destructor runs over an empty list and never references it. This wraps every arm's
+optimized body in `Opt.Destruct` with a distinct fresh name per arm; `sameExpr` (correctly, by
+design) treats `Opt.Destruct` as always non-equal, so the merge never triggers for any constructor
+pattern nested inside something else — precisely the shape of a multi-value `case (a, b) of
+(CtorX, CtorY) -> ...` dispatch, and the most common real-world shape this feature targets.
+
+This fix is independently justified — it removes dead codegen (an always-unused local variable
+binding) — not merely a workaround for Task 1. See
+`docs/superpowers/specs/2026-07-22-decision-tree-dag-sharing-design.md`'s "Addendum" section for
+the full diagnosis, including the confirmed control matrix (single-column `Int`/`Bool`/custom-type
+cases and `Bool`-in-tuple cases already share correctly today; only a non-`Bool` constructor
+pattern nested inside something else fails).
+
+**Files:**
+- Modify: `compiler/src/Optimize/Expression.hs` (`destructHelp`'s `Can.PCtor` case, currently around
+  lines 588-603)
+
+**Interfaces:**
+- Produces: `destructHelp`'s external type and behavior are unchanged for every pattern shape except
+  a nullary constructor pattern at a non-`Opt.Root` path, where it now produces one fewer
+  `Opt.Destructor` (the dead one) than before. No caller of `destructHelp` needs to change.
+
+- [ ] **Step 1: Locate the current code**
+
+Find `destructHelp`'s `Can.PCtor` case in `compiler/src/Optimize/Expression.hs`. It currently reads:
+
+```haskell
+    Can.PCtor _ _ (Can.Union _ _ _ opts) _ _ args ->
+      case args of
+        [Can.PatternCtorArg _ _ arg] ->
+          case opts of
+            Can.Normal -> destructHelp (Opt.Index Index.first path) arg revDs
+            Can.Unbox  -> destructHelp (Opt.Unbox path) arg revDs
+            Can.Enum   -> destructHelp (Opt.Index Index.first path) arg revDs
+
+        _ ->
+          case path of
+            Opt.Root _ ->
+              foldM (destructCtorArg path) revDs args
+
+            _ ->
+              do  name <- Names.generate
+                  foldM (destructCtorArg (Opt.Root name)) (Opt.Destructor name path : revDs) args
+```
+
+- [ ] **Step 2: Add a `[]` case before the single-arg case**
+
+Replace the block above with:
+
+```haskell
+    Can.PCtor _ _ (Can.Union _ _ _ opts) _ _ args ->
+      case args of
+        [] ->
+          pure revDs
+
+        [Can.PatternCtorArg _ _ arg] ->
+          case opts of
+            Can.Normal -> destructHelp (Opt.Index Index.first path) arg revDs
+            Can.Unbox  -> destructHelp (Opt.Unbox path) arg revDs
+            Can.Enum   -> destructHelp (Opt.Index Index.first path) arg revDs
+
+        _ ->
+          case path of
+            Opt.Root _ ->
+              foldM (destructCtorArg path) revDs args
+
+            _ ->
+              do  name <- Names.generate
+                  foldM (destructCtorArg (Opt.Root name)) (Opt.Destructor name path : revDs) args
+```
+
+The only change is the new `[] -> pure revDs` branch. This matches what already happens today when
+a nullary constructor pattern sits at `Opt.Root` (`foldM (destructCtorArg path) revDs []` is a no-op
+returning `revDs` unchanged) — this fix just makes that same "nothing to destructure" outcome apply
+regardless of path, instead of only when the path happens to be `Opt.Root`.
+
+- [ ] **Step 3: Build**
+
+```bash
+docker run --rm -v "$PWD":/work -w /work \
+  -v elm-cabal-home:/root/.cabal -v elm-dist:/work/dist-newstyle \
+  haskell:9.8.4 bash -c 'export PATH=/opt/ghc/9.8.4/bin:$PATH; \
+    cabal build elm --ghc-options=-O0 2>&1 | tail -n 120; exit ${PIPESTATUS[0]}'
+```
+
+Expected: build succeeds, zero warnings. This change only removes a branch that always produced an
+unused binding, so no other code should need to change to accommodate it — if the build fails
+elsewhere, stop and report rather than making further changes to force it through.
+
+- [ ] **Step 4: Re-verify the motivating fixture from Task 3 now shares**
+
+Using the same scratch fixture and Docker recipe as Task 3 Step 1-3 (create it now if Task 3 hasn't
+run yet in this session; reuse it if it has), recompile with `--optimize` and check:
+
+```bash
+grep -c "'wait'" <scratch-dir>/main.js
+```
+
+Expected: `1` (previously `2`, confirmed in Task 3's original run before this fix). Also re-run
+`node run.js` and confirm the output is still exactly
+`["wait","wait soon","urgent wait","wait","wait soon","urgent wait","done","done"]` — this fix must
+not change program behavior, only remove dead code.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add compiler/src/Optimize/Expression.hs
+git commit -m "perf(codegen): skip dead destructor for nullary constructor patterns"
+```
+
+---
+
+### Task 3: Motivating-case fixture — confirm sharing actually happens
 
 **Files:**
 - Create (scratch, not committed): `<scratchpad>/dag-sharing-fixtures/motivating/elm.json`,
@@ -651,7 +775,7 @@ transformation runs identically in Dev and Prod since it happens in `Optimize.Ca
 
 ---
 
-### Task 3: Correctness-invariant fixture — confirm variable-binding arms are never merged
+### Task 4: Correctness-invariant fixture — confirm variable-binding arms are never merged
 
 **Files:**
 - Create (scratch, not committed): `<scratchpad>/dag-sharing-fixtures/invariant/elm.json`,
@@ -664,7 +788,7 @@ transformation runs identically in Dev and Prod since it happens in `Optimize.Ca
 
 - [ ] **Step 1: Write the scratch fixture**
 
-`elm.json`: identical to Task 2's Step 1 `elm.json`.
+`elm.json`: identical to Task 3's Step 1 `elm.json`.
 
 `src/Main.elm` — two arms bind the *same variable name* at *different structural positions*
 (`First _ x` extracts `x` from the second field of a 2-field constructor; `Second x` extracts `x`
@@ -712,11 +836,11 @@ main =
         }
 ```
 
-`run.js`: identical to Task 2's Step 1 `run.js`.
+`run.js`: identical to Task 3's Step 1 `run.js`.
 
 - [ ] **Step 2: Compile with `--optimize` and run under Node**
 
-Same Docker commands as Task 2 Step 2, pointed at this fixture's directory.
+Same Docker commands as Task 3 Step 2, pointed at this fixture's directory.
 
 Expected stdout:
 ```
@@ -735,7 +859,7 @@ Same expected output: `["value:4","value:5"]`.
 
 ---
 
-### Task 4: No-duplication regression fixture — confirm unrelated cases are unaffected
+### Task 5: No-duplication regression fixture — confirm unrelated cases are unaffected
 
 **Files:**
 - Create (scratch, not committed): `<scratchpad>/dag-sharing-fixtures/regression/elm.json`,
@@ -749,7 +873,7 @@ Same expected output: `["value:4","value:5"]`.
 
 - [ ] **Step 1: Write the scratch fixture**
 
-`elm.json`: identical to Task 2's Step 1 `elm.json`.
+`elm.json`: identical to Task 3's Step 1 `elm.json`.
 
 `src/Main.elm` — every arm's body is distinct, so no merging should ever be triggered:
 
@@ -792,21 +916,28 @@ main =
         }
 ```
 
-`run.js`: identical to Task 2's Step 1 `run.js`.
+`run.js`: identical to Task 3's Step 1 `run.js`.
 
 - [ ] **Step 2: Build the pre-change compiler binary for comparison**
 
+Do not use a relative ref like `HEAD~2` here — a doc-only merge commit sits between this plan's two
+code commits and `main`, so relative counting is fragile. Instead, look up the exact commit hash
+recorded as this plan's starting point (the commit checked out when the worktree for this plan was
+created, i.e. the parent of Task 1's first commit — check the progress ledger at
+`.superpowers/sdd/progress.md`, which records it against "Task 1: complete", or run `git log
+--oneline compiler/src/Optimize/Case.hs compiler/src/Optimize/Expression.hs` and take the commit
+right before the first one touching either file) and use that hash directly:
+
 ```bash
-git worktree add <scratchpad>/dag-sharing-fixtures/pre-change-worktree HEAD~1
+git worktree add <scratchpad>/dag-sharing-fixtures/pre-change-worktree <pre-task-1-commit-hash>
 docker run --rm -v "<scratchpad>/dag-sharing-fixtures/pre-change-worktree":/work -w /work \
   -v elm-cabal-home-prechange:/root/.cabal -v elm-dist-prechange:/work/dist-newstyle \
   haskell:9.8.4 bash -c 'export PATH=/opt/ghc/9.8.4/bin:$PATH; \
     cabal build elm --ghc-options=-O0 2>&1 | tail -n 120; exit ${PIPESTATUS[0]}'
 ```
 
-(`HEAD~1` is the commit immediately before Task 1 Step 3's commit — adjust if other commits landed
-in between. Using separate named volumes, `elm-cabal-home-prechange`/`elm-dist-prechange`, avoids
-clobbering the post-change build's cached artifacts from Task 1.)
+(Using separate named volumes, `elm-cabal-home-prechange`/`elm-dist-prechange`, avoids clobbering
+the post-change build's cached artifacts from Task 1/Task 2.)
 
 - [ ] **Step 3: Compile the fixture with both compilers and diff**
 
@@ -843,7 +974,7 @@ git worktree remove <scratchpad>/dag-sharing-fixtures/pre-change-worktree
 
 ---
 
-### Task 5: Benchmark the real compiler output for the motivating case
+### Task 6: Benchmark the real compiler output for the motivating case
 
 **Files:**
 - Create (scratch, not committed): `<scratchpad>/dag-sharing-fixtures/benchmark/elm.json`,
@@ -852,7 +983,7 @@ git worktree remove <scratchpad>/dag-sharing-fixtures/pre-change-worktree
 
 **Interfaces:**
 - Consumes: the post-change `elm` binary from Task 1, and the pre-change `elm` binary built the same
-  way as Task 4 Step 2 (reuse that worktree/build if it still exists, otherwise recreate it).
+  way as Task 5 Step 2 (reuse that worktree/build if it still exists, otherwise recreate it).
 - Produces: a console report of measured speedup — the final evidence this plan set out to gather
   (per [[decision-tree-dag-sharing-spike]]'s 1.40x-1.46x hand-patched finding).
 
@@ -862,7 +993,7 @@ A wider union (10 outer values sharing one inner 5-way dispatch, matching the sp
 called in a loop, with the loop count taken from `process.argv` via a port so the same compiled JS
 can be benchmarked at multiple sizes without recompiling:
 
-`elm.json`: identical to Task 2's Step 1 `elm.json`.
+`elm.json`: identical to Task 3's Step 1 `elm.json`.
 
 `src/Main.elm`:
 
@@ -1008,10 +1139,10 @@ Invoked as `node bench-runner.js <reps> <path-to-compiled-file>`, e.g. `node ben
 
 - [ ] **Step 2: Compile the fixture with both the pre-change and post-change compilers**
 
-Reuse (or recreate, per Task 4 Step 2) the `pre-change-worktree`. Compile this fixture's
+Reuse (or recreate, per Task 5 Step 2) the `pre-change-worktree`. Compile this fixture's
 `src/Main.elm --optimize` with each compiler into two separately-named output files,
 `main-before.js` and `main-after.js`, in the same fixture directory (same Docker command shape as
-Task 4 Step 3, changing only `--output`).
+Task 5 Step 3, changing only `--output`).
 
 - [ ] **Step 3: Run both interleaved across several rep counts, comparing checksums and timing**
 
@@ -1032,14 +1163,14 @@ done
 
 Confirm every run's `checksum` field is identical across all `main-before.js`/`main-after.js` runs
 at a given `reps` value (this is the correctness check — if checksums differ, stop, do not trust any
-timing number, and go back to Task 2/3's fixtures to find what's wrong first). Then compare the
+timing number, and go back to Task 3/4's fixtures to find what's wrong first). Then compare the
 median `ms` for `main-before.js` vs `main-after.js` at each size (discarding the warmup pair) and
 report the ratio (`before-ms / after-ms`) as the observed speedup.
 
 - [ ] **Step 4: Record the result**
 
 Note the observed speedup at each tested size in the commit message or a follow-up note (not a new
-file — see Task 6). A result broadly consistent with the spike's 1.40x-1.46x is confirmation; a
+file — see Task 7). A result broadly consistent with the spike's 1.40x-1.46x is confirmation; a
 result close to 1.0x (no measurable improvement) or worse means something about the real compiler's
 code path differs from the hand-patch simulation and is worth a closer look before considering this
 plan's goal met — but do not block on hitting an exact number, since the real compiler's output
@@ -1047,14 +1178,14 @@ naturally differs in details (e.g. actual field-name shortening, arity bypass) f
 
 ---
 
-### Task 6: Record the outcome in memory
+### Task 7: Record the outcome in memory
 
 **Files:**
 - Create: memory file in the auto-memory directory (`/home/andre/.claude/projects/-home-andre-Workspace-Projects-Freinet-elm-compiler/memory/decision-tree-dag-sharing-plan.md`)
 - Modify: `/home/andre/.claude/projects/-home-andre-Workspace-Projects-Freinet-elm-compiler/memory/MEMORY.md` (append one line)
 
 **Interfaces:**
-- Consumes: the build/test/benchmark results from Tasks 1-5.
+- Consumes: the build/test/benchmark results from Tasks 1-6.
 - Produces: a durable record of what shipped, for future sessions (mirrors the existing
   `decision-tree-dag-sharing-spike.md` memory entry's format).
 
@@ -1065,7 +1196,7 @@ Write `decision-tree-dag-sharing-plan.md` with frontmatter:
 ```markdown
 ---
 name: decision-tree-dag-sharing-plan
-description: "Case-arm body merging (variable-free patterns, structural Opt.Expr equality) implemented in Optimize.Case.optimize's assignTargets, replacing indexify; reuses existing countTargets/createChoices/Opt.Jump machinery unmodified. No AST.Optimized/.elmo changes. Committed <commit-hash>."
+description: "Case-arm body merging (variable-free patterns, structural Opt.Expr equality) implemented in Optimize.Case.optimize's assignTargets, replacing indexify; plus a dead-destructor fix in Optimize.Expression.destructHelp that was blocking the merge for constructor patterns nested in a tuple. Reuses existing countTargets/createChoices/Opt.Jump machinery unmodified. No AST.Optimized/.elmo changes. Committed <commit-hash>."
 metadata:
   type: project
 ---
@@ -1074,8 +1205,10 @@ metadata:
 followed by a short account (Ausgangspunkt/Vorgehen/Ergebnis in this project's established style —
 see `decision-tree-dag-sharing-spike.md` for the tone) covering: the two design pivots this plan
 went through before landing (Decider-Int-subtree comparison can't work → Can.Expr-level merge in
-Expression.hs → final: Opt.Expr-level merge inside Case.hs's own indexify replacement), the
-`bindsNoVariables` correctness restriction, and the Task 5 benchmark result.
+Expression.hs → final: Opt.Expr-level merge inside Case.hs's own indexify replacement); the
+`bindsNoVariables` correctness restriction; the Task 3 discovery that the motivating fixture didn't
+share due to a dead destructor in `destructHelp`, and Task 2's fix for it; and the Task 6 benchmark
+result.
 
 - [ ] **Step 2: Update `MEMORY.md`**
 
