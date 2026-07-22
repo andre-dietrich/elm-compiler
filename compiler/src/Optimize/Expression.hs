@@ -652,6 +652,10 @@ isListCons home name =
 -- One layer of a producer chain. Carries the *unoptimized* Can.Expr for
 -- the function/predicate so it gets `optimize`'d in the right place
 -- (inside the synthesized step, not hoisted out of its original scope).
+-- Despite the name, also reused verbatim by the ARRAY PIPELINE FUSION
+-- section further below (peelArrayStage/peelArrayChain/buildFusedArrayFold)
+-- -- these constructors carry no List-specific data, only a peeled
+-- function/predicate and its inner expression.
 data ListStage
   = StageMap Can.Expr Can.Expr        -- f, inner list expr
   | StageFilter Can.Expr Can.Expr     -- p, inner list expr
