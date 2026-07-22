@@ -106,6 +106,8 @@ sibling) — arity-matched against **that member's own** argument list, not the 
 different function. A call whose arity doesn't match still falls back to plain `Opt.Call`, exactly
 as `matchTailSelfCall` already does today for the self-only case — no new fallback logic needed.
 
+**Note on `Opt.TailCall` reuse:** step 4 reuses the existing `Opt.TailCall` constructor as-is for every widened match (self or sibling) — it does not yet need a dedicated fused-call node. `Opt.TailCall`'s *codegen*, however (`generateTailCall`, a labelled `continue <target's own name>`), only makes sense for a target that owns its own enclosing labelled loop, which is true for self-recursion but not for a sibling folded into a shared function — so confirmed clusters get a **second, dedicated** `Opt.Expr` constructor at packaging time (step 6), produced only by a rewrite over already-built `Opt.TailCall` nodes, never by `optimizeTail` directly. See Codegen/New IR below for why a plain shared `continue;` (no label at all) is sufficient and correct once every member lives in one switch inside one loop.
+
 **5. Confirmation SCC pass.** The optimistic scan in step 2 can overshoot (e.g. a tail-position call
 that turns out arity-mismatched, so step 4 emitted a plain `Opt.Call` instead of `Opt.TailCall`).
 Build a second edge list from the **actual** `Opt.TailCall` targets present in each member's
@@ -135,6 +137,33 @@ unfused candidates, 0-arg values — is packaged exactly as `addRecDefs` does to
 | FusedCycle [(Name.Name, [Name.Name], Expr)] (Set.Set Global)
 ```
 
+`AST.Optimized.Expr` gains a dedicated fused-jump node, produced only by the packaging rewrite in
+step 6 (never directly by `optimizeTail`):
+
+```haskell
+| TailCallFused Name.Name Int [(Name.Name, Expr)]
+```
+
+(cluster-identity name — a fixed anchor, deterministically the first member in the cluster's
+stored order, used only to derive the shared JS `mode` variable's name, exactly the same role
+`TailDefCons`'s trailing `Name` already plays for deriving sentinel-variable names; target mode
+index; the target's own argument-name/value pairs to reassign). Its codegen is a plain, **unlabelled**
+`continue;` — safe and sufficient because a fused member's body always lives inside exactly one
+shared `while(true)`/`switch`, so there is never a nested loop for an unlabelled `continue` to
+ambiguously target (checked directly: Elm's own case-expression decision trees, `Optimize.Case`,
+compile to `JS.Switch`/labelled `JS.Break`, never `JS.Continue`, so nesting a decision tree inside a
+fused case arm cannot collide with this).
+
+**Confirmation policy (v1 simplification):** if a first-pass candidate cluster of size N doesn't
+survive the second (confirmation) SCC pass **as one intact group of the same N members**, the whole
+group is rejected and every member falls back to the normal, unfused path — even if a strict subset
+of it (e.g. 2 of 3) would have confirmed on its own. Handling partial survival correctly would
+require iterating the widen/confirm cycle to a fixed point (removing one member can shrink another's
+matchable-target set, changing what *its* next confirmation pass would find), which is real added
+complexity for a case only arity-mismatches can trigger. All-or-nothing per attempted cluster is
+strictly conservative (never wrong, only occasionally more cautious than theoretically possible) and
+kept explicit here so the implementation plan doesn't have to rediscover this trade-off.
+
 (member name, its own argument names, its tail-optimized body; the `Set Global` is the union of all
 members' dependencies, same role as every other node's dep set). Stored under a synthetic combined
 `Global` name (`Name.fromManyNames` over the member names, mirroring `Opt.Cycle`'s existing
@@ -145,10 +174,10 @@ in `addGlobalHelp` without changes there.
 
 **`.elmo`/`.elmi` format changes** (accepted cost, same as every prior IR-changing plan in this
 repo — [[static-shape-record-clone-plan]], [[adt-shape-padding-plan]] before it): one new `Node`
-constructor tag in `Binary Node`'s `put`/`get`. No change to `Expr`, `Def`, or any existing
-constructor's shape.
+constructor tag (11) in `Binary Node`'s `put`/`get`, and one new `Expr` constructor tag (30) in
+`Binary Expr`'s `put`/`get`. No change to any *existing* constructor's shape in either type.
 
-**Not every `case` over `Opt.Node` is compiler-enforced exhaustive** — checked directly rather than
+**Not every `case` over `Opt.Node` (or `Opt.Expr`) is compiler-enforced exhaustive** — checked directly rather than
 assumed, since this repo's `-Wall -Werror` (per CLAUDE.md) only catches a missed constructor where
 the `case` has no wildcard arm:
 
