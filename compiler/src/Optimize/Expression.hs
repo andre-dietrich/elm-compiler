@@ -75,6 +75,16 @@ optimize hints cycle (A.At region expression) =
       | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
       , home == ModuleName.list, name == "foldl"
       , [stepArg, accArg, listArg] <- args
+      , (stages, source) <- peelChain listArg
+      , Just crossBase <- peelCrossBase source
+      ->
+          do  optStep <- optimize hints cycle stepArg
+              optAcc  <- optimize hints cycle accArg
+              buildFusedCrossFold hints cycle (baseStepK optStep) optAcc stages crossBase
+
+      | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
+      , home == ModuleName.list, name == "foldl"
+      , [stepArg, accArg, listArg] <- args
       , (stages@(_:_), source) <- peelChain listArg
       ->
           do  optStep <- optimize hints cycle stepArg
@@ -1140,6 +1150,93 @@ buildFusedSetFold hints cycle base initExpr stages source =
         , initExpr
         , optSource
         ]
+
+
+-- CROSS-CONTAINER CONVERSION FUSION (Dict.toList/keys/values, Set.toList,
+-- Array.toList feeding a List.foldl chain)
+--
+-- See docs/superpowers/specs/2026-07-22-cross-container-conversion-fusion-design.md
+-- for the full derivation. Reuses ListStage/StepK/wrapStage/baseStepK/
+-- peelChain verbatim -- a List.map/filter/filterMap chain sitting between
+-- one of these five conversions and the terminating List.foldl keeps
+-- working exactly as it does today, unchanged. The only new pieces are
+-- recognizing the conversion itself as a peelChain base, and picking a
+-- different terminator (Dict.foldl/Set.foldl/Array.foldl) with the right
+-- key/value adapter once one is found.
+
+
+-- One of the five recognized producer-side conversions, carrying the
+-- converted-from container expression (not yet optimized).
+data CrossBase
+  = CBDictToList Can.Expr    -- Dict.toList e:  elemExpr = (k, v) tuple, terminator = Dict.foldl
+  | CBDictKeys Can.Expr      -- Dict.keys e:    elemExpr = k,            terminator = Dict.foldl
+  | CBDictValues Can.Expr    -- Dict.values e:  elemExpr = v,            terminator = Dict.foldl
+  | CBSetToList Can.Expr     -- Set.toList e:   elemExpr = k,            terminator = Set.foldl
+  | CBArrayToList Can.Expr   -- Array.toList e: elemExpr = v,            terminator = Array.foldl
+
+
+-- Nothing => not one of the five recognized conversions => this pass
+-- doesn't apply here; the existing (unmodified) stages@(_:_)-gated
+-- List.foldl guard below still fires if `stages` is non-empty, or the
+-- expression is left for ordinary optimize recursion if not. Only
+-- elm/core's own Dict.toList/keys/values and Set.toList/Array.toList
+-- match (via either Can.Call or |>/<| syntax, thanks to
+-- collectApplication); a local alias falls through untouched.
+peelCrossBase :: Can.Expr -> Maybe CrossBase
+peelCrossBase expr =
+  case collectApplication expr of
+    (A.At _ (Can.VarForeign home name _), [e])
+      | home == ModuleName.dict,  name == "toList" -> Just (CBDictToList e)
+      | home == ModuleName.dict,  name == "keys"   -> Just (CBDictKeys e)
+      | home == ModuleName.dict,  name == "values" -> Just (CBDictValues e)
+      | home == ModuleName.set,   name == "toList" -> Just (CBSetToList e)
+      | home == ModuleName.array, name == "toList" -> Just (CBArrayToList e)
+    _ ->
+      Nothing
+
+
+-- Builds the fused replacement for `List.foldl step acc chain`, where
+-- `chain`'s peelChain base matched one of the five CrossBase shapes.
+-- `stages` may be empty (a bare `List.foldl f z (Dict.toList d)`, no
+-- map/filter in between) -- unlike buildFusedFold's callers, the dispatch
+-- clause below deliberately does not gate this on `stages@(_:_)`, since
+-- even zero stages is worth fusing here: the win is skipping the
+-- conversion's own list build, not the map/filter stages, which cost
+-- exactly the same fused or not.
+buildFusedCrossFold :: Hints -> Cycle -> StepK -> Opt.Expr -> [ListStage] -> CrossBase -> Names.Tracker Opt.Expr
+buildFusedCrossFold hints cycle base initExpr stages crossBase =
+  do  composed <- foldM (wrapStage hints cycle) base stages
+      case crossBase of
+        CBDictToList e  -> dictTerminator composed e (\k v -> Opt.Tuple k v Nothing)
+        CBDictKeys e    -> dictTerminator composed e (\k _ -> k)
+        CBDictValues e  -> dictTerminator composed e (\_ v -> v)
+        CBSetToList e   -> singleArgTerminator ModuleName.set    composed e
+        CBArrayToList e -> singleArgTerminator ModuleName.array composed e
+  where
+    dictTerminator composed e project =
+      do  optE     <- optimize hints cycle e
+          keyName  <- Names.generate
+          valName  <- Names.generate
+          accName  <- Names.generate
+          body     <- composed (project (Opt.VarLocal keyName) (Opt.VarLocal valName)) (Opt.VarLocal accName)
+          optFoldl <- Names.registerGlobal ModuleName.dict "foldl"
+          pure $ Opt.Call optFoldl
+            [ Opt.Function [keyName, valName, accName] body
+            , initExpr
+            , optE
+            ]
+
+    singleArgTerminator home composed e =
+      do  optE     <- optimize hints cycle e
+          elemName <- Names.generate
+          accName  <- Names.generate
+          body     <- composed (Opt.VarLocal elemName) (Opt.VarLocal accName)
+          optFoldl <- Names.registerGlobal home "foldl"
+          pure $ Opt.Call optFoldl
+            [ Opt.Function [elemName, accName] body
+            , initExpr
+            , optE
+            ]
 
 
 -- BARE PRODUCER-CHAIN FUSION (map/filter/filterMap, no terminator)
