@@ -80,7 +80,7 @@ optimize hints cycle (A.At region expression) =
       ->
           do  optStep <- optimize hints cycle stepArg
               optAcc  <- optimize hints cycle accArg
-              buildFusedCrossFold hints cycle (baseStepK optStep) optAcc stages crossBase
+              buildFusedCrossFold hints cycle optStep optAcc stages crossBase
 
       | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
       , home == ModuleName.list, name == "foldl"
@@ -1203,15 +1203,38 @@ peelCrossBase expr =
 -- even zero stages is worth fusing here: the win is skipping the
 -- conversion's own list build, not the map/filter stages, which cost
 -- exactly the same fused or not.
-buildFusedCrossFold :: Hints -> Cycle -> StepK -> Opt.Expr -> [ListStage] -> CrossBase -> Names.Tracker Opt.Expr
-buildFusedCrossFold hints cycle base initExpr stages crossBase =
-  do  composed <- foldM (wrapStage hints cycle) base stages
-      case crossBase of
+--
+-- `optStep` (the user's own step-function argument, already `optimize`d) used
+-- to be passed pre-wrapped as a StepK (`baseStepK optStep`), which embeds a
+-- fresh `Opt.Call optStep [...]` directly inside the per-element callback's
+-- body. When `optStep` is itself a literal `Opt.Function` (the common case --
+-- the user wrote an inline lambda), that nested call is a shape
+-- Generate.JavaScript.Expression's call-site dispatch does not recognize (it
+-- only special-cases Opt.VarGlobal/Opt.VarLocal callees with a known arity),
+-- so it falls back to the generic A2 dispatch, re-wrapping the literal
+-- Opt.Function in a fresh F2(...) closure on EVERY element -- strictly worse
+-- than the unfused baseline, where the same lambda sits as List.foldl's
+-- literal argument and gets the existing $unwrapped/no-wrap treatment for
+-- free. Fix: bind `optStep` once via Opt.Let, outside the per-element
+-- callback, and have the callback call the hoisted local instead. This
+-- reuses the already-shipped extendWithLocalArity/generateDirectLocalCall
+-- machinery unchanged: when optStep is a literal Opt.Function, the local's
+-- arity gets recorded and calls to it compile to a direct .f(...) call (no
+-- A2 at all); otherwise the hoist still avoids re-evaluating optStep once
+-- per element. Confirmed by Task 2's real-compiler timing regression
+-- (dictKeysFoldl/dictValuesFoldl/setToListFoldl/arrayToListFoldl were
+-- 1.3x-1.4x SLOWER before this fix).
+buildFusedCrossFold :: Hints -> Cycle -> Opt.Expr -> Opt.Expr -> [ListStage] -> CrossBase -> Names.Tracker Opt.Expr
+buildFusedCrossFold hints cycle optStep initExpr stages crossBase =
+  do  stepName <- Names.generate
+      composed  <- foldM (wrapStage hints cycle) (baseStepK (Opt.VarLocal stepName)) stages
+      result <- case crossBase of
         CBDictToList e  -> dictTerminator composed e (\k v -> Opt.Tuple k v Nothing)
         CBDictKeys e    -> dictTerminator composed e (\k _ -> k)
         CBDictValues e  -> dictTerminator composed e (\_ v -> v)
         CBSetToList e   -> singleArgTerminator ModuleName.set    composed e
         CBArrayToList e -> singleArgTerminator ModuleName.array composed e
+      pure (Opt.Let (Opt.Def stepName optStep) result)
   where
     dictTerminator composed e project =
       do  optE     <- optimize hints cycle e
