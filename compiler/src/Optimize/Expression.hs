@@ -587,6 +587,9 @@ destructHelp path (A.At region pattern) revDs =
 
     Can.PCtor _ _ (Can.Union _ _ _ opts) _ _ args ->
       case args of
+        [] ->
+          pure revDs
+
         [Can.PatternCtorArg _ _ arg] ->
           case opts of
             Can.Normal -> destructHelp (Opt.Index Index.first path) arg revDs
