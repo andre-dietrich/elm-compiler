@@ -114,6 +114,15 @@ optimize hints cycle (A.At region expression) =
               optAcc  <- optimize hints cycle accArg
               buildFusedArrayFold hints cycle (baseStepK optStep) optAcc stages source
 
+      | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
+      , home == ModuleName.dict, name == "foldl"
+      , [stepArg, accArg, dictArg] <- args
+      , (stages@(_:_), source) <- peelDictChain dictArg
+      ->
+          do  optStep <- optimize hints cycle stepArg
+              optAcc  <- optimize hints cycle accArg
+              buildFusedDictFold hints cycle (baseDictStepK optStep) optAcc stages source
+
       -- WORKER.RUN call-site rewrite. Requires at least one argument
       -- (fnArg : dataArgs) so a bare, unapplied `Worker.run` falls through
       -- to the plain Can.VarForeign case further below instead (compiled
@@ -929,6 +938,106 @@ buildFusedArrayFold hints cycle base initExpr stages source =
       optFoldl  <- Names.registerGlobal ModuleName.array "foldl"
       pure $ Opt.Call optFoldl
         [ Opt.Function [xName, accName] body
+        , initExpr
+        , optSource
+        ]
+
+
+-- DICT PIPELINE FUSION (map/filter -> foldl)
+--
+-- See docs/superpowers/specs/2026-07-22-dict-map-filter-fusion-design.md for
+-- the full derivation. Structurally the same idea as LIST/ARRAY PIPELINE
+-- FUSION above, but NOT built on ListStage/StepK: Dict.map/Dict.filter/
+-- Dict.foldl all carry the *key* as an extra argument that stays unchanged
+-- through the whole chain (`k -> a -> b`, `k -> v -> Bool`, `k -> v -> b ->
+-- b`), a shape ListStage/StepK have no slot for. This adds a small parallel
+-- set of definitions instead of retrofitting a key parameter into the
+-- List/Array machinery, which would mean touching and re-verifying five
+-- already-shipped call sites for a change only this new one needs.
+
+
+-- One layer of a Dict producer chain. Carries the *unoptimized* Can.Expr for
+-- the function/predicate, same reasoning as ListStage.
+data DictStage
+  = DStageMap Can.Expr Can.Expr     -- f, inner dict expr
+  | DStageFilter Can.Expr Can.Expr  -- p, inner dict expr
+
+
+dictStageInner :: DictStage -> Can.Expr
+dictStageInner (DStageMap _ inner)    = inner
+dictStageInner (DStageFilter _ inner) = inner
+
+
+-- Nothing => not a recognized Dict producer shape => stop peeling here. Only
+-- elm/core's own Dict.map/Dict.filter match (via either Can.Call or |>/<|
+-- syntax, thanks to collectApplication); everything else (including
+-- Dict.foldr, which this plan deliberately does not fuse, and a local
+-- `myMap = Dict.map` alias) falls through untouched.
+peelDictStage :: Can.Expr -> Maybe DictStage
+peelDictStage expr =
+  case collectApplication expr of
+    (A.At _ (Can.VarForeign home name _), [f, inner])
+      | home == ModuleName.dict, name == "map" ->
+          Just (DStageMap f inner)
+      | home == ModuleName.dict, name == "filter" ->
+          Just (DStageFilter f inner)
+    _ ->
+      Nothing
+
+
+-- Peels as many layers as match, outermost (closest to the foldl) first.
+-- Mirrors peelChain's recursion exactly, built on peelDictStage instead of
+-- peelListStage.
+peelDictChain :: Can.Expr -> ([DictStage], Can.Expr)
+peelDictChain expr =
+  case peelDictStage expr of
+    Nothing    -> ([], expr)
+    Just stage -> let (rest, source) = peelDictChain (dictStageInner stage) in (stage : rest, source)
+
+
+-- A step continuation carrying the key alongside the current value and
+-- accumulator -- the Dict analogue of StepK, which only threads a single
+-- value. foldM over `stages` left-to-right (outermost stage wrapped first)
+-- reconstructs the original evaluation order: a filter's predicate is
+-- checked on whatever value an outer map already produced, exactly as
+-- `dict |> Dict.map f |> Dict.filter pred` implies -- same reasoning as
+-- wrapStage's own doc comment.
+type DictStepK = Opt.Expr -> Opt.Expr -> Opt.Expr -> Names.Tracker Opt.Expr
+
+
+baseDictStepK :: Opt.Expr -> DictStepK
+baseDictStepK optStep keyExpr elemExpr accExpr =
+  pure (Opt.Call optStep [keyExpr, elemExpr, accExpr])
+
+
+wrapDictStage :: Hints -> Cycle -> DictStepK -> DictStage -> Names.Tracker DictStepK
+wrapDictStage hints cycle inner stage =
+  case stage of
+    DStageMap f _ ->
+      do  optF <- optimize hints cycle f
+          pure $ \keyExpr elemExpr accExpr -> inner keyExpr (Opt.Call optF [keyExpr, elemExpr]) accExpr
+
+    DStageFilter p _ ->
+      do  optP <- optimize hints cycle p
+          pure $ \keyExpr elemExpr accExpr ->
+            do  thenBranch <- inner keyExpr elemExpr accExpr
+                pure (Opt.If [(Opt.Call optP [keyExpr, elemExpr], thenBranch)] accExpr)
+
+
+-- Mirrors buildFusedFold/buildFusedArrayFold, except the synthesized step
+-- function takes three parameters (key, value, acc) instead of two,
+-- matching Dict.foldl's real (k -> v -> b -> b) shape.
+buildFusedDictFold :: Hints -> Cycle -> DictStepK -> Opt.Expr -> [DictStage] -> Can.Expr -> Names.Tracker Opt.Expr
+buildFusedDictFold hints cycle base initExpr stages source =
+  do  optSource <- optimize hints cycle source
+      composed  <- foldM (wrapDictStage hints cycle) base stages
+      keyName   <- Names.generate
+      xName     <- Names.generate
+      accName   <- Names.generate
+      body      <- composed (Opt.VarLocal keyName) (Opt.VarLocal xName) (Opt.VarLocal accName)
+      optFoldl  <- Names.registerGlobal ModuleName.dict "foldl"
+      pure $ Opt.Call optFoldl
+        [ Opt.Function [keyName, xName, accName] body
         , initExpr
         , optSource
         ]
