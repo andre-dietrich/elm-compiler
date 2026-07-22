@@ -93,6 +93,11 @@ assignTarget (patternsAcc, branchesAcc, seen, nextFresh) (pattern, branch) =
       )
 
 
+-- Takes the first (really: most-recently-seen, since `seen` is built by
+-- prepending) match. Match order doesn't matter here: a body is only ever
+-- added to `seen` when it found no existing match, so `seen` can never
+-- hold two entries that are `sameExpr`-equal to each other -- there is at
+-- most one match to find.
 findSharedTarget :: Seen -> Can.Pattern -> Opt.Expr -> Maybe Int
 findSharedTarget seen pattern branch =
   if bindsNoVariables pattern then
