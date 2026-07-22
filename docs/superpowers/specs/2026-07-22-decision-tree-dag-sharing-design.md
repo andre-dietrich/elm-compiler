@@ -12,9 +12,19 @@ writing the implementation plan, working out the exact comparison logic showed t
 (0, 1, 2, ...), so two genuinely-duplicate branches — e.g. `(Pending, Low) -> "wait"` and
 `(Active, Low) -> "wait"` — compile to `Leaf 0` and `Leaf 3` respectively. Different integers are
 never `Eq`-equal regardless of how identical the surrounding test structure or the actual leaf body
-is. That design would have compiled and run, but silently never fired. This revision replaces it
-with a mechanism that reuses the existing target-sharing machinery instead of building a new
-subtree-sharing layer next to it.
+is. That design would have compiled and run, but silently never fired.
+
+A second version proposed doing the merge in `Optimize/Expression.hs`, before branches reach
+`Case.optimize`, comparing pre-optimization `Can.Expr` bodies. Deriving the exact mechanics further
+showed the merge decision has to be made at the point target indices are actually assigned — which
+happens *inside* `Optimize.Case.optimize`'s `indexify` step, not in its caller — since
+`Case.optimize`'s existing signature (`[(Can.Pattern, Opt.Expr)] -> Opt.Expr`) assigns one fresh
+target per list position unconditionally, regardless of what the caller passes in. This final
+version does the merge exactly there: replacing `indexify`'s blind enumeration with target
+assignment that reuses an earlier index when a later branch qualifies for merging. This is smaller
+than either earlier version — one function inside one file, no signature or call-site changes
+anywhere — and reuses the existing `countTargets`/`createChoices`/`Opt.Jump` machinery completely
+unmodified.
 
 ## Background
 
@@ -25,9 +35,9 @@ gain. This spec turns that finding into a real compiler change ("Mechanism A" fr
 "Mechanism B", cold-branch outlining, was found conditional/regressive under uniform call-site
 traffic and is explicitly out of scope here).
 
-**Root cause in the current compiler:** `Optimize.Expression`'s handling of `Can.Case expr branches`
-(and its `optimizeTail` mirror) assigns every case-arm its own unique target index via `indexify`
-before decision-tree compilation ever runs, even when two or more arms produce an identical result.
+**Root cause in the current compiler:** `Optimize.Case.optimize`'s `indexify` step assigns every
+case-arm its own unique target index before decision-tree compilation ever runs, even when two or
+more arms produce an identical result.
 `Optimize.Case.treeToDecider` then builds each sibling edge of the decision tree independently
 (`map (second treeToDecider) edges`) — so when a case expression's decision tree contains sibling
 branches whose bodies are genuinely identical, for example
@@ -53,60 +63,74 @@ today.
   different outer arms). Only arms of the *same* `case` are considered.
 - Cold-branch outlining (spike Mechanism B) — conditional/regressive, not part of this plan.
 - Any whole-program or `Mode`-dependent analysis. This transformation runs identically for
-  `Mode.Dev` and `Mode.Prod`, since it happens in `Optimize.Expression`, before `Generate.Mode` ever
+  `Mode.Dev` and `Mode.Prod`, since it happens in `Optimize.Case`, before `Generate.Mode` ever
   sees the tree.
 - Deriving `Eq`/`Ord` on `Can.Expr`/`Opt.Expr` generally. A narrow, hand-written, conservative
   comparison is used instead (see Architecture).
 
 ## Architecture
 
-The transformation lives in `compiler/src/Optimize/Expression.hs`, in the `Can.Case expr branches`
-handling (and its structurally-identical `optimizeTail` counterpart), *before* branches are indexed
-and handed to `Optimize.Case.optimize`/`DT.compile`. No changes to `Optimize/Case.hs`'s algorithm and
-no changes to `AST.Optimized`'s types — this is purely a preprocessing step over the branch list.
+The transformation lives entirely inside `compiler/src/Optimize/Case.hs`'s `optimize` function,
+replacing its `indexify` target-assignment step. No changes to `Optimize/Expression.hs` (no call
+sites change — `Case.optimize`'s external type signature is unchanged) and no changes to
+`AST.Optimized`'s types.
 
-1. For each `Can.CaseBranch pattern body`, determine whether `pattern` binds any variable
-   (`bindsNoVariables :: Can.Pattern -> Bool`, recursing over `Pattern_`, `False` — i.e. "does
-   bind" — for any `PVar`/`PAlias`, `True` for everything else including nested patterns built
-   purely from literals/wildcards/constructors/tuples).
-2. Among branches where `bindsNoVariables pattern == True`, group by structural equality of their
-   `body :: Can.Expr`, using a new hand-written, conservative `sameExpr :: Can.Expr -> Can.Expr ->
-   Bool` (see below). Branches whose pattern binds a variable are never merged with anything and
-   always keep their own unique target — this is what makes the merge unconditionally safe (see
-   Correctness invariant).
-3. Assign target indices: each equality-class of variable-free branches (size 1 or more) gets one
-   shared index; every variable-binding branch gets its own index as before. This replaces the
-   current unconditional `zipWith indexify [0..]`.
-4. Each *distinct* body is optimized (via the existing `optimize hints cycle branch`) exactly once
-   per equality class, not once per original arm — this is a side benefit (less optimizer work
-   for the merged case), not the primary goal.
-5. The rest of the pipeline (`Case.optimize`, `DT.compile`, `treeToDecider`, `countTargets`,
-   `createChoices`) runs completely unchanged. Because two-or-more original arms now point at the
-   same target index, `countTargets` naturally counts it as reached multiple times, and
-   `createChoices` naturally emits `Opt.Jump` instead of `Opt.Inline` for it — the exact mechanism
-   that already exists today for any other multiply-reached target.
+Today, `optimize`'s first step is:
+
+```haskell
+(patterns, indexedBranches) = unzip (zipWith indexify [0..] optBranches)
+```
+
+which gives every entry of `optBranches :: [(Can.Pattern, Opt.Expr)]` its own fresh target index,
+unconditionally, one per list position. This is replaced by `assignTargets`, a left fold over
+`optBranches` that reuses an earlier index instead of minting a fresh one when the current branch
+qualifies for merging:
+
+1. A branch qualifies for merging only if its own pattern binds no variable
+   (`bindsNoVariables :: Can.Pattern -> Bool`, recursing over `Pattern_`; `False` — i.e. "does
+   bind" — for any `PVar`/`PAlias`/`PRecord`, `True` for everything else, including nested patterns
+   built purely from literals/wildcards/constructors/tuples).
+2. Among qualifying branches, it is merged into (assigned the same target as) the *first* earlier
+   qualifying branch whose already-optimized body is `sameExpr`-equal (see below). Non-qualifying
+   (variable-binding) branches always get a fresh target, exactly as today, and are never used as a
+   merge source or target for anything else — this is what makes the merge unconditionally safe
+   (see Correctness invariant).
+3. `patterns :: [(Can.Pattern, Int)]` keeps one entry per *original* branch (every source pattern
+   still needs its own decision-tree test position, merged or not) — only the `Int` may repeat.
+   `indexedBranches :: [(Int, Opt.Expr)]` keeps exactly one entry per *distinct* target — this is
+   what `createChoices`/the final jump list are built from, so a merged target must not appear
+   twice there.
+4. The rest of `optimize` (`treeToDecider`, `countTargets`, `createChoices`, `insertChoices`) runs
+   completely unchanged, on these same two lists, exactly as it does today. Because two-or-more
+   original branches now point at the same target index, `countTargets` naturally counts it as
+   reached multiple times, and `createChoices` naturally emits `Opt.Jump` instead of `Opt.Inline`
+   for it — the exact mechanism that already exists today for any other multiply-reached target.
 
 ### `sameExpr` — conservative structural equality
 
-`sameExpr :: Can.Expr -> Can.Expr -> Bool` is a hand-written recursive comparison over
-`Can.Expr_` (not a derived `Eq` instance — deriving one for the whole canonical AST is out of scope,
-see Non-goals). It positively supports exactly the constructors that can appear in a variable-free
-body without introducing new bindings:
+`sameExpr :: Opt.Expr -> Opt.Expr -> Bool` is a hand-written recursive comparison over `Opt.Expr`
+(not a derived `Eq` instance — deriving one for the whole optimized AST is out of scope, see
+Non-goals). It compares the *already-optimized* body, which both avoids re-deriving name-resolution
+from scratch and sidesteps a subtlety: any body that would need `Optimize.Names.generate` to mint a
+fresh local name during optimization (i.e. anything building a `Let`/`Destruct`/`Case`/`Function`)
+is already outside the whitelist below, so nothing being compared can differ merely due to
+otherwise-harmless alpha-renaming.
 
-- `Chr`, `Str`, `Int`, `Float`, `Unit` — direct value comparison.
-- `VarLocal`, `VarTopLevel`, `VarKernel`, `VarCtor` — compared by name/identity fields only (safe:
-  a variable-free body's `VarLocal` can only refer to an outer-scope binding, which is the same
-  binding in every arm of the same `case`, since these branches don't bind anything themselves).
-- `Call`, `Tuple`, `List`, `If`, `Access`, `Binop` — recurse structurally into sub-expressions.
-- `Accessor` — compared by field name.
+`sameExpr` positively supports exactly the constructors that can appear in a variable-free body
+without introducing new bindings: `Bool`, `Chr`, `Str`, `Int`, `Float`, `Unit` (direct value
+comparison); `VarLocal`, `VarGlobal`, `VarEnum`, `VarBox`, `VarKernel` (compared by
+name/global-identity fields only — safe, since a variable-free body's `VarLocal` can only refer to
+an outer-scope binding, identical in every arm of the same `case`); `List`, `Call`, `If`, `Tuple`
+(recurse structurally into sub-expressions); `Accessor`/`Access` (field name comparison).
 
-Every other constructor (`Negate`, `Lambda`, `Let`, `LetRec`, `LetDestruct`, `Case`, `Update`,
-`Record`, `Shader`, `VarDebug`, `VarForeign`, `VarOperator`) makes `sameExpr` return `False`
-unconditionally for that pair, even if both sides happen to use the same one — these forms either
-introduce their own bindings (subtler aliasing questions, deliberately deferred) or are rare/complex
-enough that comparing them isn't worth the risk for this first version. Returning `False` only ever
-*misses* a sharing opportunity; it can never cause an incorrect merge, so this restriction is free
-to make generously.
+Every other constructor (`VarCycle`, `VarDebug`, `Function`, `TailCall`, `TailCallCons`,
+`TailCallConsBase`, `Let`, `Destruct`, `Case`, `Update`, `Record`, `Shader`, `PrimOp`) makes
+`sameExpr` return `False` unconditionally for that pair, even if both sides happen to use the same
+one — these forms either introduce their own bindings (subtler aliasing questions, deliberately
+deferred) or aren't worth the risk for a first version (`PrimOp` is excluded specifically to avoid
+needing an `Eq` instance on `AST.Optimized.PrimBinop`, keeping this change from touching
+`AST.Optimized` at all). Returning `False` only ever *misses* a sharing opportunity; it can never
+cause an incorrect merge, so this restriction is free to make generously.
 
 ## Correctness invariant
 
@@ -125,10 +149,12 @@ include a branch that binds a variable and has a body that's textually identical
 
 ## Components touched
 
-- `compiler/src/Optimize/Expression.hs` — new `bindsNoVariables`/`sameExpr` helpers; the
-  `Can.Case expr branches` handling (and `optimizeTail`'s mirror) changes how target indices are
-  assigned to branches before calling `Case.optimize`.
-- `compiler/src/Optimize/Case.hs` — **no changes**.
+- `compiler/src/Optimize/Case.hs` — new `assignTargets`/`bindsNoVariables`/`argPattern`/`sameExpr`
+  (+small helpers) functions; `optimize`'s `indexify` step is replaced by `assignTargets`. New
+  import: `qualified Reporting.Annotation as A` (for pattern-matching `Can.Pattern`'s `A.At`
+  wrapper) and `Data.List (foldl')`.
+- `compiler/src/Optimize/Expression.hs` — **no changes**. `Case.optimize`'s external signature is
+  unchanged, so none of its ~4 call sites need touching.
 - `compiler/src/AST/Optimized.hs` — **no changes**.
 - `compiler/src/Generate/JavaScript/Expression.hs` — **no changes**.
 
@@ -161,4 +187,4 @@ following the project's established pattern:
 - **`sameExpr` scope creep** — temptation to add more constructors later; each addition needs the
   same soundness argument. Deliberately narrow for v1.
 - **No format/`.elmo` risk** — this design touches no `AST.Optimized`/`AST.Canonical` type
-  definitions at all, only adds ordinary functions in `Optimize/Expression.hs`.
+  definitions at all, only adds ordinary functions in `Optimize/Case.hs`.
