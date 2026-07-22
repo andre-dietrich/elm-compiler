@@ -97,6 +97,15 @@ optimize hints cycle (A.At region expression) =
           do  optAdd <- Names.registerGlobal ModuleName.basics "add"
               buildFusedFold hints cycle (baseStepKLength optAdd) (Opt.Int 0) stages source
 
+      | (A.At _ (Can.VarForeign home name _), args) <- collectApplication (A.At region expression)
+      , home == ModuleName.array, name == "foldl"
+      , [stepArg, accArg, arrArg] <- args
+      , (stages@(_:_), source) <- peelArrayChain arrArg
+      ->
+          do  optStep <- optimize hints cycle stepArg
+              optAcc  <- optimize hints cycle accArg
+              buildFusedArrayFold hints cycle (baseStepK optStep) optAcc stages source
+
       -- WORKER.RUN call-site rewrite. Requires at least one argument
       -- (fnArg : dataArgs) so a bare, unapplied `Worker.run` falls through
       -- to the plain Can.VarForeign case further below instead (compiled
@@ -842,6 +851,65 @@ baseStepKLength :: Opt.Expr -> StepK
 baseStepKLength optAdd _ accExpr =
   pure (Opt.Call optAdd [accExpr, Opt.Int 1])
 
+
+-- ARRAY PIPELINE FUSION (map/filter -> foldl)
+--
+-- See docs/superpowers/specs/2026-07-22-array-chain-fusion-design.md for the
+-- full derivation. Same mechanism as LIST PIPELINE FUSION above (reuses
+-- ListStage/StepK/wrapStage/baseStepK verbatim -- none of those reference
+-- List specifically), only the peeling recognizer and the final terminator
+-- call target Array instead. Deliberately NOT generalized into one
+-- module-parameterized peelChain: the existing List peelChain/peelListStage
+-- are also called from the bare-producer-chain catch-all guard and from
+-- three other List terminator guards (sum/product/length) that this plan
+-- does not touch, so leaving them untouched keeps this change purely
+-- additive with zero risk to already-shipped List fusion behavior.
+
+
+-- Nothing => not a recognized Array producer shape => stop peeling here.
+-- Only elm/core's own Array.map/Array.filter match (via either Can.Call or
+-- |>/<| syntax, thanks to collectApplication); everything else (including
+-- Array.foldr, which this plan deliberately does not fuse, and a local
+-- `myMap = Array.map` alias) falls through untouched. Reuses the List
+-- fusion work's ListStage constructors (StageMap/StageFilter) -- they carry
+-- no List-specific data, only the peeled function/predicate and inner expr.
+peelArrayStage :: Can.Expr -> Maybe ListStage
+peelArrayStage expr =
+  case collectApplication expr of
+    (A.At _ (Can.VarForeign home name _), [f, inner])
+      | home == ModuleName.array, name == "map" ->
+          Just (StageMap f inner)
+      | home == ModuleName.array, name == "filter" ->
+          Just (StageFilter f inner)
+    _ ->
+      Nothing
+
+
+-- Peels as many layers as match, outermost (closest to the foldl) first.
+-- Mirrors peelChain's recursion exactly, built on peelArrayStage instead of
+-- peelListStage.
+peelArrayChain :: Can.Expr -> ([ListStage], Can.Expr)
+peelArrayChain expr =
+  case peelArrayStage expr of
+    Nothing    -> ([], expr)
+    Just stage -> let (rest, source) = peelArrayChain (stageInner stage) in (stage : rest, source)
+
+
+-- Mirrors buildFusedFold exactly, only the emitted terminator differs
+-- (Array.foldl instead of List.foldl).
+buildFusedArrayFold :: Hints -> Cycle -> StepK -> Opt.Expr -> [ListStage] -> Can.Expr -> Names.Tracker Opt.Expr
+buildFusedArrayFold hints cycle base initExpr stages source =
+  do  optSource <- optimize hints cycle source
+      composed  <- foldM (wrapStage hints cycle) base stages
+      xName     <- Names.generate
+      accName   <- Names.generate
+      body      <- composed (Opt.VarLocal xName) (Opt.VarLocal accName)
+      optFoldl  <- Names.registerGlobal ModuleName.array "foldl"
+      pure $ Opt.Call optFoldl
+        [ Opt.Function [xName, accName] body
+        , initExpr
+        , optSource
+        ]
 
 -- BARE PRODUCER-CHAIN FUSION (map/filter/filterMap, no terminator)
 --
