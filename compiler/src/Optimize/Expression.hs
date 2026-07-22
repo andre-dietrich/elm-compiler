@@ -999,9 +999,9 @@ peelDictChain expr =
 -- accumulator -- the Dict analogue of StepK, which only threads a single
 -- value. foldM over `stages` left-to-right (outermost stage wrapped first)
 -- reconstructs the original evaluation order: a filter's predicate is
--- checked on whatever value an outer map already produced, exactly as
--- `dict |> Dict.map f |> Dict.filter pred` implies -- same reasoning as
--- wrapStage's own doc comment.
+-- checked on whatever value the map that runs first already produced,
+-- exactly as `dict |> Dict.map f |> Dict.filter pred` implies -- same
+-- reasoning as wrapStage's own doc comment.
 type DictStepK = Opt.Expr -> Opt.Expr -> Opt.Expr -> Names.Tracker Opt.Expr
 
 

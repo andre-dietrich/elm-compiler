@@ -128,10 +128,15 @@ This plan adds:
   detour): `Dict.map` never touches keys or tree shape (only the value at each existing node), so
   the composed pipeline's final `Dict.foldl` visits surviving keys in the same ascending order the
   fused version's direct walk over the *original* tree does, unconditionally.
-- Every sub-expression that used to be evaluated exactly once (`step`, `acc`, each producer's
-  function/predicate, the source dict) is still evaluated exactly once in the fused form — no
-  duplication, no elision (same argument as [[list-foldl-fusion-plan]]'s and
-  [[array-chain-fusion-spike]]'s).
+- No *observable* change for total, effect-free producer functions — the common case. A map whose
+  output feeds a following filter is emitted at both the predicate call site and the pass-through
+  to the next stage (`wrapDictStage`'s `DStageFilter` case calls `inner` with the same `elemExpr`
+  it just tested), so that producer's function is called twice per surviving element in the fused
+  form, not once. This is identical, pre-existing behavior inherited from `wrapStage`'s own
+  `StageFilter` case (same argument as [[list-foldl-fusion-plan]]'s and
+  [[array-chain-fusion-spike]]'s) — not a Dict-specific regression — and is unobservable for pure,
+  terminating functions, which is why the order-sensitive correctness check still passes. It would
+  only be observable for a diverging/crashing function or `Debug.log` in a Dev build.
 - Purely syntactic, import-alias-agnostic (matches `Can.VarForeign (ModuleName.Canonical
   "elm/core" "Dict") name` shapes, canonicalized before this pass runs) — does not fire through a
   local alias (e.g. `myFilter = Dict.filter`), same scope limitation every existing syntactic
