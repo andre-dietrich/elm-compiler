@@ -188,3 +188,70 @@ following the project's established pattern:
   same soundness argument. Deliberately narrow for v1.
 - **No format/`.elmo` risk** — this design touches no `AST.Optimized`/`AST.Canonical` type
   definitions at all, only adds ordinary functions in `Optimize/Case.hs`.
+
+## Addendum (found during implementation): dead destructor blocks the motivating case
+
+Task 1 built exactly as designed and passed its own build gate, but manual fixture testing (plan
+Task 2) found the merge does not fire for the plan's own motivating example —
+`case (status, priority) of (Pending, Low) -> "wait"; (Active, Low) -> "wait"; ...` — even though
+both arms' patterns bind no variable and both bodies are the literal string `"wait"`.
+
+**Root cause, in a function this design did not originally touch:**
+`Optimize.Expression.destructHelp`'s `Can.PCtor` case, for a **nullary** constructor pattern
+(`args = []`, e.g. `Pending`) whose path is *not* `Opt.Root` (i.e. it's nested inside a tuple/list/
+other compound pattern rather than being the case's direct scrutinee), unconditionally allocates a
+fresh-named `Opt.Destructor` before folding over `args`:
+
+```haskell
+_ ->
+  do  name <- Names.generate
+      foldM (destructCtorArg (Opt.Root name)) (Opt.Destructor name path : revDs) args
+```
+
+Since `args` is empty, the `foldM` is a no-op and `name` is never referenced by anything — this
+destructor exists purely as dead codegen (an unused local binding), independent of this feature
+entirely. But its presence wraps every arm's optimized body in `Opt.Destruct` with a distinct fresh
+name per arm, and `sameExpr` (by design) treats `Opt.Destruct` as always non-equal — so the merge
+never triggers for any constructor pattern nested inside something else, which is precisely the
+shape of the plan's own motivating multi-value-dispatch example, and a very common real Elm idiom.
+
+Manual testing confirmed the mechanism *does* work correctly for: single-column `Int`/`Bool`/
+custom-type `case` (patterns directly at `Opt.Root`), and `Bool` patterns at any nesting depth
+(`destructHelp`'s `PBool` case never allocates a destructor, regardless of path). It fails
+specifically for a non-nullary-free constructor pattern nested inside a tuple/list/etc.
+
+**Fix (root cause, not a `sameExpr` workaround):** `destructHelp`'s `Can.PCtor` case gets a new
+first branch for `args = []`, returning `pure revDs` unconditionally — matching what already
+happens today when such a pattern sits at `Opt.Root`. This never allocates a destructor for a
+nullary constructor regardless of path, since there is provably nothing to destructure:
+
+```haskell
+    Can.PCtor _ _ (Can.Union _ _ _ opts) _ _ args ->
+      case args of
+        [] ->
+          pure revDs
+
+        [Can.PatternCtorArg _ _ arg] ->
+          case opts of
+            Can.Normal -> destructHelp (Opt.Index Index.first path) arg revDs
+            Can.Unbox  -> destructHelp (Opt.Unbox path) arg revDs
+            Can.Enum   -> destructHelp (Opt.Index Index.first path) arg revDs
+
+        _ ->
+          case path of
+            Opt.Root _ ->
+              foldM (destructCtorArg path) revDs args
+
+            _ ->
+              do  name <- Names.generate
+                  foldM (destructCtorArg (Opt.Root name)) (Opt.Destructor name path : revDs) args
+```
+
+This is independently justified as removing genuinely dead codegen (an always-unused variable
+binding), not merely a workaround for this feature — and, as a side effect, it recovers sharing for
+the nested-constructor-pattern case, which is the shape this whole feature was motivated by.
+
+**Components touched (revised):** `compiler/src/Optimize/Expression.hs` is now also touched by this
+plan — specifically `destructHelp`'s `Can.PCtor` case (around what was originally lines 588-603).
+This is a small, self-contained, behavior-preserving change (it only removes an unreachable/unused
+binding) and does not change `Optimize.Case.hs` further or affect the `.elmo` binary format.
