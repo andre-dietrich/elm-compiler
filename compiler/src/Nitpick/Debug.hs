@@ -69,6 +69,13 @@ hasDebug expression =
     Opt.Shader _ _ _     -> False
     Opt.PrimOp _ l r     -> hasDebug l || hasDebug r
     Opt.EqClosed _ _ l r -> hasDebug l || hasDebug r
+    Opt.CmpOpClosed _ _ l r -> hasDebug l || hasDebug r
+    Opt.CmpCallClosed _ l r kind ->
+      hasDebug l || hasDebug r ||
+      case kind of
+        Opt.KCompare lt eq gt -> hasDebug lt || hasDebug eq || hasDebug gt
+        Opt.KMin              -> False
+        Opt.KMax              -> False
 
 
 defHasDebug :: Opt.Def -> Bool

@@ -96,6 +96,13 @@ exprTargets expression =
     Opt.Shader _ _ _     -> Set.empty
     Opt.PrimOp _ l r     -> exprTargets l <> exprTargets r
     Opt.EqClosed _ _ l r -> exprTargets l <> exprTargets r
+    Opt.CmpOpClosed _ _ l r -> exprTargets l <> exprTargets r
+    Opt.CmpCallClosed _ l r kind ->
+      exprTargets l <> exprTargets r <>
+      case kind of
+        Opt.KCompare lt eq gt -> exprTargets lt <> exprTargets eq <> exprTargets gt
+        Opt.KMin              -> Set.empty
+        Opt.KMax              -> Set.empty
 
 
 deciderTargets :: Opt.Decider Opt.Choice -> Set.Set Opt.Global

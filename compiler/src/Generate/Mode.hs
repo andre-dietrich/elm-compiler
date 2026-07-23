@@ -423,6 +423,13 @@ scanParam arities self param body =
         Opt.List entries     -> merges (map scan entries)
         Opt.PrimOp _ l r     -> merge (scan l) (scan r)
         Opt.EqClosed _ _ l r -> merge (scan l) (scan r)
+        Opt.CmpOpClosed _ _ l r -> merge (scan l) (scan r)
+        Opt.CmpCallClosed _ l r kind ->
+          merges $ scan l : scan r :
+            case kind of
+              Opt.KCompare lt eq gt -> [scan lt, scan eq, scan gt]
+              Opt.KMin              -> []
+              Opt.KMax              -> []
 
         Opt.Bool _       -> none
         Opt.Chr _        -> none

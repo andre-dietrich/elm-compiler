@@ -161,6 +161,12 @@ generate mode expression =
     Opt.EqClosed isEq shape left right ->
       JsExpr $ generateClosedEq mode isEq shape left right
 
+    Opt.CmpOpClosed op shape left right ->
+      JsExpr $ generateCmpOpClosed mode op shape left right
+
+    Opt.CmpCallClosed shape left right kind ->
+      JsExpr $ generateCmpCallClosed mode shape left right kind
+
 
 
 -- CODE CHUNKS
@@ -984,6 +990,184 @@ foldAnd exprs =
     []       -> JS.Bool True
     [e]      -> e
     e : rest -> JS.Infix JS.OpAnd e (foldAnd rest)
+
+
+
+-- CLOSED TUPLE COMPARE
+
+
+-- Emitted for Opt.CmpOpClosed. Dev mode calls the existing `cmp` helper
+-- unchanged, with the same (idealOp, backupOp, backupInt) triple
+-- generateBasicsCall already uses per operator -- byte-identical to
+-- today's output, since `cmp`'s isLiteral fast path can never fire for a
+-- Tuple-typed operand (Tuples are always JS object literals, never
+-- JS.String/Float/Int/Bool). Prod mode recursively lowers CmpShape into a
+-- direct short-circuiting boolean chain, no intermediate ordinal value.
+generateCmpOpClosed :: Mode.Mode -> Opt.CmpOp -> Opt.CmpShape -> Opt.Expr -> Opt.Expr -> JS.Expr
+generateCmpOpClosed mode op shape left right =
+  let
+    jsLeft = generateJsExpr mode left
+    jsRight = generateJsExpr mode right
+  in
+  case mode of
+    Mode.Dev _ ->
+      case op of
+        Opt.OpLt -> cmp JS.OpLt JS.OpLt   0    jsLeft jsRight
+        Opt.OpLe -> cmp JS.OpLe JS.OpLt   1    jsLeft jsRight
+        Opt.OpGt -> cmp JS.OpGt JS.OpGt   0    jsLeft jsRight
+        Opt.OpGe -> cmp JS.OpGe JS.OpGt (-1)   jsLeft jsRight
+
+    Mode.Prod _ _ ->
+      generateCmpBool op shape jsLeft jsRight
+
+
+-- Direct short-circuiting boolean chain for one comparison operator: all
+-- slots but the last are compared via generateOrdinal (need the full
+-- three-way result to decide whether to move on to the next slot or
+-- resolve now), the last slot uses the operator's actual relation
+-- directly. E.g. for OpLt on a flat Tuple2: `x.a !== y.a ? x.a < y.a :
+-- x.b < y.b`.
+generateCmpBool :: Opt.CmpOp -> Opt.CmpShape -> JS.Expr -> JS.Expr -> JS.Expr
+generateCmpBool op shape exprL exprR =
+  case shape of
+    Opt.CmpLeaf ->
+      JS.Infix (finalRelOp op) exprL exprR
+
+    Opt.CmpTuple2 s0 s1 ->
+      prefixStep op (slotOrdinal Index.first s0 exprL exprR) $
+        generateCmpBool op s1 (slotAccess Index.second exprL) (slotAccess Index.second exprR)
+
+    Opt.CmpTuple3 s0 s1 s2 ->
+      prefixStep op (slotOrdinal Index.first s0 exprL exprR) $
+        prefixStep op (slotOrdinal Index.second s1 exprL exprR) $
+          generateCmpBool op s2 (slotAccess Index.third exprL) (slotAccess Index.third exprR)
+
+
+-- If the prefix slot's ordinal is nonzero, the whole comparison is
+-- decided by it (using the operator's strict prefix relation: `<` for
+-- OpLt/OpLe, `>` for OpGt/OpGe -- ties must fall through to the next
+-- slot regardless of `<` vs `<=`). Otherwise defer to `rest`.
+prefixStep :: Opt.CmpOp -> JS.Expr -> JS.Expr -> JS.Expr
+prefixStep op ordinal rest =
+  JS.If (JS.Infix JS.OpNe ordinal (JS.Int 0))
+    (JS.Infix (prefixRelOp op) ordinal (JS.Int 0))
+    rest
+
+
+-- Full lexicographic ordinal (-1/0/1) for two same-shaped CmpShape-typed
+-- JS expressions -- the "compute once, read three ways" primitive used
+-- both by generateCmpBool's prefix-slot tie-breaks and by
+-- generateCmpCallClosed's `compare`/`min`/`max` codegen. Note: a prefix
+-- slot's ordinal subexpression is referenced twice by prefixStep/ordStep
+-- (once in the nonzero check, once as the resolved value) -- this
+-- duplicates generated code by a small constant factor per nesting level,
+-- which is fine in practice since real Tuple nesting is shallow (this
+-- scope's own MVP fixtures never go past 2 levels); a genuine shared JS
+-- temp per level would need an IIFE per level, trading code size for
+-- runtime call overhead, not obviously a win.
+generateOrdinal :: Opt.CmpShape -> JS.Expr -> JS.Expr -> JS.Expr
+generateOrdinal shape exprL exprR =
+  case shape of
+    Opt.CmpLeaf ->
+      JS.If (JS.Infix JS.OpLt exprL exprR) (JS.Int (-1))
+        (JS.If (JS.Infix JS.OpGt exprL exprR) (JS.Int 1) (JS.Int 0))
+
+    Opt.CmpTuple2 s0 s1 ->
+      ordStep (slotOrdinal Index.first s0 exprL exprR) $
+        generateOrdinal s1 (slotAccess Index.second exprL) (slotAccess Index.second exprR)
+
+    Opt.CmpTuple3 s0 s1 s2 ->
+      ordStep (slotOrdinal Index.first s0 exprL exprR) $
+        ordStep (slotOrdinal Index.second s1 exprL exprR) $
+          generateOrdinal s2 (slotAccess Index.third exprL) (slotAccess Index.third exprR)
+
+
+ordStep :: JS.Expr -> JS.Expr -> JS.Expr
+ordStep ordinal rest =
+  JS.If (JS.Infix JS.OpNe ordinal (JS.Int 0)) ordinal rest
+
+
+slotOrdinal :: Index.ZeroBased -> Opt.CmpShape -> JS.Expr -> JS.Expr -> JS.Expr
+slotOrdinal index subShape exprL exprR =
+  generateOrdinal subShape (slotAccess index exprL) (slotAccess index exprR)
+
+
+slotAccess :: Index.ZeroBased -> JS.Expr -> JS.Expr
+slotAccess index expr =
+  JS.Access expr (JsName.fromIndex index)
+
+
+finalRelOp :: Opt.CmpOp -> JS.InfixOp
+finalRelOp op =
+  case op of
+    Opt.OpLt -> JS.OpLt
+    Opt.OpLe -> JS.OpLe
+    Opt.OpGt -> JS.OpGt
+    Opt.OpGe -> JS.OpGe
+
+
+prefixRelOp :: Opt.CmpOp -> JS.InfixOp
+prefixRelOp op =
+  case op of
+    Opt.OpLt -> JS.OpLt
+    Opt.OpLe -> JS.OpLt
+    Opt.OpGt -> JS.OpGt
+    Opt.OpGe -> JS.OpGt
+
+
+-- Emitted for Opt.CmpCallClosed. Dev mode calls the existing
+-- generateGlobalCall unchanged, with the original Basics function name --
+-- byte-identical to today's `A2(global, left, right)`. Prod mode: KMin/
+-- KMax use a single short-circuit boolean condition (generateCmpBool)
+-- with left/right as the two ternary branches -- no intermediate value.
+-- KCompare needs the ordinal read three ways (LT/EQ/GT), so it's
+-- genuinely computed once via a small IIFE built directly at the JS.Expr
+-- level (JS.Function/JS.Var/JS.IfStmt/JS.Return) -- this construction is
+-- entirely local to this function, never touches Opt.Expr/the .elmo, and
+-- is therefore invisible to Dev-mode codegen (which never reaches this
+-- branch at all): it cannot violate the byte-identical-Dev-output
+-- contract the way a generic Opt.Let+Opt.If built at the Optimize.
+-- Expression layer would have (see the design spec's Correction 2).
+generateCmpCallClosed :: Mode.Mode -> Opt.CmpShape -> Opt.Expr -> Opt.Expr -> Opt.CmpCallKind -> JS.Expr
+generateCmpCallClosed mode shape left right kind =
+  case mode of
+    Mode.Dev _ ->
+      generateGlobalCall ModuleName.basics (cmpCallKindName kind)
+        (map (generateJsExpr mode) [left, right])
+
+    Mode.Prod _ _ ->
+      let
+        jsLeft = generateJsExpr mode left
+        jsRight = generateJsExpr mode right
+      in
+      case kind of
+        Opt.KMin -> JS.If (generateCmpBool Opt.OpLt shape jsLeft jsRight) jsLeft jsRight
+        Opt.KMax -> JS.If (generateCmpBool Opt.OpGt shape jsLeft jsRight) jsLeft jsRight
+
+        Opt.KCompare lt eq gt ->
+          let
+            ordName = JsName.fromLocal "_ord"
+            ordRef = JS.Ref ordName
+          in
+          JS.Call
+            ( JS.Function Nothing []
+                [ JS.Var ordName (generateOrdinal shape jsLeft jsRight)
+                , JS.IfStmt (JS.Infix JS.OpLt ordRef (JS.Int 0))
+                    (JS.Return (generateJsExpr mode lt))
+                    (JS.IfStmt (JS.Infix JS.OpEq ordRef (JS.Int 0))
+                      (JS.Return (generateJsExpr mode eq))
+                      (JS.Return (generateJsExpr mode gt)))
+                ]
+            )
+            []
+
+
+cmpCallKindName :: Opt.CmpCallKind -> Name.Name
+cmpCallKindName kind =
+  case kind of
+    Opt.KCompare _ _ _ -> "compare"
+    Opt.KMin           -> "min"
+    Opt.KMax           -> "max"
 
 
 
