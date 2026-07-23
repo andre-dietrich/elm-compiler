@@ -240,12 +240,6 @@ optimize hints cycle (A.At region expression) =
 
         Nothing ->
           case toClosedEqTarget hints region home name of
-            Nothing ->
-              do  optFunc <- Names.registerGlobal home name
-                  optLeft <- optimize hints cycle left
-                  optRight <- optimize hints cycle right
-                  return (Opt.Call optFunc [optLeft, optRight])
-
             Just (isEq, shape) ->
               do  optLeft <- optimize hints cycle left
                   optRight <- optimize hints cycle right
@@ -254,6 +248,23 @@ optimize hints cycle (A.At region expression) =
                     else
                       do  optFunc <- Names.registerGlobal home name
                           return (Opt.Call optFunc [optLeft, optRight])
+
+            Nothing ->
+              case toClosedCmpTarget hints region home name of
+                Just (op, shape) ->
+                  do  optLeft <- optimize hints cycle left
+                      optRight <- optimize hints cycle right
+                      if isCheap optLeft && isCheap optRight
+                        then registerClosedCmpOp name op shape optLeft optRight
+                        else
+                          do  optFunc <- Names.registerGlobal home name
+                              return (Opt.Call optFunc [optLeft, optRight])
+
+                Nothing ->
+                  do  optFunc <- Names.registerGlobal home name
+                      optLeft <- optimize hints cycle left
+                      optRight <- optimize hints cycle right
+                      return (Opt.Call optFunc [optLeft, optRight])
 
     Can.Lambda args body ->
       do  (argNames, destructors) <- destructArgs args
@@ -273,9 +284,21 @@ optimize hints cycle (A.At region expression) =
                       pure (Opt.Call optFunc optArgs)
 
         Nothing ->
-          Opt.Call
-            <$> optimize hints cycle func
-            <*> traverse (optimize hints cycle) args
+          case toClosedCmpCall hints region func args of
+            Just (name, shape) ->
+              do  optArgs <- traverse (optimize hints cycle) args
+                  case optArgs of
+                    [left, right] | isCheap left && isCheap right ->
+                      makeClosedCmpCall name shape left right
+
+                    _ ->
+                      do  optFunc <- optimize hints cycle func
+                          pure (Opt.Call optFunc optArgs)
+
+            Nothing ->
+              Opt.Call
+                <$> optimize hints cycle func
+                <*> traverse (optimize hints cycle) args
 
     Can.If branches finally ->
       let
@@ -435,6 +458,42 @@ registerClosedEq shape isEq optLeft optRight =
         Opt.ClosedEqUnion _       -> pure withKernel
 
 
+-- Like toClosedEqTarget, but for `<`/`<=`/`>`/`>=` on a closed
+-- Tuple2/Tuple3-of-comparable-scalars shape (see Type.Solve's
+-- resolveCmpProbes).
+toClosedCmpTarget :: Hints -> A.Region -> ModuleName.Canonical -> Name.Name -> Maybe (Opt.CmpOp, Opt.CmpShape)
+toClosedCmpTarget hints region home name =
+  if home /= ModuleName.basics then
+    Nothing
+  else
+    do  op <-
+          case name of
+            "lt" -> Just Opt.OpLt
+            "le" -> Just Opt.OpLe
+            "gt" -> Just Opt.OpGt
+            "ge" -> Just Opt.OpGe
+            _    -> Nothing
+        shape <- Map.lookup region (_cmpHints hints)
+        Just (op, shape)
+
+
+-- Builds the Opt.CmpOpClosed node. Registers the same phantom
+-- Basics.lt/le/gt/ge global edge the generic fallback branch would have
+-- registered for this call site -- not because the CmpOpClosed node we
+-- build actually calls through that global, but so the dead-code-
+-- elimination reachability graph coming out of this module stays
+-- identical to what it was before this shortcut existed (same reasoning
+-- as registerClosedEq -- see that function's comment). Also registers the
+-- Utils kernel dependency: unlike registerClosedEq's Dev fallback,
+-- generateCmpOpClosed's Dev fallback goes through the existing `cmp`
+-- helper, which references _Utils_cmp directly (not through the Basics
+-- global at all), so the kernel chunk must stay reachable too.
+registerClosedCmpOp :: Name.Name -> Opt.CmpOp -> Opt.CmpShape -> Opt.Expr -> Opt.Expr -> Names.Tracker Opt.Expr
+registerClosedCmpOp name op shape optLeft optRight =
+  do  _ <- Names.registerGlobal ModuleName.basics name
+      Names.registerKernel Name.utils (Opt.CmpOpClosed op shape optLeft optRight)
+
+
 -- PRIM CALL
 
 
@@ -481,6 +540,44 @@ isCheap expr =
     Opt.Str _         -> True
     Opt.Access e _    -> isCheap e
     _                 -> False
+
+
+-- Like toPrimCall, but for closed-tuple compare/min/max (see Type.Solve's
+-- resolveCmpProbes). Checked only when toPrimCall's own scalar PrimType
+-- hint lookup fails (see the Can.Call case below), so a genuinely scalar
+-- compare/min/max keeps taking the existing CallCompare/CallMin/CallMax
+-- path unchanged.
+toClosedCmpCall :: Hints -> A.Region -> Can.Expr -> [Can.Expr] -> Maybe (Name.Name, Opt.CmpShape)
+toClosedCmpCall hints region (A.At _ func) args =
+  case (func, args) of
+    (Can.VarForeign home name _, [_, _])
+      | home == ModuleName.basics && (name == "compare" || name == "min" || name == "max") ->
+          (,) name <$> Map.lookup region (_cmpHints hints)
+
+    _ ->
+      Nothing
+
+
+-- Builds the Opt.CmpCallClosed node, registering the same phantom
+-- Basics.compare/min/max global edge registerClosedCmpOp documents, for
+-- the same DCE-reachability reason. Unlike registerClosedCmpOp, no Utils
+-- kernel registration is needed: generateCmpCallClosed's Dev fallback
+-- goes through generateGlobalCall (the ordinary Basics.compare/min/max
+-- global), not a direct kernel reference. `compare` additionally
+-- registers the LT/EQ/GT ctor refs its Prod-mode codegen embeds -- same
+-- registerCtor calls the existing scalar CallCompare already makes.
+makeClosedCmpCall :: Name.Name -> Opt.CmpShape -> Opt.Expr -> Opt.Expr -> Names.Tracker Opt.Expr
+makeClosedCmpCall name shape optLeft optRight =
+  do  _ <- Names.registerGlobal ModuleName.basics name
+      case name of
+        "compare" ->
+          do  lt <- Names.registerCtor ModuleName.basics "LT" Index.first Can.Enum
+              eq <- Names.registerCtor ModuleName.basics "EQ" Index.second Can.Enum
+              gt <- Names.registerCtor ModuleName.basics "GT" Index.third Can.Enum
+              pure (Opt.CmpCallClosed shape optLeft optRight (Opt.KCompare lt eq gt))
+
+        "min" -> pure (Opt.CmpCallClosed shape optLeft optRight Opt.KMin)
+        _     -> pure (Opt.CmpCallClosed shape optLeft optRight Opt.KMax)
 
 
 -- `min a b` becomes `if a < b then a else b` (and analogously for max),
