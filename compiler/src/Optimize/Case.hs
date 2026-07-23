@@ -234,6 +234,9 @@ sameExpr expr1 expr2 =
     (Opt.Tuple a1 b1 c1, Opt.Tuple a2 b2 c2) ->
       sameExpr a1 a2 && sameExpr b1 b2 && sameMaybeExpr c1 c2
 
+    (Opt.EqClosed isEq1 shape1 l1 r1, Opt.EqClosed isEq2 shape2 l2 r2) ->
+      isEq1 == isEq2 && shape1 == shape2 && sameExpr l1 l2 && sameExpr r1 r2
+
     _ ->
       False
 

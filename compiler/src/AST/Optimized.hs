@@ -121,6 +121,7 @@ data PrimBinop
 data ClosedEqShape
   = ClosedEqRecord (Set.Set Name)
   | ClosedEqUnion Int
+  deriving (Eq)
 
 
 data Global = Global ModuleName.Canonical Name
