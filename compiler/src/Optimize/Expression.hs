@@ -405,12 +405,22 @@ toClosedEqTarget hints region home name =
 -- must stay reachable even though Prod mode never calls it -- skipping
 -- this the way Opt.PrimOp skips Names.registerGlobal would be wrong here,
 -- since unlike PrimOp's raw `===`/`<`, EqClosed's Dev-mode codegen is
--- itself still a kernel call. For the record case, also registers the
--- field names for Prod's field-shortening table, exactly like Can.Update's
+-- itself still a kernel call. We also register the plain
+-- Global ModuleName.basics "eq"/"neq" edge the generic fallback branch
+-- above would have registered for this call site -- not because the
+-- EqClosed node we build actually calls Basics.eq/neq, but so that the
+-- dead-code-elimination reachability graph coming out of this module is
+-- identical to what it was before this shortcut existed. Without it, a
+-- program whose only remaining reference to Basics.eq/neq is a closed-type
+-- call site would see that global's own top-level binding pruned, changing
+-- Dev-mode output even though nothing in the program actually calls the
+-- dropped binding. For the record case, also registers the field names for
+-- Prod's field-shortening table, exactly like Can.Update's
 -- registerFieldList call above.
 registerClosedEq :: Opt.ClosedEqShape -> Bool -> Opt.Expr -> Opt.Expr -> Names.Tracker Opt.Expr
 registerClosedEq shape isEq optLeft optRight =
-  do  withKernel <- Names.registerKernel Name.utils (Opt.EqClosed isEq shape optLeft optRight)
+  do  _ <- Names.registerGlobal ModuleName.basics (if isEq then "eq" else "neq")
+      withKernel <- Names.registerKernel Name.utils (Opt.EqClosed isEq shape optLeft optRight)
       case shape of
         Opt.ClosedEqRecord fields -> Names.registerFieldList (Set.toList fields) withKernel
         Opt.ClosedEqUnion _       -> pure withKernel
