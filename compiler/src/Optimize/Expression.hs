@@ -230,10 +230,21 @@ optimize hints cycle (A.At region expression) =
             <*> optimize hints cycle right
 
         Nothing ->
-          do  optFunc <- Names.registerGlobal home name
-              optLeft <- optimize hints cycle left
-              optRight <- optimize hints cycle right
-              return (Opt.Call optFunc [optLeft, optRight])
+          case toClosedEqTarget hints region home name of
+            Nothing ->
+              do  optFunc <- Names.registerGlobal home name
+                  optLeft <- optimize hints cycle left
+                  optRight <- optimize hints cycle right
+                  return (Opt.Call optFunc [optLeft, optRight])
+
+            Just (isEq, shape) ->
+              do  optLeft <- optimize hints cycle left
+                  optRight <- optimize hints cycle right
+                  if isCheap optLeft && isCheap optRight
+                    then registerClosedEq shape isEq optLeft optRight
+                    else
+                      do  optFunc <- Names.registerGlobal home name
+                          return (Opt.Call optFunc [optLeft, optRight])
 
     Can.Lambda args body ->
       do  (argNames, destructors) <- destructArgs args
@@ -365,6 +376,44 @@ toPrimBinop home name prim =
       "append" -> if prim == Type.PStr then Just Opt.PrimAppend else Nothing
       _        -> Nothing
 
+
+-- Like toPrimBinop, but for `==`/`/=` on a closed Record or closed
+-- same-module non-generic Normal-ctor Union type (see Type.Solve's
+-- resolveRecordEqProbes/resolveUnionEqProbes). A region can never match
+-- both hint maps (a given `==`/`/=` site has exactly one operand type), so
+-- checking the record map first is just a fixed, arbitrary order.
+toClosedEqTarget :: Hints -> A.Region -> ModuleName.Canonical -> Name.Name -> Maybe (Bool, Opt.ClosedEqShape)
+toClosedEqTarget hints region home name =
+  if home /= ModuleName.basics || not (name == "eq" || name == "neq") then
+    Nothing
+  else
+    let isEq = name == "eq" in
+    case Map.lookup region (_recordEqHints hints) of
+      Just fields ->
+        Just (isEq, Opt.ClosedEqRecord fields)
+
+      Nothing ->
+        case Map.lookup region (_unionEqHints hints) of
+          Just maxArity -> Just (isEq, Opt.ClosedEqUnion maxArity)
+          Nothing       -> Nothing
+
+
+-- Builds the Opt.EqClosed node, registering the same runtime dependency a
+-- generic Basics.eq/neq call would have needed: the Utils kernel. Dev mode
+-- still falls back to _Utils_eq/_Utils_neq for these nodes (see
+-- Generate.JavaScript.Expression's generateClosedEq), so the kernel chunk
+-- must stay reachable even though Prod mode never calls it -- skipping
+-- this the way Opt.PrimOp skips Names.registerGlobal would be wrong here,
+-- since unlike PrimOp's raw `===`/`<`, EqClosed's Dev-mode codegen is
+-- itself still a kernel call. For the record case, also registers the
+-- field names for Prod's field-shortening table, exactly like Can.Update's
+-- registerFieldList call above.
+registerClosedEq :: Opt.ClosedEqShape -> Bool -> Opt.Expr -> Opt.Expr -> Names.Tracker Opt.Expr
+registerClosedEq shape isEq optLeft optRight =
+  do  withKernel <- Names.registerKernel Name.utils (Opt.EqClosed isEq shape optLeft optRight)
+      case shape of
+        Opt.ClosedEqRecord fields -> Names.registerFieldList (Set.toList fields) withKernel
+        Opt.ClosedEqUnion _       -> pure withKernel
 
 
 -- PRIM CALL
