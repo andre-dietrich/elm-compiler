@@ -48,10 +48,20 @@ type Cycle =
 -- constraints. An absent entry means the record's type wasn't provably
 -- closed at that site (e.g. still row-polymorphic), which keeps the
 -- generic Object.assign-based codegen path.
+--
+-- _recordEqHints/_unionEqHints are analogous tables for `==`/`/=` sites on
+-- a closed Record or closed same-module non-generic Normal-ctor Union type
+-- whose fields/ctor-args are all JS-primitive-safe -- populated by
+-- Type.Solve from the same CProbe constraints as _primHints (see
+-- Type.Type's toClosedPrimFields/toClosedUnionEqArity). An absent entry in
+-- both keeps the generic Basics.eq/neq call (-> _Utils_eq). See
+-- AST.Optimized's EqClosed.
 data Hints =
   Hints
     { _primHints :: Map.Map A.Region Type.PrimType
     , _recordShapeHints :: Map.Map A.Region (Set.Set Name.Name)
+    , _recordEqHints :: Map.Map A.Region (Set.Set Name.Name)
+    , _unionEqHints :: Map.Map A.Region Int
     }
 
 

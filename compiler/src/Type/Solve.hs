@@ -15,6 +15,7 @@ import qualified Data.Vector as Vector
 import qualified Data.Vector.Mutable as MVector
 
 import qualified AST.Canonical as Can
+import qualified Elm.ModuleName as ModuleName
 import qualified Reporting.Annotation as A
 import qualified Reporting.Error.Type as Error
 import qualified Reporting.Render.Type as RT
@@ -30,8 +31,8 @@ import qualified Type.UnionFind as UF
 -- RUN SOLVER
 
 
-run :: Constraint -> IO (Either (NE.List Error.Error) (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType, Map.Map A.Region (Set.Set Name.Name)))
-run constraint =
+run :: ModuleName.Canonical -> Map.Map Name.Name Can.Union -> Constraint -> IO (Either (NE.List Error.Error) (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType, Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region Int))
+run home unions constraint =
   do  pools <- MVector.replicate 8 []
 
       (State env _ errors probes recordProbes) <-
@@ -42,7 +43,9 @@ run constraint =
           do  annotations <- traverse Type.toAnnotation env
               hints <- resolveProbes probes
               shapeHints <- resolveRecordProbes recordProbes
-              return $ Right (annotations, hints, shapeHints)
+              recordEqHints <- resolveRecordEqProbes probes
+              unionEqHints <- resolveUnionEqProbes home unions probes
+              return $ Right (annotations, hints, shapeHints, recordEqHints, unionEqHints)
 
         e:es ->
           return $ Left (NE.List e es)
@@ -88,6 +91,42 @@ addRecordProbe hints (region, var) =
       return $ case maybeFields of
         Just fields -> Map.insert region fields hints
         Nothing     -> hints
+
+
+
+-- CLOSED RECORD EQUALITY HINTS
+
+
+resolveRecordEqProbes :: [(A.Region, Variable, Variable)] -> IO (Map.Map A.Region (Set.Set Name.Name))
+resolveRecordEqProbes probes =
+  foldM addRecordEqProbe Map.empty probes
+
+
+addRecordEqProbe :: Map.Map A.Region (Set.Set Name.Name) -> (A.Region, Variable, Variable) -> IO (Map.Map A.Region (Set.Set Name.Name))
+addRecordEqProbe hints (region, leftVar, rightVar) =
+  do  maybeLeft <- Type.toClosedPrimFields leftVar
+      maybeRight <- Type.toClosedPrimFields rightVar
+      return $ case (maybeLeft, maybeRight) of
+        (Just left, Just right) | left == right -> Map.insert region left hints
+        _                                       -> hints
+
+
+
+-- CLOSED UNION EQUALITY HINTS
+
+
+resolveUnionEqProbes :: ModuleName.Canonical -> Map.Map Name.Name Can.Union -> [(A.Region, Variable, Variable)] -> IO (Map.Map A.Region Int)
+resolveUnionEqProbes home unions probes =
+  foldM (addUnionEqProbe home unions) Map.empty probes
+
+
+addUnionEqProbe :: ModuleName.Canonical -> Map.Map Name.Name Can.Union -> Map.Map A.Region Int -> (A.Region, Variable, Variable) -> IO (Map.Map A.Region Int)
+addUnionEqProbe home unions hints (region, leftVar, rightVar) =
+  do  maybeLeft <- Type.toClosedUnionEqArity home unions leftVar
+      maybeRight <- Type.toClosedUnionEqArity home unions rightVar
+      return $ case (maybeLeft, maybeRight) of
+        (Just left, Just right) | left == right -> Map.insert region left hints
+        _                                       -> hints
 
 
 
