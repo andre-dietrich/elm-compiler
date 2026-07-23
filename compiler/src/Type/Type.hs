@@ -11,6 +11,8 @@ module Type.Type
   , PrimType(..)
   , toPrimType
   , toClosedFields
+  , toClosedPrimFields
+  , toClosedUnionEqArity
   , noRank
   , outermostRank
   , Mark
@@ -294,6 +296,119 @@ toClosedFields variable =
         _ ->
           return Nothing
 
+
+-- CLOSED PRIMITIVE-FIELD RECORD PROBES
+--
+-- Like toClosedFields, but additionally requires every field to itself be
+-- a JS-primitive-safe monomorphic type (see PrimType/toPrimType above).
+-- Used to prove a record-typed `==`/`/=` comparison can be lowered to a
+-- flat chain of `===` field reads instead of the generic _Utils_eq walk --
+-- see Type.Solve's resolveRecordEqProbes and Generate.JavaScript's
+-- generateClosedEq. A record containing a nested Record/Union/List/Dict/
+-- etc. field is deliberately NOT closed-prim (returns Nothing), keeping
+-- the generic fallback -- this is a first pass that only handles flat
+-- records of scalar fields, not recursively nested closed shapes.
+
+
+toClosedPrimFields :: Variable -> IO (Maybe (Set.Set Name.Name))
+toClosedPrimFields variable =
+  do  (Descriptor content _ _ _) <- UF.get variable
+      case content of
+        Structure EmptyRecord1 ->
+          return (Just Set.empty)
+
+        Structure (Record1 fields extVar) ->
+          do  maybeFieldNames <- traverse toPrimFieldName (Map.toList fields)
+              case sequence maybeFieldNames of
+                Nothing ->
+                  return Nothing
+
+                Just names ->
+                  do  maybeExtFields <- toClosedPrimFields extVar
+                      return (Set.union (Set.fromList names) <$> maybeExtFields)
+
+        Alias _ _ _ realVariable ->
+          toClosedPrimFields realVariable
+
+        _ ->
+          return Nothing
+
+
+toPrimFieldName :: (Name.Name, Variable) -> IO (Maybe Name.Name)
+toPrimFieldName (name, fieldVar) =
+  do  maybePrim <- toPrimType fieldVar
+      return (fmap (const name) maybePrim)
+
+
+-- CLOSED UNION EQUALITY PROBES
+--
+-- Determines whether a resolved Variable is an application of a
+-- non-generic Can.Union (no type parameters) defined in the CURRENT
+-- module, whose CtorOpts is Normal (excludes Enum -- raw ints at runtime,
+-- no `$`/`aN` fields to compare -- and Unbox -- identity-erased, the
+-- runtime value literally IS the unwrapped payload) and whose every ctor's
+-- argument types are themselves JS-primitive-safe. Returns the union's
+-- max ctor arity (== the Prod-mode padded object shape's field count, see
+-- Optimize.Module's addUnion and Generate.JavaScript.Expression's
+-- generateCtor) so Generate.JavaScript can emit a flat
+-- `.$===.$ && .a1===.a1 && ...` chain.
+--
+-- Restricted to unions declared in the module being compiled, since only
+-- that module's own Can.Union table is available here -- a union imported
+-- from elsewhere keeps the generic _Utils_eq fallback. Restricted to
+-- non-generic unions (no type variables) to avoid needing the
+-- substitution machinery a parameterized union's ctor argument types
+-- would require.
+
+
+toClosedUnionEqArity :: ModuleName.Canonical -> Map.Map Name.Name Can.Union -> Variable -> IO (Maybe Int)
+toClosedUnionEqArity home unions variable =
+  do  (Descriptor content _ _ _) <- UF.get variable
+      case content of
+        Structure (App1 typeHome name []) | typeHome == home ->
+          return $
+            do  union <- Map.lookup name unions
+                closedUnionArity union
+
+        Alias _ _ _ realVariable ->
+          toClosedUnionEqArity home unions realVariable
+
+        _ ->
+          return Nothing
+
+
+closedUnionArity :: Can.Union -> Maybe Int
+closedUnionArity (Can.Union vars ctors _ opts) =
+  if not (null vars) || opts /= Can.Normal then
+    Nothing
+  else if all ctorIsPrim ctors then
+    Just (foldr (\(Can.Ctor _ _ numArgs _) high -> max numArgs high) 0 ctors)
+  else
+    Nothing
+
+
+ctorIsPrim :: Can.Ctor -> Bool
+ctorIsPrim (Can.Ctor _ _ _ argTypes) =
+  all (\t -> closedPrimOfCanType t /= Nothing) argTypes
+
+
+closedPrimOfCanType :: Can.Type -> Maybe PrimType
+closedPrimOfCanType tipe =
+  case tipe of
+    Can.TType typeHome name []
+      | typeHome == ModuleName.basics && name == "Int"    -> Just PInt
+      | typeHome == ModuleName.basics && name == "Float"  -> Just PFloat
+      | typeHome == ModuleName.basics && name == "Bool"   -> Just PBool
+      | typeHome == ModuleName.string && name == "String" -> Just PStr
+
+    Can.TAlias _ _ [] (Can.Filled realType) ->
+      closedPrimOfCanType realType
+
+    Can.TAlias _ _ [] (Can.Holey realType) ->
+      closedPrimOfCanType realType
+
+    _ ->
+      Nothing
 
 
 -- WEBGL TYPES
