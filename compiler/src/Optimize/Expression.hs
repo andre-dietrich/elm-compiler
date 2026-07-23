@@ -56,12 +56,21 @@ type Cycle =
 -- Type.Type's toClosedPrimFields/toClosedUnionEqArity). An absent entry in
 -- both keeps the generic Basics.eq/neq call (-> _Utils_eq). See
 -- AST.Optimized's EqClosed.
+--
+-- _cmpHints is the analogous table for `<`/`<=`/`>`/`>=`/`compare`/`min`/
+-- `max` sites on a closed Tuple2/Tuple3-of-comparable-scalars shape --
+-- populated by Type.Solve from the same CProbe constraints, converted from
+-- Type.CmpShape to Opt.CmpShape once in Optimize.Module (see
+-- Type.Type's toClosedCmpShape). An absent entry keeps the generic
+-- Basics.lt/le/gt/ge/compare/min/max call. See AST.Optimized's
+-- CmpOpClosed/CmpCallClosed.
 data Hints =
   Hints
     { _primHints :: Map.Map A.Region Type.PrimType
     , _recordShapeHints :: Map.Map A.Region (Set.Set Name.Name)
     , _recordEqHints :: Map.Map A.Region (Set.Set Name.Name)
     , _unionEqHints :: Map.Map A.Region Int
+    , _cmpHints :: Map.Map A.Region Opt.CmpShape
     }
 
 
