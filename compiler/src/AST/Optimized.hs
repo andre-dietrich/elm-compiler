@@ -2,6 +2,7 @@ module AST.Optimized
   ( Def(..)
   , Expr(..)
   , PrimBinop(..)
+  , ClosedEqShape(..)
   , Global(..)
   , ConsInfo(..)
   , Path(..)
@@ -90,6 +91,17 @@ data Expr
   | Tuple Expr Expr (Maybe Expr)
   | Shader Shader.Source (Set.Set Name) (Set.Set Name)
   | PrimOp PrimBinop Expr Expr
+  -- Emitted for `==`/`/=` on a closed Record or non-generic same-module
+  -- closed Union type whose fields/ctor-args are all JS-primitive-safe
+  -- (see Type.Type's toClosedPrimFields/toClosedUnionEqArity and
+  -- Optimize.Expression's toClosedEqTarget). The Bool is True for `==`,
+  -- False for `/=`. Lets Generate.JavaScript skip the generic
+  -- _Utils_eq/_Utils_eqHelp keyed walk in favor of a flat chain of named
+  -- field reads -- see Generate.JavaScript.Expression's generateClosedEq.
+  -- Prod-mode-only codegen; Dev mode ignores the shape and keeps
+  -- generating the ordinary _Utils_eq/_Utils_neq kernel call (Dev output
+  -- must stay byte-identical -- see CLAUDE.md).
+  | EqClosed Bool ClosedEqShape Expr Expr
 
 
 -- Specialized comparison/append operators emitted when the type checker has
@@ -104,6 +116,11 @@ data PrimBinop
   | PrimLe
   | PrimGe
   | PrimAppend
+
+
+data ClosedEqShape
+  = ClosedEqRecord (Set.Set Name)
+  | ClosedEqUnion Int
 
 
 data Global = Global ModuleName.Canonical Name
@@ -341,6 +358,7 @@ instance Binary Expr where
       PrimOp a b c     -> putWord8 27 >> put a >> put b >> put c
       TailCallCons a b c d e   -> putWord8 28 >> put a >> put b >> put c >> put d >> put e
       TailCallConsBase a b c   -> putWord8 29 >> put a >> put b >> put c
+      EqClosed a b c d         -> putWord8 30 >> put a >> put b >> put c >> put d
 
   get =
     do  word <- getWord8
@@ -375,6 +393,7 @@ instance Binary Expr where
           27 -> liftM3 PrimOp get get get
           28 -> TailCallCons <$> get <*> get <*> get <*> get <*> get
           29 -> liftM3 TailCallConsBase get get get
+          30 -> EqClosed <$> get <*> get <*> get <*> get
           _  -> fail "problem getting Opt.Expr binary"
 
 
@@ -401,6 +420,20 @@ instance Binary PrimBinop where
           5 -> pure PrimGe
           6 -> pure PrimAppend
           _ -> fail "problem getting Opt.PrimBinop binary"
+
+
+instance Binary ClosedEqShape where
+  put shape =
+    case shape of
+      ClosedEqRecord a -> putWord8 0 >> put a
+      ClosedEqUnion  a -> putWord8 1 >> put a
+
+  get =
+    do  n <- getWord8
+        case n of
+          0 -> liftM ClosedEqRecord get
+          1 -> liftM ClosedEqUnion get
+          _ -> fail "problem getting Opt.ClosedEqShape binary"
 
 
 instance Binary Def where

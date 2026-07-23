@@ -422,6 +422,7 @@ scanParam arities self param body =
         Opt.Tuple a b maybeC -> merges [scan a, scan b, maybe none scan maybeC]
         Opt.List entries     -> merges (map scan entries)
         Opt.PrimOp _ l r     -> merge (scan l) (scan r)
+        Opt.EqClosed _ _ l r -> merge (scan l) (scan r)
 
         Opt.Bool _       -> none
         Opt.Chr _        -> none

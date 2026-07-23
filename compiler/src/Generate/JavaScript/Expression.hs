@@ -158,6 +158,9 @@ generate mode expression =
     Opt.PrimOp op left right ->
       JsExpr $ generatePrimOp mode op left right
 
+    Opt.EqClosed isEq shape left right ->
+      JsExpr $ generateClosedEq mode isEq shape left right
+
 
 
 -- CODE CHUNKS
@@ -919,6 +922,68 @@ generatePrimOp mode op left right =
     Opt.PrimLe     -> JS.Infix JS.OpLe (generateJsExpr mode left) (generateJsExpr mode right)
     Opt.PrimGe     -> JS.Infix JS.OpGe (generateJsExpr mode left) (generateJsExpr mode right)
     Opt.PrimAppend -> foldr1 (JS.Infix JS.OpAdd) (generateJsExpr mode left : toSeqs mode right)
+
+
+-- Emitted for Opt.EqClosed. Dev mode keeps the exact codegen a plain
+-- Basics.eq/neq call on these operands would have produced before this
+-- optimization existed (_Utils_eq/_Utils_neq kernel call) -- Dev output is
+-- a debugging/time-travel contract, see CLAUDE.md, so it must not change.
+-- Prod mode emits a flat chain of `===` field reads instead: for a closed
+-- Record, one per proven-prim field (ClosedEqRecord); for a closed Union,
+-- a tag check followed by one per padded a1..aN slot (ClosedEqUnion --
+-- see generateCtor's maxArity padding: every variant of a Can.Normal
+-- union shares the same object shape in Prod, so comparing up to the
+-- union's max arity is safe and tag-independent even though only one
+-- variant's slots are "meaningful" -- the rest are `null` on both sides
+-- whenever the tags already matched, since same tag implies same real
+-- arity).
+generateClosedEq :: Mode.Mode -> Bool -> Opt.ClosedEqShape -> Opt.Expr -> Opt.Expr -> JS.Expr
+generateClosedEq mode isEq shape left right =
+  case mode of
+    Mode.Dev _ ->
+      let
+        jsLeft = generateJsExpr mode left
+        jsRight = generateJsExpr mode right
+      in
+      if isEq then equal jsLeft jsRight else notEqual jsLeft jsRight
+
+    Mode.Prod _ _ ->
+      let
+        jsLeft = generateJsExpr mode left
+        jsRight = generateJsExpr mode right
+
+        comparisons =
+          case shape of
+            Opt.ClosedEqRecord fields ->
+              map (fieldEq mode jsLeft jsRight) (Set.toAscList fields)
+
+            Opt.ClosedEqUnion maxArity ->
+              strictEq (JS.Access jsLeft JsName.dollar) (JS.Access jsRight JsName.dollar)
+                : map (slotEq jsLeft jsRight) (Index.range maxArity)
+
+        chain =
+          foldAnd comparisons
+      in
+      if isEq then chain else JS.Prefix JS.PrefixNot chain
+
+
+fieldEq :: Mode.Mode -> JS.Expr -> JS.Expr -> Name.Name -> JS.Expr
+fieldEq mode jsLeft jsRight field =
+  strictEq (JS.Access jsLeft (generateField mode field)) (JS.Access jsRight (generateField mode field))
+
+
+slotEq :: JS.Expr -> JS.Expr -> Index.ZeroBased -> JS.Expr
+slotEq jsLeft jsRight index =
+  let slot = JsName.fromIndex index in
+  strictEq (JS.Access jsLeft slot) (JS.Access jsRight slot)
+
+
+foldAnd :: [JS.Expr] -> JS.Expr
+foldAnd exprs =
+  case exprs of
+    []       -> JS.Bool True
+    [e]      -> e
+    e : rest -> JS.Infix JS.OpAnd e (foldAnd rest)
 
 
 

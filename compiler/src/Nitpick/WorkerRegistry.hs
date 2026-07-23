@@ -95,6 +95,7 @@ exprTargets expression =
     Opt.Tuple a b c      -> exprTargets a <> exprTargets b <> maybe Set.empty exprTargets c
     Opt.Shader _ _ _     -> Set.empty
     Opt.PrimOp _ l r     -> exprTargets l <> exprTargets r
+    Opt.EqClosed _ _ l r -> exprTargets l <> exprTargets r
 
 
 deciderTargets :: Opt.Decider Opt.Choice -> Set.Set Opt.Global
