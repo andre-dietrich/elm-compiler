@@ -1595,6 +1595,9 @@ data Make
   | MakeNonMainFilesIntoJavaScript ModuleName.Raw [ModuleName.Raw]
   | MakeCannotBuild BuildProblem
   | MakeBadGenerate Generate
+  | MakeChunkNeedsOptimize
+  | MakeChunkNeedsJsOutput
+  | MakeChunkModuleNotARoot ModuleName.Raw
 
 
 makeToReport :: Make -> Help.Report
@@ -1748,6 +1751,35 @@ makeToReport make =
 
     MakeBadGenerate generateProblem ->
       toGenerateReport generateProblem
+
+    MakeChunkNeedsOptimize ->
+      Help.report "CHUNK NEEDS OPTIMIZE" Nothing
+        "The --chunk flag only works together with --optimize."
+        [ D.reflow $
+            "Code splitting is a production deployment feature, so I only support it for\
+            \ --optimize builds. Add --optimize to your command, and drop --debug if you had\
+            \ it set."
+        ]
+
+    MakeChunkNeedsJsOutput ->
+      Help.report "CHUNK NEEDS JS OUTPUT" Nothing
+        "The --chunk flag needs a plain --output=somewhere.js target for the core bundle."
+        [ D.reflow $
+            "I do not support --chunk together with an HTML output, /dev/null, or no --output\
+            \ at all yet. Add something like --output=core.js."
+        ]
+
+    MakeChunkModuleNotARoot m ->
+      Help.report "CHUNK MODULE NOT GIVEN" Nothing
+        (
+          "The --chunk=" ++ ModuleName.toChars m ++ ":... module needs to be one of the files\
+          \ you are compiling."
+        )
+        [ D.reflow $
+            "Add it alongside your other files, e.g. elm make src/Main.elm src/"
+            ++ ModuleName.toChars m ++ ".elm --optimize --chunk="
+            ++ ModuleName.toChars m ++ ":chunk.js --output=core.js"
+        ]
 
 
 
@@ -1950,6 +1982,7 @@ toModuleNameConventionTable srcDir names =
 data Generate
   = GenerateCannotLoadArtifacts
   | GenerateCannotOptimizeDebugValues ModuleName.Raw [ModuleName.Raw]
+  | GenerateChunkModuleNotFound ModuleName.Raw
 
 
 toGenerateReport :: Generate -> Help.Report
@@ -1978,6 +2011,17 @@ toGenerateReport problem =
             \ inlining code. That optimization could move `Debug.log` and `Debug.todo` calls,\
             \ resulting in unpredictable behavior. I hope that clarifies why this restriction\
             \ exists!"
+        ]
+
+    GenerateChunkModuleNotFound m ->
+      Help.report "CHUNK MODULE NOT FOUND" Nothing
+        (
+          "I could not find any top-level definitions belonging to the module " ++
+          ModuleName.toChars m ++ ", so there is nothing to put in its chunk file."
+        )
+        [ D.reflow $
+            "Double check the module name in --chunk=" ++ ModuleName.toChars m ++ ":... matches\
+            \ the `module " ++ ModuleName.toChars m ++ " exposing (...)` line in the file exactly."
         ]
 
 

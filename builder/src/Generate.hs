@@ -3,6 +3,7 @@ module Generate
   ( debug
   , dev
   , prod
+  , prodSplit
   , repl
   )
   where
@@ -75,6 +76,25 @@ prod root details (Build.Artifacts pkg _ roots modules) =
       let mode = Mode.Prod (Mode.shortenFieldNames graph) (Mode.computeArities graph)
       let mains = gatherMains pkg objects roots
       return $ JS.generate mode graph mains
+
+
+-- Like `prod`, but carves the module `chunkModule` out into its own,
+-- separately-loadable bundle instead of inlining it into the main one.
+-- See Generate.JavaScript.generateSplit for how the split itself works.
+prodSplit :: FilePath -> Details.Details -> Build.Artifacts -> ModuleName.Raw -> Task (B.Builder, B.Builder)
+prodSplit root details (Build.Artifacts pkg _ roots modules) chunkModule =
+  do  objects <- finalizeObjects =<< loadObjects root details modules
+      checkForDebugUses objects
+      let graph = objectsToGlobalGraph objects
+      let mode = Mode.Prod (Mode.shortenFieldNames graph) (Mode.computeArities graph)
+      let mains = gatherMains pkg objects roots
+      let chunkHome = ModuleName.Canonical pkg chunkModule
+      case JS.generateSplit mode graph mains chunkHome of
+        Right builders ->
+          return builders
+
+        Left (JS.ChunkModuleNotFound _) ->
+          Task.throw (Exit.GenerateChunkModuleNotFound chunkModule)
 
 
 repl :: FilePath -> Details.Details -> Bool -> Build.ReplArtifacts -> N.Name -> Task B.Builder
