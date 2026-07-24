@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Multi-Tab CRDT Demo</title>
+</head>
+<body>
+<div id="app"></div>
+<script src="elm.js"></script>
+<script src="crdt-runtime.js"></script>
+<script>
+  var app = Elm.Main.init({
+    node: document.getElementById("app"),
+    flags: crypto.randomUUID()
+  });
+  attachCrdtSync(app, {});
+</script>
+</body>
+</html>
