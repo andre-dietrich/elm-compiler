@@ -7,12 +7,15 @@ module Make
   , reportType
   , output
   , docsFile
+  , chunkSpec
   )
   where
 
 
 import qualified Data.ByteString.Builder as B
+import qualified Data.Char as Char
 import qualified Data.Maybe as Maybe
+import qualified Data.Name as N
 import qualified Data.NonEmptyList as NE
 import qualified System.Directory as Dir
 import qualified System.FilePath as FP
@@ -41,6 +44,7 @@ data Flags =
     { _debug :: Bool
     , _optimize :: Bool
     , _output :: Maybe Output
+    , _chunk :: Maybe (ModuleName.Raw, FilePath)
     , _report :: Maybe ReportType
     , _docs :: Maybe FilePath
     }
@@ -64,7 +68,7 @@ type Task a = Task.Task Exit.Make a
 
 
 run :: [FilePath] -> Flags -> IO ()
-run paths flags@(Flags _ _ _ report _) =
+run paths flags@(Flags _ _ _ _ report _) =
   do  style <- getStyle report
       maybeRoot <- Stuff.findRoot
       Reporting.attemptWithStyle style Exit.makeToReport $
@@ -74,48 +78,70 @@ run paths flags@(Flags _ _ _ report _) =
 
 
 runHelp :: FilePath -> [FilePath] -> Reporting.Style -> Flags -> IO (Either Exit.Make ())
-runHelp root paths style (Flags debug optimize maybeOutput _ maybeDocs) =
+runHelp root paths style (Flags debug optimize maybeOutput maybeChunk _ maybeDocs) =
   BW.withScope $ \scope ->
   Stuff.withRootLock root $ Task.run $
   do  desiredMode <- getMode debug optimize
       details <- Task.eio Exit.MakeBadDetails (Details.load style scope root)
-      case paths of
-        [] ->
-          do  exposed <- getExposed details
-              buildExposed style root details maybeDocs exposed
+      case maybeChunk of
+        Just (chunkModule, chunkPath) ->
+          do  case desiredMode of
+                Prod -> return ()
+                _    -> Task.throw Exit.MakeChunkNeedsOptimize
+              case paths of
+                [] -> Task.throw Exit.MakeAppNeedsFileNames
+                p:ps ->
+                  do  artifacts <- buildPaths style root details (NE.List p ps)
+                      case elem chunkModule (NE.toList (Build.getRootNames artifacts)) of
+                        False ->
+                          Task.throw (Exit.MakeChunkModuleNotARoot chunkModule)
 
-        p:ps ->
-          do  artifacts <- buildPaths style root details (NE.List p ps)
-              case maybeOutput of
-                Nothing ->
-                  case getMains artifacts of
-                    [] ->
+                        True ->
+                          do  target <- case maybeOutput of
+                                Just (JS t) -> return t
+                                _           -> Task.throw Exit.MakeChunkNeedsJsOutput
+                              (coreBuilder, chunkBuilder) <- toSplitBuilder root details artifacts chunkModule
+                              generate style target coreBuilder (Build.getRootNames artifacts)
+                              generateChunk style chunkPath chunkBuilder chunkModule
+
+        Nothing ->
+          case paths of
+            [] ->
+              do  exposed <- getExposed details
+                  buildExposed style root details maybeDocs exposed
+
+            p:ps ->
+              do  artifacts <- buildPaths style root details (NE.List p ps)
+                  case maybeOutput of
+                    Nothing ->
+                      case getMains artifacts of
+                        [] ->
+                          return ()
+
+                        [name] ->
+                          do  builder <- toBuilder root details desiredMode artifacts
+                              generate style "index.html" (Html.sandwich name builder) (NE.List name [])
+
+                        name:names ->
+                          do  builder <- toBuilder root details desiredMode artifacts
+                              generate style "elm.js" builder (NE.List name names)
+
+                    Just DevNull ->
                       return ()
 
-                    [name] ->
-                      do  builder <- toBuilder root details desiredMode artifacts
-                          generate style "index.html" (Html.sandwich name builder) (NE.List name [])
+                    Just (JS target) ->
+                      case getNoMains artifacts of
+                        [] ->
+                          do  builder <- toBuilder root details desiredMode artifacts
+                              generate style target builder (Build.getRootNames artifacts)
 
-                    name:names ->
-                      do  builder <- toBuilder root details desiredMode artifacts
-                          generate style "elm.js" builder (NE.List name names)
+                        name:names ->
+                          Task.throw (Exit.MakeNonMainFilesIntoJavaScript name names)
 
-                Just DevNull ->
-                  return ()
-
-                Just (JS target) ->
-                  case getNoMains artifacts of
-                    [] ->
-                      do  builder <- toBuilder root details desiredMode artifacts
-                          generate style target builder (Build.getRootNames artifacts)
-
-                    name:names ->
-                      Task.throw (Exit.MakeNonMainFilesIntoJavaScript name names)
-
-                Just (Html target) ->
-                  do  name <- hasOneMain artifacts
-                      builder <- toBuilder root details desiredMode artifacts
-                      generate style target (Html.sandwich name builder) (NE.List name [])
+                    Just (Html target) ->
+                      do  name <- hasOneMain artifacts
+                          builder <- toBuilder root details desiredMode artifacts
+                          generate style target (Html.sandwich name builder) (NE.List name [])
 
 
 
@@ -248,6 +274,14 @@ generate style target builder names =
         Reporting.reportGenerate style names target
 
 
+generateChunk :: Reporting.Style -> FilePath -> B.Builder -> ModuleName.Raw -> Task ()
+generateChunk style target builder chunkModule =
+  Task.io $
+    do  Dir.createDirectoryIfMissing True (FP.takeDirectory target)
+        File.writeBuilder target builder
+        Reporting.reportGenerate style (NE.List chunkModule []) target
+
+
 
 -- TO BUILDER
 
@@ -262,6 +296,12 @@ toBuilder root details desiredMode artifacts =
       Debug -> Generate.debug root details artifacts
       Dev   -> Generate.dev   root details artifacts
       Prod  -> Generate.prod  root details artifacts
+
+
+toSplitBuilder :: FilePath -> Details.Details -> Build.Artifacts -> ModuleName.Raw -> Task (B.Builder, B.Builder)
+toSplitBuilder root details artifacts chunkModule =
+  Task.mapError Exit.MakeBadGenerate $
+    Generate.prodSplit root details artifacts chunkModule
 
 
 
@@ -307,6 +347,48 @@ docsFile =
     , _suggest = \_ -> return []
     , _examples = \_ -> return ["docs.json","documentation.json"]
     }
+
+
+chunkSpec :: Parser (ModuleName.Raw, FilePath)
+chunkSpec =
+  Parser
+    { _singular = "chunk spec"
+    , _plural = "chunk specs"
+    , _parser = parseChunkSpec
+    , _suggest = \_ -> return []
+    , _examples = \_ -> return ["Heavy:heavy.js"]
+    }
+
+
+parseChunkSpec :: String -> Maybe (ModuleName.Raw, FilePath)
+parseChunkSpec str =
+  case break (== ':') str of
+    (modulePart, ':':pathPart)
+      | isModuleName modulePart && hasExt ".js" pathPart ->
+          Just (N.fromChars modulePart, pathPart)
+    _ ->
+      Nothing
+
+
+isModuleName :: String -> Bool
+isModuleName str =
+  case str of
+    [] -> False
+    _  -> all isModuleSegmentOk (splitOnDot str)
+
+
+splitOnDot :: String -> [String]
+splitOnDot str =
+  case break (== '.') str of
+    (piece, [])     -> [piece]
+    (piece, _:rest) -> piece : splitOnDot rest
+
+
+isModuleSegmentOk :: String -> Bool
+isModuleSegmentOk segment =
+  case segment of
+    []     -> False
+    (c:cs) -> Char.isUpper c && all (\ch -> Char.isAlphaNum ch || ch == '_') cs
 
 
 hasExt :: String -> String -> Bool

@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Generate.JavaScript
   ( generate
+  , generateSplit
+  , SplitError(..)
   , generateForRepl
   , generateForReplEndpoint
   )
@@ -58,6 +60,86 @@ generate mode globalGraph@(Opt.GlobalGraph graph _) mains =
   <> generateWorkerRegistrations mode workerTargets
   <> toMainExports mode mains
   <> "}(this));"
+
+
+
+-- GENERATE SPLIT
+--
+-- Compiles `mains` into a "core" bundle plus a separately-loadable "chunk"
+-- bundle holding everything defined in `chunkHome`. The core pass never
+-- recurses into chunkHome's own globals (see addGlobal's redirect branch),
+-- so nothing from the chunk gets inlined into core even if something
+-- reachable from `mains` calls into it directly. The chunk pass is an
+-- entirely ordinary, self-contained generate-style DFS seeded from every
+-- global chunkHome defines -- it duplicates whatever shared helpers/kernel
+-- code it needs rather than importing anything from core (V1 doesn't
+-- dedupe across the two bundles, only avoids inlining chunk code into
+-- core). The only bridge is one-directional: once loaded, the chunk
+-- assigns each global core referenced onto the shared global object
+-- (`scope` at top level of a classic <script> tag == window), so core's
+-- already-emitted, perfectly ordinary references to those (bare,
+-- undeclared-in-core) identifiers resolve via normal JS scope-chain
+-- lookup the moment that code path actually runs -- not necessarily at
+-- core's own load time. See docs/superpowers/plans (code-splitting plan)
+-- for the full design rationale, including why a naive "redirect via a
+-- local alias var" design doesn't work (it would snapshot `undefined`
+-- once at load time instead of resolving live at use time).
+
+
+-- V1 deliberately does not dedupe shared helpers/kernel code between core
+-- and the chunk (see module-level note above) -- so unlike an earlier
+-- design draft, there is no "chunk needs kernel code core doesn't have"
+-- error case: the chunk pass independently, fully resolves its own kernel
+-- needs every time, same as any ordinary standalone `generate` call would.
+newtype SplitError
+  = ChunkModuleNotFound ModuleName.Canonical
+
+
+generateSplit :: Mode.Mode -> Opt.GlobalGraph -> Mains -> ModuleName.Canonical -> Either SplitError (B.Builder, B.Builder)
+generateSplit mode globalGraph@(Opt.GlobalGraph graph _) mains chunkHome =
+  let
+    chunkRoots = [ g | g@(Opt.Global home _) <- Map.keys graph, home == chunkHome ]
+  in
+  if null chunkRoots then
+    Left (ChunkModuleNotFound chunkHome)
+  else
+    let
+      coreSeedState = emptyState { _chunkHome = Just chunkHome }
+      coreState = Map.foldrWithKey (addMain mode graph) coreSeedState mains
+      boundary = _boundary coreState
+
+      chunkState = List.foldl' (addGlobal mode graph) emptyState chunkRoots
+
+      coreWorkerTargets = Set.intersection (WorkerRegistry.collect globalGraph) (_seenGlobals coreState)
+
+      coreBuilder =
+        "(function(scope){\n'use strict';"
+        <> Functions.functions
+        <> perfNote mode
+        <> stateToBuilder coreState
+        <> generateWorkerRegistrations mode coreWorkerTargets
+        <> toMainExports mode mains
+        <> "}(this));"
+
+      chunkBuilder =
+        "(function(scope){\n'use strict';"
+        <> Functions.functions
+        <> stateToBuilder chunkState
+        <> chunkExports boundary
+        <> "}(this));"
+    in
+    Right (coreBuilder, chunkBuilder)
+
+
+chunkExports :: Set.Set Opt.Global -> B.Builder
+chunkExports boundary =
+  Set.foldr (\global acc -> exportOnScope global <> acc) mempty boundary
+
+
+exportOnScope :: Opt.Global -> B.Builder
+exportOnScope (Opt.Global home name) =
+  let n = JsName.toBuilder (JsName.fromGlobal home name) in
+  "scope." <> n <> " = " <> n <> ";"
 
 
 -- WORKER REGISTRY
@@ -188,16 +270,22 @@ data State =
     { _revKernels :: [B.Builder]
     , _revBuilders :: [B.Builder]
     , _seenGlobals :: Set.Set Opt.Global
+    -- The next two fields only matter for generateSplit's core pass (see
+    -- below); for the ordinary generate/generateForRepl paths _chunkHome
+    -- stays Nothing forever, so the redirect branch in addGlobal never
+    -- fires and behavior is byte-identical to before code splitting existed.
+    , _chunkHome :: Maybe ModuleName.Canonical
+    , _boundary :: Set.Set Opt.Global
     }
 
 
 emptyState :: State
 emptyState =
-  State mempty [] Set.empty
+  State mempty [] Set.empty Nothing Set.empty
 
 
 stateToBuilder :: State -> B.Builder
-stateToBuilder (State revKernels revBuilders _) =
+stateToBuilder (State revKernels revBuilders _ _ _) =
   prependBuilders revKernels (prependBuilders revBuilders mempty)
 
 
@@ -211,12 +299,23 @@ prependBuilders revBuilders monolith =
 
 
 addGlobal :: Mode.Mode -> Graph -> State -> Opt.Global -> State
-addGlobal mode graph state@(State revKernels builders seen) global =
-  if Set.member global seen then
+addGlobal mode graph state global@(Opt.Global home _) =
+  if Just home == _chunkHome state then
+    -- This global belongs to the module carved out into a separate lazy
+    -- chunk (see generateSplit). Do NOT recurse into its definition or
+    -- deps here -- that would pull the chunk's code into this bundle,
+    -- defeating the whole point of splitting it out. Just remember that
+    -- something in this bundle references it; the reference itself
+    -- (a bare JsName.fromGlobal identifier, emitted completely normally
+    -- by whatever def is calling into it) resolves at *use time* via
+    -- ordinary JS scope-chain lookup once the chunk has loaded and
+    -- exported it onto the shared global object -- see generateSplit.
+    state { _boundary = Set.insert global (_boundary state) }
+  else if Set.member global (_seenGlobals state) then
     state
   else
     addGlobalHelp mode graph global $
-      State revKernels builders (Set.insert global seen)
+      state { _seenGlobals = Set.insert global (_seenGlobals state) }
 
 
 addGlobalHelp :: Mode.Mode -> Graph -> Opt.Global -> State -> State
@@ -293,13 +392,13 @@ addMaybeStmt maybeStmt state =
 
 
 addBuilder :: State -> B.Builder -> State
-addBuilder (State revKernels revBuilders seen) builder =
-  State revKernels (builder:revBuilders) seen
+addBuilder state builder =
+  state { _revBuilders = builder : _revBuilders state }
 
 
 addKernel :: State -> B.Builder -> State
-addKernel (State revKernels revBuilders seen) kernel =
-  State (kernel:revKernels) revBuilders seen
+addKernel state kernel =
+  state { _revKernels = kernel : _revKernels state }
 
 
 var :: Opt.Global -> Expr.Code -> JS.Stmt
