@@ -4,6 +4,7 @@ module Crdt.Dict exposing
     , insert, remove, applyOp
     , sync
     , encode, decoder, encodeOp, opDecoder
+    , encodeBytes, bytesDecoder, encodeOpBytes, opBytesDecoder
     )
 
 {-| Observed-Remove Dict, API-shaped like `elm/core`'s `Dict` (`sync`
@@ -24,6 +25,9 @@ key(s) against the full tag history (an add this replica already knows
 about, that the remover didn't, can keep the key alive).
 -}
 
+import Bytes.Decode as BD
+import Bytes.Encode as BE
+import Crdt.Wire as Wire
 import Dict as InternalDict
 import Json.Decode as Decode exposing (Decoder)
 import Json.Encode as Encode
@@ -324,3 +328,156 @@ entryDecoder keyDecoder valueDecoder =
         (Decode.field "key" keyDecoder)
         (Decode.field "value" valueDecoder)
         (Decode.field "tag" Decode.int)
+
+
+-- BINARY
+
+
+encodeBytes : (comparable -> BE.Encoder) -> (v -> BE.Encoder) -> Dict comparable v -> BE.Encoder
+encodeBytes encodeKey encodeValue (Dict d) =
+    let
+        sites =
+            collectSites d
+    in
+    BE.sequence
+        [ Wire.list Wire.uuid sites
+        , Wire.varint (siteIndex sites d.site)
+        , Wire.varint d.clock
+        , Wire.list (encodeTagBytes sites encodeKey) (CoreSet.toList d.adds)
+        , Wire.list (encodeTagBytes sites encodeKey) (CoreSet.toList d.removes)
+        , Wire.list (encodeEntryBytes encodeKey encodeValue) (InternalDict.toList d.entries)
+        ]
+
+
+encodeTagBytes : List String -> (comparable -> BE.Encoder) -> ( String, comparable, Int ) -> BE.Encoder
+encodeTagBytes sites encodeKey ( site, key, tag ) =
+    BE.sequence [ Wire.varint (siteIndex sites site), encodeKey key, Wire.varint tag ]
+
+
+encodeEntryBytes : (comparable -> BE.Encoder) -> (v -> BE.Encoder) -> ( comparable, ( v, Int ) ) -> BE.Encoder
+encodeEntryBytes encodeKey encodeValue ( key, ( value, tag ) ) =
+    BE.sequence [ encodeKey key, encodeValue value, Wire.varint tag ]
+
+
+bytesDecoder : BD.Decoder comparable -> BD.Decoder v -> BD.Decoder (Dict comparable v)
+bytesDecoder keyDecoder valueDecoder =
+    Wire.listDecoder Wire.uuidDecoder
+        |> BD.andThen
+            (\sites ->
+                BD.map (\siteIdx -> \clock -> \addsList -> \removesList -> \entriesList ->
+                        let
+                            adds =
+                                CoreSet.fromList addsList
+
+                            removes =
+                                CoreSet.fromList removesList
+                        in
+                        Dict
+                            { site = siteAt siteIdx sites
+                            , clock = clock
+                            , adds = adds
+                            , removes = removes
+                            , entries = InternalDict.fromList entriesList
+                            , liveKeys = computeLiveKeys adds removes
+                            }
+                    )
+                    Wire.varintDecoder
+                    |> Wire.andMap Wire.varintDecoder
+                    |> Wire.andMap (Wire.listDecoder (tagBytesDecoder sites keyDecoder))
+                    |> Wire.andMap (Wire.listDecoder (tagBytesDecoder sites keyDecoder))
+                    |> Wire.andMap (Wire.listDecoder (entryBytesDecoder keyDecoder valueDecoder))
+            )
+
+
+tagBytesDecoder : List String -> BD.Decoder comparable -> BD.Decoder ( String, comparable, Int )
+tagBytesDecoder sites keyDecoder =
+    BD.map3 (\siteIdx key tag -> ( siteAt siteIdx sites, key, tag ))
+        Wire.varintDecoder
+        keyDecoder
+        Wire.varintDecoder
+
+
+entryBytesDecoder : BD.Decoder comparable -> BD.Decoder v -> BD.Decoder ( comparable, ( v, Int ) )
+entryBytesDecoder keyDecoder valueDecoder =
+    BD.map3 (\key value tag -> ( key, ( value, tag ) )) keyDecoder valueDecoder Wire.varintDecoder
+
+
+encodeOpBytes : (comparable -> BE.Encoder) -> (v -> BE.Encoder) -> Op comparable v -> BE.Encoder
+encodeOpBytes encodeKey encodeValue op =
+    case op of
+        Add { site, key, value, tag } ->
+            BE.sequence [ BE.unsignedInt8 0, Wire.uuid site, encodeKey key, encodeValue value, Wire.varint tag ]
+
+        Remove { tags } ->
+            BE.sequence [ BE.unsignedInt8 1, Wire.list (encodeFullTagBytes encodeKey) tags ]
+
+
+encodeFullTagBytes : (comparable -> BE.Encoder) -> ( String, comparable, Int ) -> BE.Encoder
+encodeFullTagBytes encodeKey ( site, key, tag ) =
+    BE.sequence [ Wire.uuid site, encodeKey key, Wire.varint tag ]
+
+
+opBytesDecoder : BD.Decoder comparable -> BD.Decoder v -> BD.Decoder (Op comparable v)
+opBytesDecoder keyDecoder valueDecoder =
+    BD.unsignedInt8
+        |> BD.andThen
+            (\tag ->
+                case tag of
+                    0 ->
+                        BD.map (\site -> \key -> \value -> \t -> Add { site = site, key = key, value = value, tag = t })
+                            Wire.uuidDecoder
+                            |> Wire.andMap keyDecoder
+                            |> Wire.andMap valueDecoder
+                            |> Wire.andMap Wire.varintDecoder
+
+                    1 ->
+                        BD.map (\tags -> Remove { tags = tags }) (Wire.listDecoder (fullTagBytesDecoder keyDecoder))
+
+                    _ ->
+                        BD.fail
+            )
+
+
+fullTagBytesDecoder : BD.Decoder comparable -> BD.Decoder ( String, comparable, Int )
+fullTagBytesDecoder keyDecoder =
+    BD.map3 (\site key t -> ( site, key, t )) Wire.uuidDecoder keyDecoder Wire.varintDecoder
+
+
+collectSites : { r | site : String, adds : CoreSet.Set ( String, comparable, Int ), removes : CoreSet.Set ( String, comparable, Int ) } -> List String
+collectSites d =
+    (d.site :: (CoreSet.toList d.adds |> List.map tagSite) ++ (CoreSet.toList d.removes |> List.map tagSite))
+        |> uniqueStrings
+
+
+tagSite : ( String, comparable, Int ) -> String
+tagSite ( site, _, _ ) =
+    site
+
+
+uniqueStrings : List String -> List String
+uniqueStrings xs =
+    CoreSet.fromList xs |> CoreSet.toList
+
+
+siteIndex : List String -> String -> Int
+siteIndex table site =
+    siteIndexHelp table site 0
+
+
+siteIndexHelp : List String -> String -> Int -> Int
+siteIndexHelp table site i =
+    case table of
+        [] ->
+            0
+
+        s :: rest ->
+            if s == site then
+                i
+
+            else
+                siteIndexHelp rest site (i + 1)
+
+
+siteAt : Int -> List String -> String
+siteAt idx table =
+    List.drop idx table |> List.head |> Maybe.withDefault ""
