@@ -257,8 +257,8 @@ maybeDecoder elemDecoder =
 `BD.map ctor d1 |> andMap d2 |> andMap d3 |> ...`.
 -}
 andMap : BD.Decoder a -> BD.Decoder (a -> b) -> BD.Decoder b
-andMap =
-    BD.map2 (|>)
+andMap elemDecoder fnDecoder =
+    BD.map2 (\f x -> f x) fnDecoder elemDecoder
 
 
 
