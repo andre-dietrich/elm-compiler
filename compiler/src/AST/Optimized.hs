@@ -3,6 +3,9 @@ module AST.Optimized
   , Expr(..)
   , PrimBinop(..)
   , ClosedEqShape(..)
+  , CmpShape(..)
+  , CmpOp(..)
+  , CmpCallKind(..)
   , Global(..)
   , ConsInfo(..)
   , Path(..)
@@ -102,6 +105,20 @@ data Expr
   -- generating the ordinary _Utils_eq/_Utils_neq kernel call (Dev output
   -- must stay byte-identical -- see CLAUDE.md).
   | EqClosed Bool ClosedEqShape Expr Expr
+  -- Emitted for `<`/`<=`/`>`/`>=` on a closed Tuple2/Tuple3-of-
+  -- comparable-scalars shape (see Type.Type's toClosedCmpShape and
+  -- Optimize.Expression's toClosedCmpTarget). Lets Generate.JavaScript
+  -- skip the generic _Utils_cmp recursive walk in favor of a fully
+  -- unrolled short-circuit boolean chain -- see
+  -- Generate.JavaScript.Expression's generateCmpOpClosed. Prod-mode-only
+  -- codegen; Dev mode reproduces the exact prior codegen (CLAUDE.md's
+  -- Mode.Dev contract) by calling the same `cmp` helper the generic path
+  -- already uses.
+  | CmpOpClosed CmpOp CmpShape Expr Expr
+  -- Emitted for closed-tuple `compare`/`min`/`max` (see CmpCallKind).
+  -- Same Dev/Prod split as CmpOpClosed -- see
+  -- Generate.JavaScript.Expression's generateCmpCallClosed.
+  | CmpCallClosed CmpShape Expr Expr CmpCallKind
 
 
 -- Specialized comparison/append operators emitted when the type checker has
@@ -122,6 +139,35 @@ data ClosedEqShape
   = ClosedEqRecord (Set.Set Name)
   | ClosedEqUnion Int
   deriving (Eq)
+
+
+-- A closed Tuple2/Tuple3 shape whose leaves are all proven comparable
+-- scalars (Int/Float/String/Char -- see Type.Type's isCmpLeafType).
+-- Recursion covers nested tuples-of-tuples. Mirrors Type.CmpShape
+-- structurally but is a separate type -- see Optimize.Module's
+-- toOptCmpShape.
+data CmpShape
+  = CmpLeaf
+  | CmpTuple2 CmpShape CmpShape
+  | CmpTuple3 CmpShape CmpShape CmpShape
+
+
+data CmpOp
+  = OpLt
+  | OpLe
+  | OpGt
+  | OpGe
+
+
+-- Which Basics function CmpCallClosed stands in for. KCompare carries the
+-- already-registered LT/EQ/GT ctor references (Names.registerCtor, done
+-- once at optimize time -- see Optimize.Expression's makeClosedCmpCall,
+-- same registerCtor calls the existing scalar CallCompare already makes)
+-- so Generate.JavaScript never needs its own Names.Tracker access.
+data CmpCallKind
+  = KCompare Expr Expr Expr
+  | KMin
+  | KMax
 
 
 data Global = Global ModuleName.Canonical Name
@@ -360,6 +406,8 @@ instance Binary Expr where
       TailCallCons a b c d e   -> putWord8 28 >> put a >> put b >> put c >> put d >> put e
       TailCallConsBase a b c   -> putWord8 29 >> put a >> put b >> put c
       EqClosed a b c d         -> putWord8 30 >> put a >> put b >> put c >> put d
+      CmpOpClosed a b c d      -> putWord8 31 >> put a >> put b >> put c >> put d
+      CmpCallClosed a b c d    -> putWord8 32 >> put a >> put b >> put c >> put d
 
   get =
     do  word <- getWord8
@@ -395,6 +443,8 @@ instance Binary Expr where
           28 -> TailCallCons <$> get <*> get <*> get <*> get <*> get
           29 -> liftM3 TailCallConsBase get get get
           30 -> EqClosed <$> get <*> get <*> get <*> get
+          31 -> CmpOpClosed <$> get <*> get <*> get <*> get
+          32 -> CmpCallClosed <$> get <*> get <*> get <*> get
           _  -> fail "problem getting Opt.Expr binary"
 
 
@@ -435,6 +485,57 @@ instance Binary ClosedEqShape where
           0 -> liftM ClosedEqRecord get
           1 -> liftM ClosedEqUnion get
           _ -> fail "problem getting Opt.ClosedEqShape binary"
+
+
+instance Binary CmpShape where
+  put shape =
+    case shape of
+      CmpLeaf         -> putWord8 0
+      CmpTuple2 a b   -> putWord8 1 >> put a >> put b
+      CmpTuple3 a b c -> putWord8 2 >> put a >> put b >> put c
+
+  get =
+    do  n <- getWord8
+        case n of
+          0 -> pure CmpLeaf
+          1 -> liftM2 CmpTuple2 get get
+          2 -> liftM3 CmpTuple3 get get get
+          _ -> fail "problem getting Opt.CmpShape binary"
+
+
+instance Binary CmpOp where
+  put op =
+    putWord8 $
+      case op of
+        OpLt -> 0
+        OpLe -> 1
+        OpGt -> 2
+        OpGe -> 3
+
+  get =
+    do  n <- getWord8
+        case n of
+          0 -> pure OpLt
+          1 -> pure OpLe
+          2 -> pure OpGt
+          3 -> pure OpGe
+          _ -> fail "problem getting Opt.CmpOp binary"
+
+
+instance Binary CmpCallKind where
+  put kind =
+    case kind of
+      KCompare a b c -> putWord8 0 >> put a >> put b >> put c
+      KMin           -> putWord8 1
+      KMax           -> putWord8 2
+
+  get =
+    do  n <- getWord8
+        case n of
+          0 -> liftM3 KCompare get get get
+          1 -> pure KMin
+          2 -> pure KMax
+          _ -> fail "problem getting Opt.CmpCallKind binary"
 
 
 instance Binary Def where

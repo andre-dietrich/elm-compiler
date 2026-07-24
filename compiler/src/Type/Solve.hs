@@ -31,7 +31,7 @@ import qualified Type.UnionFind as UF
 -- RUN SOLVER
 
 
-run :: ModuleName.Canonical -> Map.Map Name.Name Can.Union -> Constraint -> IO (Either (NE.List Error.Error) (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType, Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region Int))
+run :: ModuleName.Canonical -> Map.Map Name.Name Can.Union -> Constraint -> IO (Either (NE.List Error.Error) (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType, Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region Int, Map.Map A.Region Type.CmpShape))
 run home unions constraint =
   do  pools <- MVector.replicate 8 []
 
@@ -45,7 +45,8 @@ run home unions constraint =
               shapeHints <- resolveRecordProbes recordProbes
               recordEqHints <- resolveRecordEqProbes probes
               unionEqHints <- resolveUnionEqProbes home unions probes
-              return $ Right (annotations, hints, shapeHints, recordEqHints, unionEqHints)
+              cmpHints <- resolveCmpProbes probes
+              return $ Right (annotations, hints, shapeHints, recordEqHints, unionEqHints, cmpHints)
 
         e:es ->
           return $ Left (NE.List e es)
@@ -124,6 +125,24 @@ addUnionEqProbe :: ModuleName.Canonical -> Map.Map Name.Name Can.Union -> Map.Ma
 addUnionEqProbe home unions hints (region, leftVar, rightVar) =
   do  maybeLeft <- Type.toClosedUnionEqArity home unions leftVar
       maybeRight <- Type.toClosedUnionEqArity home unions rightVar
+      return $ case (maybeLeft, maybeRight) of
+        (Just left, Just right) | left == right -> Map.insert region left hints
+        _                                       -> hints
+
+
+
+-- CLOSED TUPLE COMPARE HINTS
+
+
+resolveCmpProbes :: [(A.Region, Variable, Variable)] -> IO (Map.Map A.Region Type.CmpShape)
+resolveCmpProbes probes =
+  foldM addCmpProbe Map.empty probes
+
+
+addCmpProbe :: Map.Map A.Region Type.CmpShape -> (A.Region, Variable, Variable) -> IO (Map.Map A.Region Type.CmpShape)
+addCmpProbe hints (region, leftVar, rightVar) =
+  do  maybeLeft <- Type.toClosedCmpShape leftVar
+      maybeRight <- Type.toClosedCmpShape rightVar
       return $ case (maybeLeft, maybeRight) of
         (Just left, Just right) | left == right -> Map.insert region left hints
         _                                       -> hints

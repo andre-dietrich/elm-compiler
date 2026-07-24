@@ -13,6 +13,8 @@ module Type.Type
   , toClosedFields
   , toClosedPrimFields
   , toClosedUnionEqArity
+  , CmpShape(..)
+  , toClosedCmpShape
   , noRank
   , outermostRank
   , Mark
@@ -409,6 +411,86 @@ closedPrimOfCanType tipe =
 
     _ ->
       Nothing
+
+
+-- CLOSED TUPLE COMPARE PROBES
+--
+-- Determines whether a resolved Variable is a Tuple2/Tuple3 whose every
+-- slot is either a comparable scalar (Int/Float/String/Char) or itself a
+-- closed-cmp Tuple2/Tuple3 (recursive -- covers tuples of tuples).
+-- Deliberately does NOT reuse PrimType/toPrimType for the scalar check
+-- (see isCmpLeafType below) and deliberately does not attempt List (no
+-- static arity to unroll) or Record/Union slots (a tuple-only first pass
+-- -- see Generate.JavaScript.Expression's generateCmpOpClosed/
+-- generateCmpCallClosed, the only consumers of this shape, both
+-- Prod-mode-only).
+
+
+data CmpShape
+  = CmpLeaf
+  | CmpTuple2 CmpShape CmpShape
+  | CmpTuple3 CmpShape CmpShape CmpShape
+  deriving (Eq)
+
+
+toClosedCmpShape :: Variable -> IO (Maybe CmpShape)
+toClosedCmpShape variable =
+  do  (Descriptor content _ _ _) <- UF.get variable
+      case content of
+        Structure (Tuple1 a b Nothing) ->
+          do  maybeA <- toClosedCmpSlot a
+              maybeB <- toClosedCmpSlot b
+              return (CmpTuple2 <$> maybeA <*> maybeB)
+
+        Structure (Tuple1 a b (Just c)) ->
+          do  maybeA <- toClosedCmpSlot a
+              maybeB <- toClosedCmpSlot b
+              maybeC <- toClosedCmpSlot c
+              return (CmpTuple3 <$> maybeA <*> maybeB <*> maybeC)
+
+        Alias _ _ _ realVariable ->
+          toClosedCmpShape realVariable
+
+        _ ->
+          return Nothing
+
+
+toClosedCmpSlot :: Variable -> IO (Maybe CmpShape)
+toClosedCmpSlot variable =
+  do  isLeaf <- isCmpLeafType variable
+      if isLeaf
+        then return (Just CmpLeaf)
+        else toClosedCmpShape variable
+
+
+-- Recognizes Int/Float/String/Char -- the "comparable" scalar leaf types
+-- -- WITHOUT reusing PrimType/toPrimType. This is deliberate: toPrimType
+-- feeds toPrimBinop's raw `===`/`<` scalar codegen (Opt.PrimOp), which is
+-- NOT Mode-gated (Generate.JavaScript.Expression's generatePrimOp has no
+-- Mode.Dev/Mode.Prod split at all) and therefore applies in Dev/--debug
+-- builds too, where Char is boxed (_Utils_chr__DEBUG wraps it in
+-- `new String(c)`), making a raw `===` WRONG (`new String('a') === new
+-- String('a')` is false). This closed-cmp feature's own codegen
+-- (Generate.JavaScript.Expression's generateCmpOpClosed/
+-- generateCmpCallClosed) is Prod-mode-only -- Dev mode always falls back
+-- to the untouched existing codegen -- so Char is safe here in a way it
+-- would not be if merged into the shared PrimType.
+isCmpLeafType :: Variable -> IO Bool
+isCmpLeafType variable =
+  do  (Descriptor content _ _ _) <- UF.get variable
+      case content of
+        Structure (App1 home name []) ->
+          return $
+            (home == ModuleName.basics && name == "Int")
+            || (home == ModuleName.basics && name == "Float")
+            || (home == ModuleName.string && name == "String")
+            || (home == ModuleName.char && name == "Char")
+
+        Alias _ _ _ realVariable ->
+          isCmpLeafType realVariable
+
+        _ ->
+          return False
 
 
 -- WEBGL TYPES

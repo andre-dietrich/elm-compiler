@@ -46,9 +46,9 @@ data Artifacts =
 compile :: Pkg.Name -> Map.Map ModuleName.Raw I.Interface -> Src.Module -> Either E.Error Artifacts
 compile pkg ifaces modul =
   do  canonical <- canonicalize pkg ifaces modul
-      (annotations, hints, shapeHints, recordEqHints, unionEqHints) <- typeCheck modul canonical
+      (annotations, hints, shapeHints, recordEqHints, unionEqHints, cmpHints) <- typeCheck modul canonical
       ()        <- nitpick ifaces annotations canonical
-      objects   <- optimize modul annotations hints shapeHints recordEqHints unionEqHints canonical
+      objects   <- optimize modul annotations hints shapeHints recordEqHints unionEqHints cmpHints canonical
       return (Artifacts canonical annotations objects)
 
 
@@ -66,7 +66,7 @@ canonicalize pkg ifaces modul =
       Left $ E.BadNames errors
 
 
-typeCheck :: Src.Module -> Can.Module -> Either E.Error (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType, Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region Int)
+typeCheck :: Src.Module -> Can.Module -> Either E.Error (Map.Map Name.Name Can.Annotation, Map.Map A.Region Type.PrimType, Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region (Set.Set Name.Name), Map.Map A.Region Int, Map.Map A.Region Type.CmpShape)
 typeCheck modul canonical =
   case unsafePerformIO (Type.run (Can._name canonical) (Can._unions canonical) =<< Type.constrain canonical) of
     Right result ->
@@ -91,9 +91,9 @@ nitpick ifaces annotations canonical =
           Left (E.BadWorker errors)
 
 
-optimize :: Src.Module -> Map.Map Name.Name Can.Annotation -> Map.Map A.Region Type.PrimType -> Map.Map A.Region (Set.Set Name.Name) -> Map.Map A.Region (Set.Set Name.Name) -> Map.Map A.Region Int -> Can.Module -> Either E.Error Opt.LocalGraph
-optimize modul annotations hints shapeHints recordEqHints unionEqHints canonical =
-  case snd $ R.run $ Optimize.optimize annotations hints shapeHints recordEqHints unionEqHints canonical of
+optimize :: Src.Module -> Map.Map Name.Name Can.Annotation -> Map.Map A.Region Type.PrimType -> Map.Map A.Region (Set.Set Name.Name) -> Map.Map A.Region (Set.Set Name.Name) -> Map.Map A.Region Int -> Map.Map A.Region Type.CmpShape -> Can.Module -> Either E.Error Opt.LocalGraph
+optimize modul annotations hints shapeHints recordEqHints unionEqHints cmpHints canonical =
+  case snd $ R.run $ Optimize.optimize annotations hints shapeHints recordEqHints unionEqHints cmpHints canonical of
     Right localGraph ->
       Right localGraph
 

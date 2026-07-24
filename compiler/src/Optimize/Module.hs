@@ -40,14 +40,29 @@ type Annotations =
   Map.Map Name.Name Can.Annotation
 
 
-optimize :: Annotations -> Map.Map A.Region Type.PrimType -> Map.Map A.Region (Set.Set Name.Name) -> Map.Map A.Region (Set.Set Name.Name) -> Map.Map A.Region Int -> Can.Module -> Result i [W.Warning] Opt.LocalGraph
-optimize annotations primHints shapeHints recordEqHints unionEqHints (Can.Module home _ _ decls unions aliases _ effects) =
-  let hints = Expr.Hints primHints shapeHints recordEqHints unionEqHints in
+optimize :: Annotations -> Map.Map A.Region Type.PrimType -> Map.Map A.Region (Set.Set Name.Name) -> Map.Map A.Region (Set.Set Name.Name) -> Map.Map A.Region Int -> Map.Map A.Region Type.CmpShape -> Can.Module -> Result i [W.Warning] Opt.LocalGraph
+optimize annotations primHints shapeHints recordEqHints unionEqHints cmpHints (Can.Module home _ _ decls unions aliases _ effects) =
+  let hints = Expr.Hints primHints shapeHints recordEqHints unionEqHints (Map.map toOptCmpShape cmpHints) in
   addDecls home annotations hints decls $
     addEffects home effects $
       addUnions home unions $
         addAliases home aliases $
           Opt.LocalGraph Nothing Map.empty Map.empty
+
+
+
+-- Type.CmpShape (built from Variable-based unification data in
+-- Type.Solve) and Opt.CmpShape (stored in the Opt AST / .elmo) are
+-- deliberately separate types -- AST.Optimized never imports Type.Type,
+-- matching how ClosedEqShape was kept self-contained rather than reusing
+-- anything from the type-checker's internal modules. This is the one
+-- place they meet.
+toOptCmpShape :: Type.CmpShape -> Opt.CmpShape
+toOptCmpShape shape =
+  case shape of
+    Type.CmpLeaf         -> Opt.CmpLeaf
+    Type.CmpTuple2 a b   -> Opt.CmpTuple2 (toOptCmpShape a) (toOptCmpShape b)
+    Type.CmpTuple3 a b c -> Opt.CmpTuple3 (toOptCmpShape a) (toOptCmpShape b) (toOptCmpShape c)
 
 
 
