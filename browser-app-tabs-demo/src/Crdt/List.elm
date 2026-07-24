@@ -564,6 +564,9 @@ siteIndexHelp : List String -> String -> Int -> Int
 siteIndexHelp table site i =
     case table of
         [] ->
+            -- Unreachable in practice: collectSites always includes every
+            -- site siteIndex is ever called with. Falls back to 0 (silently
+            -- wrong, not a crash) if that invariant is ever violated.
             0
 
         s :: rest ->

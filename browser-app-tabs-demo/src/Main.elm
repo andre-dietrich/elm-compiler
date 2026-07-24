@@ -21,6 +21,8 @@ import Url exposing (Url)
 {-| The entire codec switch: change this line (and nothing else) to
 `Shared.Json.codec` to go back to JSON. See
 docs/superpowers/specs/2026-07-24-bytes-wire-protocol-design.md.
+All open tabs must run the same codec; switching requires reloading every
+open tab to match (a tab on Binary cannot talk to one on Json).
 -}
 codec : Crdt.Sync.Codec
 codec =
