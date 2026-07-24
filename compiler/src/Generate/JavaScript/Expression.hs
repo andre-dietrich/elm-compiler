@@ -786,8 +786,8 @@ generateBasicsCall mode home name args =
 
     [elmLeft, elmRight] ->
       case name of
-        -- NOTE: removed "composeL" and "composeR" because of this issue:
-        -- https://github.com/elm/compiler/issues/1722
+        "composeL" | Mode.Prod _ _ <- mode -> flattenCompose mode name elmLeft elmRight
+        "composeR" | Mode.Prod _ _ <- mode -> flattenCompose mode name elmLeft elmRight
         "append"   -> append mode elmLeft elmRight
         "apL"      -> generateJsExpr mode $ apply elmLeft elmRight
         "apR"      -> generateJsExpr mode $ apply elmRight elmLeft
@@ -816,6 +816,66 @@ generateBasicsCall mode home name args =
 
     _ ->
       generateGlobalCall home name (map (generateJsExpr mode) args)
+
+
+-- COMPOSITION CHAIN FLATTENING (Mode.Prod only)
+--
+-- See docs/superpowers/specs/2026-07-24-compose-chain-flattening-design.md
+-- for the full derivation, including the historical (2018, since-reverted)
+-- decomposeL/decomposeR bug this deliberately avoids.
+--
+-- Collision-free with every other internal-use name in this file (record-
+-- update temp, ctor tag field, generic partial-application currying all use
+-- the bare "$") -- `$` cannot appear in a real Elm identifier, same
+-- invariant Name.hs's makeMCStart/makeMCCell/etc. already rely on.
+composeParamName :: Name.Name
+composeParamName =
+  "$compose$"
+
+
+-- Flattens one operand of a composeL/composeR call into an ordered
+-- ("outermost function first") list of terminal leaves. Only unfolds a
+-- SATURATED (exactly 2-argument) composeL/composeR call any further -- an
+-- under-saturated operand like `(<<) Just` (1 argument) is a single opaque
+-- leaf, left to the ordinary, unmodified call-codegen path. This is what
+-- keeps the historical apply-based resaturation bug from being possible:
+-- terminal leaves are never re-assembled into a new saturated composeL/
+-- composeR call the way the old `apply`-based fold did.
+collectComposeSide :: Opt.Expr -> [Opt.Expr]
+collectComposeSide expr =
+  case expr of
+    Opt.Call (Opt.VarGlobal (Opt.Global home "composeL")) [left, right]
+      | home == ModuleName.basics ->
+          collectComposeSide left ++ collectComposeSide right
+
+    Opt.Call (Opt.VarGlobal (Opt.Global home "composeR")) [left, right]
+      | home == ModuleName.basics ->
+          collectComposeSide right ++ collectComposeSide left
+
+    _ ->
+      [expr]
+
+
+-- Entry point, called from generateBasicsCall's [elmLeft, elmRight] arm
+-- with `name` already known to be "composeL" or "composeR" and exactly 2
+-- arguments present (so this always collects at least 2 leaves total).
+-- Builds one Opt.Function around one fresh parameter shared by the whole
+-- chain, then hands off to the ordinary, unmodified generateJsExpr/
+-- generateFunction path -- no new JS-codegen machinery, only new Opt.Expr
+-- construction.
+flattenCompose :: Mode.Mode -> Name.Name -> Opt.Expr -> Opt.Expr -> JS.Expr
+flattenCompose mode op elmLeft elmRight =
+  let
+    leaves =
+      if op == "composeL" then
+        collectComposeSide elmLeft ++ collectComposeSide elmRight
+      else
+        collectComposeSide elmRight ++ collectComposeSide elmLeft
+
+    body =
+      foldr (\leaf acc -> Opt.Call leaf [acc]) (Opt.VarLocal composeParamName) leaves
+  in
+  generateJsExpr mode (Opt.Function [composeParamName] body)
 
 
 equal :: JS.Expr -> JS.Expr -> JS.Expr

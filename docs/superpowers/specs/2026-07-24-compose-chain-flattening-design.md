@@ -198,6 +198,46 @@ meaning).
    genuine implementation — same rigor as every prior optimization in this fork's history (see e.g.
    [[list-foldl-fusion-plan]]'s verification protocol).
 
+## Real-compiler verification results (added post-implementation, 2026-07-24)
+
+Task 1 (implementation) and Task 2 (real-compiler verification) both completed and passed independent
+review: structural flattening genuinely occurs, all correctness checks pass (including the historical
+`elm/compiler#1722` regression case, concretely `fromMaybeUse(n) === n + 1`), and `Mode.Dev` output is
+byte-identical before/after (confirmed via SHA-256, not just `diff`).
+
+**V8/Node: no measured speedup.** Three independent timing protocols against real, hash-verified
+before/after binaries (interleaved single-shot, 7-trial min/median, wide-non-repeating-input, later
+repeated twice more with entirely fresh binaries/volumes to rule out any caching artifact) all show the
+real-world difference within ~1-2% noise, sometimes `after` marginally slower. Root-cause hypothesis:
+`chain2L = A2($elm$core$Basics$composeL, addOne, double)` resolves once, at module load, to a concrete
+unary closure — the one extra monomorphic call layer this optimization removes is exactly the kind of
+thing V8/TurboFan already inlines away after warmup, consistent with two prior findings in this fork's
+history ([[closed-lambda-hoisting-spike]], [[partial-application-callback-spike]]).
+
+**Firefox/SpiderMonkey: large, real, reproducible speedup.** Tested via Playwright-driven Firefox
+(hash-verified binaries identical to the Node test, 5,000,000-iteration warmup to rule out JIT-tier
+artifacts, order-reversed re-run, correctness-checked in-browser):
+
+| chain | before | after | speedup |
+|---|---|---|---|
+| chain2L (2-stage) | 26-40ms | 26-30ms | ~1x (near-parity, noisy) |
+| chain3L (3-stage) | 459ms | 32ms | **14.3x** |
+| chain4L (4-stage) | 702-726ms | 21-40ms | **18-35x** |
+| chain2R (2-stage) | 138-159ms | 28-44ms | **3.5-4.9x** |
+| chain3R (3-stage) | 559ms | 43ms | **13.0x** |
+| chain4R (4-stage) | 856-914ms | 26-42ms | **21-33x** |
+
+SpiderMonkey does not eliminate the extra `composeL`/`composeR` dispatch layer the way V8 does. For
+chains of 3+ stages the flattening delivers a substantial, real, order-independent speedup; only the
+2-stage case is roughly a wash (both variants are already fast there).
+
+**Conclusion:** the performance benefit of this optimization is real but **engine-dependent** — large on
+Firefox, a no-op on V8/Chrome/Node. Since `elm make`'s primary deployment target is the browser (via
+`elm/browser`, not exclusively Node), and Firefox is a mainstream target with no evidence the V8 result
+generalizes negatively (no regression observed there, just no gain), this is a genuine, defensible case
+for merging — reframed as "engine-dependent win, most valuable for browser/Firefox-facing Elm
+applications with composition-heavy code," not the originally-hypothesized universal 2x-5x.
+
 ## Future work (not this design)
 
 - `Random.andThen`/`mapN` chain fusion and `Maybe`/`Result` `andThen`-chain case-of-case fusion were
