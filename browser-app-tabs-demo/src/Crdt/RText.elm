@@ -4,6 +4,7 @@ module Crdt.RText exposing
     , insertChar, insertString, removeChar, applyOp
     , sync
     , encode, decoder, encodeOp, opDecoder
+    , encodeBytes, bytesDecoder, encodeOpBytes, opBytesDecoder
     )
 
 {-| Character-level CRDT text -- `Crdt.List` specialized to `Char`, plus
@@ -11,7 +12,10 @@ module Crdt.RText exposing
 resistant ordering.
 -}
 
+import Bytes.Decode as BD
+import Bytes.Encode as BE
 import Crdt.List as CrdtList
+import Crdt.Wire as Wire
 import Json.Decode as Decode exposing (Decoder)
 import Json.Encode as Encode
 
@@ -125,4 +129,46 @@ charDecoder =
 
                     _ ->
                         Decode.fail "expected a single character"
+            )
+
+
+-- BINARY
+
+
+encodeBytes : RText -> BE.Encoder
+encodeBytes =
+    CrdtList.encodeBytes encodeCharBytes
+
+
+bytesDecoder : BD.Decoder RText
+bytesDecoder =
+    CrdtList.bytesDecoder charBytesDecoder
+
+
+encodeOpBytes : Op -> BE.Encoder
+encodeOpBytes =
+    CrdtList.encodeOpBytes encodeCharBytes
+
+
+opBytesDecoder : BD.Decoder Op
+opBytesDecoder =
+    CrdtList.opBytesDecoder charBytesDecoder
+
+
+encodeCharBytes : Char -> BE.Encoder
+encodeCharBytes char =
+    Wire.string (String.fromChar char)
+
+
+charBytesDecoder : BD.Decoder Char
+charBytesDecoder =
+    Wire.stringDecoder
+        |> BD.andThen
+            (\s ->
+                case String.toList s of
+                    [ c ] ->
+                        BD.succeed c
+
+                    _ ->
+                        BD.fail
             )
