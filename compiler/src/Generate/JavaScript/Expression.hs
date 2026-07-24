@@ -91,7 +91,19 @@ generate mode expression =
 
     Opt.List entries ->
       JsExpr $
-        List.foldr (\entry acc -> JS.Call listCons [generateJsExpr mode entry, acc]) listNil entries
+        -- Short literals unroll into a direct _List_Cons chain (faster: no
+        -- array allocation / reverse loop, see Tier-1 inline-opts commit
+        -- e36fa859, +48% on tight-loop list-literal reconstruction). But
+        -- unrolling makes JS AST nesting depth grow with element count, and
+        -- large static literals (translation tables, lookup dicts, etc.)
+        -- can overflow downstream JS parsers' recursion stack -- some
+        -- natively (segfault) rather than gracefully. Past this threshold,
+        -- fall back to upstream's flat-array `_List_fromArray([...])` (one
+        -- level of nesting, regardless of length).
+        if List.length entries <= maxInlineListLength then
+          List.foldr (\entry acc -> JS.Call listCons [generateJsExpr mode entry, acc]) listNil entries
+        else
+          JS.Call listFromArray [ JS.Array (map (generateJsExpr mode) entries) ]
 
     Opt.Function args body ->
       generateFunction (map JsName.fromLocal args) (generate mode body)
@@ -1020,6 +1032,18 @@ listCons =
 listNil :: JS.Expr
 listNil =
   JS.Ref (JsName.fromKernel Name.list "Nil")
+
+
+listFromArray :: JS.Expr
+listFromArray =
+  JS.Ref (JsName.fromKernel Name.list "fromArray")
+
+
+-- Above this many elements, `Opt.List` falls back to a flat-array
+-- `_List_fromArray` instead of unrolling a `_List_Cons` chain -- see the
+-- comment at its call site.
+maxInlineListLength :: Int
+maxInlineListLength = 64
 
 
 -- Builds one accumulator cell (either the sentinel, at loop entry, or a
