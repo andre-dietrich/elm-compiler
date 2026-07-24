@@ -1,22 +1,19 @@
 module Shared exposing
     ( SharedState, SharedOp(..)
     , init
-    , encode, decoder, sync
-    , encodeOp, opDecoder, applyOp
+    , sync
+    , applyOp
     )
 
 import Crdt.Counter as Counter
 import Crdt.Dict as CrdtDict
 import Crdt.LWW as LWW
 import Crdt.RText as RText
-import Json.Decode as Decode exposing (Decoder)
-import Json.Encode as Encode
 
 
 {-| The state shared across tabs. Plain Elm record whose fields happen to
-be CRDT types -- no special record-level abstraction needed, this is
-composed the same way any Elm app composes a `Json.Decode.mapN` decoder by
-hand.
+be CRDT types -- no special record-level abstraction needed. Encoding
+(JSON or binary) lives in `Shared.Json`/`Shared.Binary`, not here.
 -}
 type alias SharedState =
     { total : Counter.Counter
@@ -33,25 +30,6 @@ init site =
     , title = LWW.init site ""
     , notes = RText.init site
     }
-
-
-encode : SharedState -> Encode.Value
-encode s =
-    Encode.object
-        [ ( "total", Counter.encode s.total )
-        , ( "tags", CrdtDict.encode Encode.string Encode.bool s.tags )
-        , ( "title", LWW.encode Encode.string s.title )
-        , ( "notes", RText.encode s.notes )
-        ]
-
-
-decoder : Decoder SharedState
-decoder =
-    Decode.map4 SharedState
-        (Decode.field "total" Counter.decoder)
-        (Decode.field "tags" (CrdtDict.decoder Decode.string Decode.bool))
-        (Decode.field "title" (LWW.decoder Decode.string))
-        (Decode.field "notes" RText.decoder)
 
 
 {-| Only used for the one-time bootstrap exchange when a tab joins --
@@ -87,42 +65,3 @@ applyOp op s =
 
         NotesOp o ->
             { s | notes = RText.applyOp o s.notes }
-
-
-encodeOp : SharedOp -> Encode.Value
-encodeOp op =
-    case op of
-        TotalOp o ->
-            Encode.object [ ( "kind", Encode.string "total" ), ( "op", Counter.encodeOp o ) ]
-
-        TagsOp o ->
-            Encode.object [ ( "kind", Encode.string "tags" ), ( "op", CrdtDict.encodeOp Encode.string Encode.bool o ) ]
-
-        TitleOp o ->
-            Encode.object [ ( "kind", Encode.string "title" ), ( "op", LWW.encodeOp Encode.string o ) ]
-
-        NotesOp o ->
-            Encode.object [ ( "kind", Encode.string "notes" ), ( "op", RText.encodeOp o ) ]
-
-
-opDecoder : Decoder SharedOp
-opDecoder =
-    Decode.field "kind" Decode.string
-        |> Decode.andThen
-            (\kind ->
-                case kind of
-                    "total" ->
-                        Decode.map TotalOp (Decode.field "op" Counter.opDecoder)
-
-                    "tags" ->
-                        Decode.map TagsOp (Decode.field "op" (CrdtDict.opDecoder Decode.string Decode.bool))
-
-                    "title" ->
-                        Decode.map TitleOp (Decode.field "op" (LWW.opDecoder Decode.string))
-
-                    "notes" ->
-                        Decode.map NotesOp (Decode.field "op" RText.opDecoder)
-
-                    _ ->
-                        Decode.fail ("unknown SharedOp kind: " ++ kind)
-            )

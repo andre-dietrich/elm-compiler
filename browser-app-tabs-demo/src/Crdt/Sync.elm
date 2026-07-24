@@ -1,4 +1,4 @@
-port module Crdt.Sync exposing (SyncMsg, send, application)
+port module Crdt.Sync exposing (SyncMsg, Codec, WireMsg(..), send, application)
 
 {-| Wraps `Browser.application` so the wrapped app's `update`/`view`/
 `subscriptions` never see ports, encoding, or merge logic directly.
@@ -10,26 +10,28 @@ Three wire message kinds share the same two ports:
   - `OpMsg`: an incremental change (small).
   - `RequestState`: sent once on startup so a newly opened tab can catch up.
   - `FullState`: the answer to `RequestState` (or the demo's only large message).
+
+`WireMsg` itself is format-agnostic; how it's turned into bytes is supplied
+externally as a `Codec` (see `Shared.Json`/`Shared.Binary`), so switching
+formats is a single argument at the `Main.elm` call site, not a structural
+change here.
 -}
 
 import Browser
 import Browser.Navigation as Nav
+import Bytes exposing (Bytes)
+import Bytes.Decode as BD
+import Bytes.Encode as BE
+import Crdt.Wire as Wire
 import Html
-import Json.Decode as Decode exposing (Decoder)
-import Json.Encode as Encode
 import Shared exposing (SharedOp, SharedState)
 import Url exposing (Url)
 
 
-port crdtSend : Encode.Value -> Cmd msg
+port crdtSend : String -> Cmd msg
 
 
-port crdtReceive : (Decode.Value -> msg) -> Sub msg
-
-
-send : SharedOp -> Cmd msg
-send op =
-    crdtSend (encodeWireMsg (OpMsg op))
+port crdtReceive : (String -> msg) -> Sub msg
 
 
 type WireMsg
@@ -38,46 +40,30 @@ type WireMsg
     | FullState SharedState
 
 
-encodeWireMsg : WireMsg -> Encode.Value
-encodeWireMsg msg =
-    case msg of
-        OpMsg op ->
-            Encode.object [ ( "kind", Encode.string "op" ), ( "payload", Shared.encodeOp op ) ]
-
-        RequestState ->
-            Encode.object [ ( "kind", Encode.string "requestState" ) ]
-
-        FullState state ->
-            Encode.object [ ( "kind", Encode.string "fullState" ), ( "payload", Shared.encode state ) ]
+type alias Codec =
+    { encodeWireMsg : WireMsg -> BE.Encoder
+    , wireMsgDecoder : BD.Decoder WireMsg
+    }
 
 
-wireMsgDecoder : Decoder WireMsg
-wireMsgDecoder =
-    Decode.field "kind" Decode.string
-        |> Decode.andThen
-            (\kind ->
-                case kind of
-                    "op" ->
-                        Decode.map OpMsg (Decode.field "payload" Shared.opDecoder)
+send : Codec -> SharedOp -> Cmd msg
+send codec op =
+    crdtSend (encodeToPort codec (OpMsg op))
 
-                    "requestState" ->
-                        Decode.succeed RequestState
 
-                    "fullState" ->
-                        Decode.map FullState (Decode.field "payload" Shared.decoder)
-
-                    _ ->
-                        Decode.fail ("unknown WireMsg kind: " ++ kind)
-            )
+encodeToPort : Codec -> WireMsg -> String
+encodeToPort codec msg =
+    Wire.toPortString (BE.encode (codec.encodeWireMsg msg))
 
 
 type SyncMsg msg
     = AppMsg msg
-    | GotWire Decode.Value
+    | GotWire String
 
 
 application :
-    { get : model -> SharedState, set : SharedState -> model -> model }
+    Codec
+    -> { get : model -> SharedState, set : SharedState -> model -> model }
     ->
         { init : flags -> Url -> Nav.Key -> ( model, Cmd msg )
         , view : model -> Browser.Document msg
@@ -87,7 +73,7 @@ application :
         , onUrlRequest : Browser.UrlRequest -> msg
         }
     -> Program flags model (SyncMsg msg)
-application c app =
+application codec c app =
     Browser.application
         { init =
             \flags url key ->
@@ -95,7 +81,7 @@ application c app =
                     ( model, cmd ) =
                         app.init flags url key
                 in
-                ( model, Cmd.batch [ Cmd.map AppMsg cmd, crdtSend (encodeWireMsg RequestState) ] )
+                ( model, Cmd.batch [ Cmd.map AppMsg cmd, crdtSend (encodeToPort codec RequestState) ] )
         , view =
             \model ->
                 let
@@ -109,18 +95,18 @@ application c app =
                     AppMsg inner ->
                         app.update inner model |> Tuple.mapSecond (Cmd.map AppMsg)
 
-                    GotWire value ->
-                        case Decode.decodeValue wireMsgDecoder value of
-                            Ok (OpMsg op) ->
+                    GotWire portStr ->
+                        case BD.decode codec.wireMsgDecoder (Wire.fromPortString portStr) of
+                            Just (OpMsg op) ->
                                 ( c.set (Shared.applyOp op (c.get model)) model, Cmd.none )
 
-                            Ok RequestState ->
-                                ( model, crdtSend (encodeWireMsg (FullState (c.get model))) )
+                            Just RequestState ->
+                                ( model, crdtSend (encodeToPort codec (FullState (c.get model))) )
 
-                            Ok (FullState remote) ->
+                            Just (FullState remote) ->
                                 ( c.set (Shared.sync (c.get model) remote) model, Cmd.none )
 
-                            Err _ ->
+                            Nothing ->
                                 ( model, Cmd.none )
         , subscriptions =
             \model -> Sub.batch [ Sub.map AppMsg (app.subscriptions model), crdtReceive GotWire ]

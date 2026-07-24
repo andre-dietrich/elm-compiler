@@ -2,17 +2,28 @@ module Main exposing (main)
 
 import Browser
 import Browser.Navigation as Nav
+import Bytes
+import Bytes.Encode as BE
 import Crdt.Counter as Counter
 import Crdt.Dict as CrdtDict
 import Crdt.LWW as LWW
 import Crdt.RText as RText
-import Crdt.Sync
+import Crdt.Sync exposing (WireMsg(..))
 import Html exposing (Html, a, button, code, div, h1, h2, input, li, p, pre, text, textarea, ul)
 import Html.Attributes exposing (href, placeholder, value)
 import Html.Events exposing (onClick, onInput)
-import Json.Encode as Encode
 import Shared exposing (SharedOp(..), SharedState)
+import Shared.Binary
 import Url exposing (Url)
+
+
+{-| The entire codec switch: change this line (and nothing else) to
+`Shared.Json.codec` to go back to JSON. See
+docs/superpowers/specs/2026-07-24-bytes-wire-protocol-design.md.
+-}
+codec : Crdt.Sync.Codec
+codec =
+    Shared.Binary.codec
 
 
 
@@ -171,9 +182,9 @@ withSentOps : List SharedOp -> Model -> ( Model, Cmd Msg )
 withSentOps ops model =
     let
         totalBytes =
-            ops |> List.map (\op -> Shared.encodeOp op |> Encode.encode 0 |> String.length) |> List.sum
+            ops |> List.map (\op -> BE.encode (codec.encodeWireMsg (OpMsg op)) |> Bytes.width) |> List.sum
     in
-    ( { model | lastSentOpBytes = totalBytes }, Cmd.batch (List.map Crdt.Sync.send ops) )
+    ( { model | lastSentOpBytes = totalBytes }, Cmd.batch (List.map (Crdt.Sync.send codec) ops) )
 
 
 {-| Turns a textarea's `onInput` old/new value pair into a minimal sequence
@@ -410,7 +421,7 @@ viewStats model =
             model.shared
 
         stateBytes =
-            Shared.encode shared |> Encode.encode 0 |> String.length
+            BE.encode (codec.encodeWireMsg (FullState shared)) |> Bytes.width
     in
     div []
         [ h2 [] [ text "Debug-Statistik" ]
@@ -434,7 +445,7 @@ viewStats model =
                         ++ " Knoten insgesamt (inkl. Tombstones)"
                     )
                 ]
-            , li [] [ text ("Gesamter Zustand codiert: " ++ formatBytes stateBytes ++ " (Bootstrap-Nachrichtengröße)") ]
+            , li [] [ text ("Gesamter Zustand codiert: " ++ formatBytes stateBytes ++ " (Bootstrap-Nachrichtengröße, inkl. WireMsg-Rahmen)") ]
             , li [] [ text ("Zuletzt gesendete Operation: " ++ formatBytes model.lastSentOpBytes) ]
             ]
         ]
@@ -465,6 +476,7 @@ tabLabel tab =
 main : Program String Model (Crdt.Sync.SyncMsg Msg)
 main =
     Crdt.Sync.application
+        codec
         { get = .shared, set = \v m -> { m | shared = v } }
         { init = init
         , view = view
