@@ -126,17 +126,23 @@ Every newly introduced JS parameter uses a name in the same collision-free famil
 existing TRMC scaffolding names (`makeMCStart`/`makeMCCell`/`makeMCHead`/`makeMCField`,
 `Generate/JavaScript/Name.hs:143-175`, whose own comment states the invariant this design relies on:
 *"`$` cannot appear in Elm identifiers, so these can never collide with argNames or user locals"*) —
-e.g. `makeComposeParam` producing `$compose$<n>`, distinct from the bare `dollar`/`"$"` used elsewhere
-(record-update temp, ctor tag field, generic partial-application currying) so that this rewrite's own
-bindings can never be shadowed by, or shadow, anything from those unrelated codepaths.
+a fixed name, e.g. `$compose$`, distinct from the bare `dollar`/`"$"` used elsewhere (record-update
+temp, ctor tag field, generic partial-application currying) so that this rewrite's own bindings can
+never be shadowed by, or shadow, anything from those unrelated codepaths.
 
-A single top-level chain flattening needs exactly **one** such parameter (the whole collected chain
-shares one bound variable, applied once at the start: `f(g(h($compose$0)))`). Nesting only recurs when
-a chain link is *itself* a separate, independent `composeL`/`composeR` expression embedded inside
-another chain link's own arguments (not part of the same chain) — the implementation threads a small
-depth counter through the recursive collection so that such a nested, independent flattening mints
-`$compose$1`, `$compose$2`, etc., guaranteeing no cross-scope collision even in that case, without
-requiring any global/monadic unique-name supply.
+**No per-invocation counter is needed, and a single fixed name is sufficient** — this falls out of the
+leaf-combination strategy above, not out of a separate uniqueness mechanism bolted on afterwards. Every
+terminal leaf is compiled independently (via the ordinary, unmodified `generateJsExpr`) and combined
+into the chain with a plain JS call (`leaf(runningValue)`); the leaf's own internals — including any
+*separate*, nested `composeL`/`composeR` expression the leaf happens to contain, which would trigger
+this same rewrite recursively — are never textually spliced into or substituted through this rewrite's
+own body the way the historical `apply`-based resaturation did. A nested invocation's closure is called
+normally from outside, opaquely; it never needs to see through, or be seen through by, an enclosing
+invocation's own parameter. Since no invocation of this rewrite ever needs to reference an *enclosing*
+invocation's parameter, two invocations using the textually identical name `$compose$`, however deeply
+nested relative to each other, cannot capture one another — the historical bug specifically required a
+newly-introduced parameter to *shadow* a reference to an outer one that a nested closure still needed
+to reach, which this design's leaf/chain-link boundary never creates.
 
 ## Where this lives
 
