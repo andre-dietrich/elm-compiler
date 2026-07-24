@@ -13,6 +13,9 @@
     node: document.getElementById("app"),
     flags: crypto.randomUUID()
   });
+  // crdt-runtime.js's message-kind detection (tag byte 0/1/2) works
+  // unchanged regardless of which Crdt.Sync.Codec Main.elm picks --
+  // see Main.elm's `codec` value.
   attachCrdtSync(app, {});
 </script>
 </body>
