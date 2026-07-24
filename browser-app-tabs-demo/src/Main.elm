@@ -14,6 +14,7 @@ import Html.Attributes exposing (href, placeholder, value)
 import Html.Events exposing (onClick, onInput)
 import Shared exposing (SharedOp(..), SharedState)
 import Shared.Binary
+import Shared.Json
 import Url exposing (Url)
 
 
