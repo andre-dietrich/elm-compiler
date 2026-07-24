@@ -1,5 +1,13 @@
-module Crdt.LWW exposing (LWW, Op, init, value, set, applyOp, merge, encode, decoder, encodeOp, opDecoder)
+module Crdt.LWW exposing
+    ( LWW, Op
+    , init, value, set, applyOp, merge
+    , encode, decoder, encodeOp, opDecoder
+    , encodeBytes, bytesDecoder, encodeOpBytes, opBytesDecoder
+    )
 
+import Bytes.Decode as BD
+import Bytes.Encode as BE
+import Crdt.Wire as Wire
 import Json.Decode as Decode exposing (Decoder)
 import Json.Encode as Encode
 
@@ -87,3 +95,32 @@ opDecoder valueDecoder =
         (Decode.field "site" Decode.string)
         (Decode.field "clock" Decode.int)
         (Decode.field "value" valueDecoder)
+
+
+-- BINARY
+
+
+encodeBytes : (a -> BE.Encoder) -> LWW a -> BE.Encoder
+encodeBytes encodeValue (LWW r) =
+    BE.sequence [ Wire.uuid r.site, Wire.varint r.clock, encodeValue r.value ]
+
+
+bytesDecoder : BD.Decoder a -> BD.Decoder (LWW a)
+bytesDecoder valueDecoder =
+    BD.map3 (\site clock v -> LWW { site = site, clock = clock, value = v })
+        Wire.uuidDecoder
+        Wire.varintDecoder
+        valueDecoder
+
+
+encodeOpBytes : (a -> BE.Encoder) -> Op a -> BE.Encoder
+encodeOpBytes encodeValue op =
+    BE.sequence [ Wire.uuid op.site, Wire.varint op.clock, encodeValue op.value ]
+
+
+opBytesDecoder : BD.Decoder a -> BD.Decoder (Op a)
+opBytesDecoder valueDecoder =
+    BD.map3 (\site clock v -> { site = site, clock = clock, value = v })
+        Wire.uuidDecoder
+        Wire.varintDecoder
+        valueDecoder
