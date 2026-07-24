@@ -4,6 +4,7 @@ module Crdt.List exposing
     , insertAt, removeAt, applyOp
     , sync
     , encode, decoder, encodeOp, opDecoder
+    , encodeBytes, bytesDecoder, encodeOpBytes, opBytesDecoder
     )
 
 {-| Ordered CRDT sequence using the Fugue algorithm (Weidner, Kleppmann,
@@ -76,6 +77,9 @@ Known limitations (documented rather than silently accepted):
     `sync` (full-state) exchange repairs it.
 -}
 
+import Bytes.Decode as BD
+import Bytes.Encode as BE
+import Crdt.Wire as Wire
 import Dict exposing (Dict)
 import Json.Decode as Decode exposing (Decoder)
 import Json.Encode as Encode
@@ -769,3 +773,160 @@ sideDecoder =
                     _ ->
                         Decode.fail ("unknown Side: " ++ s)
             )
+
+
+-- BINARY
+--
+-- Reuses this module's own `collectSites`/`siteIndex`/`siteAt` (already
+-- defined above for the JSON codec -- generic over a `List String` table,
+-- not JSON-specific). Layout: site table, then
+-- `{ siteIdx, clock, nodes: list NodeEntry, rootLeft: list NodeIdIndexed,
+-- rootRight: list NodeIdIndexed }`. `NodeIdIndexed = { siteIdx, counter }`.
+-- `Op`s stay unindexed (full uuids), same rationale as every other
+-- module's `Op` codec in this file/plan.
+
+
+encodeBytes : (a -> BE.Encoder) -> Sequence a -> BE.Encoder
+encodeBytes encodeValue (Sequence l) =
+    let
+        sites =
+            collectSites l
+    in
+    BE.sequence
+        [ Wire.list Wire.uuid sites
+        , Wire.varint (siteIndex sites l.site)
+        , Wire.varint l.clock
+        , Wire.list (encodeNodeEntryBytes sites encodeValue) (Dict.toList l.nodes)
+        , Wire.list (encodeNodeIdBytes sites) l.rootLeft
+        , Wire.list (encodeNodeIdBytes sites) l.rootRight
+        ]
+
+
+encodeNodeIdBytes : List String -> NodeId -> BE.Encoder
+encodeNodeIdBytes sites ( site, counter ) =
+    BE.sequence [ Wire.varint (siteIndex sites site), Wire.varint counter ]
+
+
+encodeNodeEntryBytes : List String -> (a -> BE.Encoder) -> ( NodeId, Node a ) -> BE.Encoder
+encodeNodeEntryBytes sites encodeValue ( id, node ) =
+    BE.sequence
+        [ encodeNodeIdBytes sites id
+        , Wire.maybe encodeValue node.value
+        , Wire.maybe (encodeNodeIdBytes sites) node.parent
+        , Wire.bool (node.side == R)
+        , Wire.list (encodeNodeIdBytes sites) node.leftChildren
+        , Wire.list (encodeNodeIdBytes sites) node.rightChildren
+        ]
+
+
+bytesDecoder : BD.Decoder a -> BD.Decoder (Sequence a)
+bytesDecoder valueDecoder =
+    Wire.listDecoder Wire.uuidDecoder
+        |> BD.andThen
+            (\sites ->
+                BD.map5
+                    (\siteIdx clock nodesList rootLeft rootRight ->
+                        let
+                            raw =
+                                { site = siteAt siteIdx sites
+                                , clock = clock
+                                , nodes = Dict.fromList nodesList
+                                , rootLeft = rootLeft
+                                , rootRight = rootRight
+                                , order = []
+                                }
+                        in
+                        Sequence { raw | order = recomputeOrder raw }
+                    )
+                    Wire.varintDecoder
+                    Wire.varintDecoder
+                    (Wire.listDecoder (nodeEntryBytesDecoder sites valueDecoder))
+                    (Wire.listDecoder (nodeIdBytesDecoder sites))
+                    (Wire.listDecoder (nodeIdBytesDecoder sites))
+            )
+
+
+nodeIdBytesDecoder : List String -> BD.Decoder NodeId
+nodeIdBytesDecoder sites =
+    BD.map2 (\idx counter -> ( siteAt idx sites, counter )) Wire.varintDecoder Wire.varintDecoder
+
+
+{-| Six fields -- past `Bytes.Decode`'s `map5` ceiling, hence `Wire.andMap`
+(see Global Constraints).
+-}
+nodeEntryBytesDecoder : List String -> BD.Decoder a -> BD.Decoder ( NodeId, Node a )
+nodeEntryBytesDecoder sites valueDecoder =
+    BD.map
+        (\id ->
+            \value ->
+                \parent ->
+                    \isRight ->
+                        \leftChildren ->
+                            \rightChildren ->
+                                ( id
+                                , { value = value
+                                  , parent = parent
+                                  , side =
+                                        if isRight then
+                                            R
+
+                                        else
+                                            L
+                                  , leftChildren = leftChildren
+                                  , rightChildren = rightChildren
+                                  }
+                                )
+        )
+        (nodeIdBytesDecoder sites)
+        |> Wire.andMap (Wire.maybeDecoder valueDecoder)
+        |> Wire.andMap (Wire.maybeDecoder (nodeIdBytesDecoder sites))
+        |> Wire.andMap Wire.boolDecoder
+        |> Wire.andMap (Wire.listDecoder (nodeIdBytesDecoder sites))
+        |> Wire.andMap (Wire.listDecoder (nodeIdBytesDecoder sites))
+
+
+encodeOpBytes : (a -> BE.Encoder) -> Op a -> BE.Encoder
+encodeOpBytes encodeValue op =
+    case op of
+        InsertOp { id, value, parent, side } ->
+            BE.sequence
+                [ BE.unsignedInt8 0
+                , encodeNodeIdFullBytes id
+                , encodeValue value
+                , Wire.maybe encodeNodeIdFullBytes parent
+                , Wire.bool (side == R)
+                ]
+
+        DeleteOp { id } ->
+            BE.sequence [ BE.unsignedInt8 1, encodeNodeIdFullBytes id ]
+
+
+encodeNodeIdFullBytes : NodeId -> BE.Encoder
+encodeNodeIdFullBytes ( site, counter ) =
+    BE.sequence [ Wire.uuid site, Wire.varint counter ]
+
+
+opBytesDecoder : BD.Decoder a -> BD.Decoder (Op a)
+opBytesDecoder valueDecoder =
+    BD.unsignedInt8
+        |> BD.andThen
+            (\tag ->
+                case tag of
+                    0 ->
+                        BD.map (\id -> \value -> \parent -> \isRight -> InsertOp { id = id, value = value, parent = parent, side = if isRight then R else L })
+                            nodeIdFullBytesDecoder
+                            |> Wire.andMap valueDecoder
+                            |> Wire.andMap (Wire.maybeDecoder nodeIdFullBytesDecoder)
+                            |> Wire.andMap Wire.boolDecoder
+
+                    1 ->
+                        BD.map (\id -> DeleteOp { id = id }) nodeIdFullBytesDecoder
+
+                    _ ->
+                        BD.fail
+            )
+
+
+nodeIdFullBytesDecoder : BD.Decoder NodeId
+nodeIdFullBytesDecoder =
+    BD.map2 Tuple.pair Wire.uuidDecoder Wire.varintDecoder
