@@ -1021,75 +1021,71 @@ generateCmpOpClosed mode op shape left right =
       generateCmpBool op shape jsLeft jsRight
 
 
--- Direct short-circuiting boolean chain for one comparison operator: all
--- slots but the last are compared via generateOrdinal (need the full
--- three-way result to decide whether to move on to the next slot or
--- resolve now), the last slot uses the operator's actual relation
--- directly. E.g. for OpLt on a flat Tuple2: `x.a !== y.a ? x.a < y.a :
--- x.b < y.b`.
+-- Direct short-circuiting boolean chain for one comparison operator, with
+-- no duplicated subexpression at any nesting depth -- a rewrite of an
+-- earlier version that duplicated each prefix slot's ordinal
+-- subexpression (once for a "!= 0" test, once as the resolved value),
+-- which a real two-binary benchmark traced as the cause of
+-- Opt.CmpCallClosed's KCompare case landing at parity instead of a win.
+-- This version threads a `rest` continuation through instead: each
+-- slot's own comparison is emitted exactly once (the CmpLeaf case
+-- references `exprL`/`exprR` once each); on a strict inequality the
+-- whole chain resolves immediately with a fixed Bool (ltResult/gtResult,
+-- which depend only on `op`, not on nesting depth); on a tie it defers
+-- to `rest`, the already-built continuation for the remaining slots.
+-- `tieResult` is the answer when every slot compared equal (e.g. True
+-- for OpLe/OpGe, False for OpLt/OpGt) -- this subsumes the old "prefix
+-- slot uses strict relation, last slot uses the real relation"
+-- special-casing: a leaf that ties simply defers onward, and the base
+-- case at the very end already encodes what "totally equal" should mean
+-- for each operator.
 generateCmpBool :: Opt.CmpOp -> Opt.CmpShape -> JS.Expr -> JS.Expr -> JS.Expr
 generateCmpBool op shape exprL exprR =
+  generateCmpBoolStep op shape exprL exprR (JS.Bool (tieResult op))
+
+
+generateCmpBoolStep :: Opt.CmpOp -> Opt.CmpShape -> JS.Expr -> JS.Expr -> JS.Expr -> JS.Expr
+generateCmpBoolStep op shape exprL exprR rest =
   case shape of
     Opt.CmpLeaf ->
-      JS.Infix (finalRelOp op) exprL exprR
+      JS.If (JS.Infix JS.OpLt exprL exprR) (JS.Bool (ltResult op))
+        (JS.If (JS.Infix JS.OpGt exprL exprR) (JS.Bool (gtResult op)) rest)
 
     Opt.CmpTuple2 s0 s1 ->
-      prefixStep op (slotOrdinal Index.first s0 exprL exprR) $
-        generateCmpBool op s1 (slotAccess Index.second exprL) (slotAccess Index.second exprR)
+      generateCmpBoolStep op s0 (slotAccess Index.first exprL) (slotAccess Index.first exprR) $
+        generateCmpBoolStep op s1 (slotAccess Index.second exprL) (slotAccess Index.second exprR) rest
 
     Opt.CmpTuple3 s0 s1 s2 ->
-      prefixStep op (slotOrdinal Index.first s0 exprL exprR) $
-        prefixStep op (slotOrdinal Index.second s1 exprL exprR) $
-          generateCmpBool op s2 (slotAccess Index.third exprL) (slotAccess Index.third exprR)
+      generateCmpBoolStep op s0 (slotAccess Index.first exprL) (slotAccess Index.first exprR) $
+        generateCmpBoolStep op s1 (slotAccess Index.second exprL) (slotAccess Index.second exprR) $
+          generateCmpBoolStep op s2 (slotAccess Index.third exprL) (slotAccess Index.third exprR) rest
 
 
--- If the prefix slot's ordinal is nonzero, the whole comparison is
--- decided by it (using the operator's strict prefix relation: `<` for
--- OpLt/OpLe, `>` for OpGt/OpGe -- ties must fall through to the next
--- slot regardless of `<` vs `<=`). Otherwise defer to `rest`.
-prefixStep :: Opt.CmpOp -> JS.Expr -> JS.Expr -> JS.Expr
-prefixStep op ordinal rest =
-  JS.If (JS.Infix JS.OpNe ordinal (JS.Int 0))
-    (JS.Infix (prefixRelOp op) ordinal (JS.Int 0))
-    rest
+tieResult :: Opt.CmpOp -> Bool
+tieResult op =
+  case op of
+    Opt.OpLt -> False
+    Opt.OpLe -> True
+    Opt.OpGt -> False
+    Opt.OpGe -> True
 
 
--- Full lexicographic ordinal (-1/0/1) for two same-shaped CmpShape-typed
--- JS expressions -- the "compute once, read three ways" primitive used
--- both by generateCmpBool's prefix-slot tie-breaks and by
--- generateCmpCallClosed's `compare`/`min`/`max` codegen. Note: a prefix
--- slot's ordinal subexpression is referenced twice by prefixStep/ordStep
--- (once in the nonzero check, once as the resolved value) -- this
--- duplicates generated code by a small constant factor per nesting level,
--- which is fine in practice since real Tuple nesting is shallow (this
--- scope's own MVP fixtures never go past 2 levels); a genuine shared JS
--- temp per level would need an IIFE per level, trading code size for
--- runtime call overhead, not obviously a win.
-generateOrdinal :: Opt.CmpShape -> JS.Expr -> JS.Expr -> JS.Expr
-generateOrdinal shape exprL exprR =
-  case shape of
-    Opt.CmpLeaf ->
-      JS.If (JS.Infix JS.OpLt exprL exprR) (JS.Int (-1))
-        (JS.If (JS.Infix JS.OpGt exprL exprR) (JS.Int 1) (JS.Int 0))
-
-    Opt.CmpTuple2 s0 s1 ->
-      ordStep (slotOrdinal Index.first s0 exprL exprR) $
-        generateOrdinal s1 (slotAccess Index.second exprL) (slotAccess Index.second exprR)
-
-    Opt.CmpTuple3 s0 s1 s2 ->
-      ordStep (slotOrdinal Index.first s0 exprL exprR) $
-        ordStep (slotOrdinal Index.second s1 exprL exprR) $
-          generateOrdinal s2 (slotAccess Index.third exprL) (slotAccess Index.third exprR)
+ltResult :: Opt.CmpOp -> Bool
+ltResult op =
+  case op of
+    Opt.OpLt -> True
+    Opt.OpLe -> True
+    Opt.OpGt -> False
+    Opt.OpGe -> False
 
 
-ordStep :: JS.Expr -> JS.Expr -> JS.Expr
-ordStep ordinal rest =
-  JS.If (JS.Infix JS.OpNe ordinal (JS.Int 0)) ordinal rest
-
-
-slotOrdinal :: Index.ZeroBased -> Opt.CmpShape -> JS.Expr -> JS.Expr -> JS.Expr
-slotOrdinal index subShape exprL exprR =
-  generateOrdinal subShape (slotAccess index exprL) (slotAccess index exprR)
+gtResult :: Opt.CmpOp -> Bool
+gtResult op =
+  case op of
+    Opt.OpLt -> False
+    Opt.OpLe -> False
+    Opt.OpGt -> True
+    Opt.OpGe -> True
 
 
 slotAccess :: Index.ZeroBased -> JS.Expr -> JS.Expr
@@ -1097,37 +1093,21 @@ slotAccess index expr =
   JS.Access expr (JsName.fromIndex index)
 
 
-finalRelOp :: Opt.CmpOp -> JS.InfixOp
-finalRelOp op =
-  case op of
-    Opt.OpLt -> JS.OpLt
-    Opt.OpLe -> JS.OpLe
-    Opt.OpGt -> JS.OpGt
-    Opt.OpGe -> JS.OpGe
-
-
-prefixRelOp :: Opt.CmpOp -> JS.InfixOp
-prefixRelOp op =
-  case op of
-    Opt.OpLt -> JS.OpLt
-    Opt.OpLe -> JS.OpLt
-    Opt.OpGt -> JS.OpGt
-    Opt.OpGe -> JS.OpGt
-
-
 -- Emitted for Opt.CmpCallClosed. Dev mode calls the existing
 -- generateGlobalCall unchanged, with the original Basics function name --
 -- byte-identical to today's `A2(global, left, right)`. Prod mode: KMin/
--- KMax use a single short-circuit boolean condition (generateCmpBool)
--- with left/right as the two ternary branches -- no intermediate value.
--- KCompare needs the ordinal read three ways (LT/EQ/GT), so it's
--- genuinely computed once via a small IIFE built directly at the JS.Expr
--- level (JS.Function/JS.Var/JS.IfStmt/JS.Return) -- this construction is
--- entirely local to this function, never touches Opt.Expr/the .elmo, and
--- is therefore invisible to Dev-mode codegen (which never reaches this
--- branch at all): it cannot violate the byte-identical-Dev-output
--- contract the way a generic Opt.Let+Opt.If built at the Optimize.
--- Expression layer would have (see the design spec's Correction 2).
+-- KMax reuse generateCmpBool (a single short-circuit boolean condition)
+-- with left/right as the two ternary branches. KCompare directly threads
+-- the LT/GT ctor refs through generateCmpOrderStep -- no ordinal value,
+-- no IIFE: a leaf that's strictly unequal resolves the whole chain
+-- immediately (referencing the LT/GT refs multiple times is cheap --
+-- they're plain global/enum references, not recomputed work, unlike the
+-- ordinal subexpression the previous version duplicated), a tie defers
+-- to the continuation for the remaining slots, and the final
+-- continuation is the EQ ref for when every slot tied. Mirrors
+-- generateCmpBoolStep's shape exactly, just carrying three possible
+-- outcomes instead of two -- this eliminates the IIFE this case used to
+-- need entirely, since nothing needs to be read back more than once.
 generateCmpCallClosed :: Mode.Mode -> Opt.CmpShape -> Opt.Expr -> Opt.Expr -> Opt.CmpCallKind -> JS.Expr
 generateCmpCallClosed mode shape left right kind =
   case mode of
@@ -1145,21 +1125,27 @@ generateCmpCallClosed mode shape left right kind =
         Opt.KMax -> JS.If (generateCmpBool Opt.OpGt shape jsLeft jsRight) jsLeft jsRight
 
         Opt.KCompare lt eq gt ->
-          let
-            ordName = JsName.fromLocal "_ord"
-            ordRef = JS.Ref ordName
-          in
-          JS.Call
-            ( JS.Function Nothing []
-                [ JS.Var ordName (generateOrdinal shape jsLeft jsRight)
-                , JS.IfStmt (JS.Infix JS.OpLt ordRef (JS.Int 0))
-                    (JS.Return (generateJsExpr mode lt))
-                    (JS.IfStmt (JS.Infix JS.OpEq ordRef (JS.Int 0))
-                      (JS.Return (generateJsExpr mode eq))
-                      (JS.Return (generateJsExpr mode gt)))
-                ]
-            )
-            []
+          generateCmpOrderStep shape
+            (generateJsExpr mode lt) (generateJsExpr mode gt)
+            jsLeft jsRight
+            (generateJsExpr mode eq)
+
+
+generateCmpOrderStep :: Opt.CmpShape -> JS.Expr -> JS.Expr -> JS.Expr -> JS.Expr -> JS.Expr -> JS.Expr
+generateCmpOrderStep shape jsLt jsGt exprL exprR rest =
+  case shape of
+    Opt.CmpLeaf ->
+      JS.If (JS.Infix JS.OpLt exprL exprR) jsLt
+        (JS.If (JS.Infix JS.OpGt exprL exprR) jsGt rest)
+
+    Opt.CmpTuple2 s0 s1 ->
+      generateCmpOrderStep s0 jsLt jsGt (slotAccess Index.first exprL) (slotAccess Index.first exprR) $
+        generateCmpOrderStep s1 jsLt jsGt (slotAccess Index.second exprL) (slotAccess Index.second exprR) rest
+
+    Opt.CmpTuple3 s0 s1 s2 ->
+      generateCmpOrderStep s0 jsLt jsGt (slotAccess Index.first exprL) (slotAccess Index.first exprR) $
+        generateCmpOrderStep s1 jsLt jsGt (slotAccess Index.second exprL) (slotAccess Index.second exprR) $
+          generateCmpOrderStep s2 jsLt jsGt (slotAccess Index.third exprL) (slotAccess Index.third exprR) rest
 
 
 cmpCallKindName :: Opt.CmpCallKind -> Name.Name
